@@ -1,0 +1,18 @@
+# dsh / агентский мусор (временные каталоги рантайма)
+.dsh-scratch/
+*.log
+trace.log
+
+# OS-мусор
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# node (если появятся)
+node_modules/
+dist/
+
+# локальные секреты/окружение — НИКОГДА не коммитить
+.env
+.env.*
+*.local
