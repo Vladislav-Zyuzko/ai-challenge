@@ -26,13 +26,19 @@ const C = process.stdout.isTTY && !process.env.NO_COLOR
   ? { dim: '\x1b[2m', reset: '\x1b[22m', cyan: '\x1b[36m', green: '\x1b[32m', red: '\x1b[31m', yellow: '\x1b[33m', bold: '\x1b[1m', off: '\x1b[0m' }
   : { dim: '', reset: '', cyan: '', green: '', red: '', yellow: '', bold: '', off: '' }
 
+// Состояние UI: oneShot = режим -p (ответ только в stdout, диагностика в stderr).
+const UI = { oneShot: false, lastChar: '' }
+function outWrite(s) {
+  UI.lastChar = s.length > 0 ? s[s.length - 1] : UI.lastChar
+  process.stdout.write(s)
+}
 const log = {
-  out: (s) => process.stdout.write(s),
-  line: (s) => process.stdout.write(s + '\n'),
+  out: (s) => outWrite(s),
+  line: (s) => outWrite(s + '\n'),
   err: (s) => process.stderr.write(C.red + s + C.off + '\n'),
-  dim: (s) => process.stdout.write(C.dim + s + C.reset + '\n'),
-  tool: (s) => process.stdout.write(C.cyan + s + C.off + '\n'),
-  ok: (s) => process.stdout.write(C.green + s + C.off + '\n'),
+  dim: (s) => (UI.oneShot ? process.stderr : process.stdout).write(C.dim + s + C.reset + '\n'),
+  tool: (s) => (UI.oneShot ? process.stderr : process.stdout).write(C.cyan + s + C.off + '\n'),
+  ok: (s) => (UI.oneShot ? process.stderr : process.stdout).write(C.green + s + C.off + '\n'),
 }
 
 // Отладочная трассировка в файл (stdout при process.exit теряется, файл — нет).
@@ -59,7 +65,7 @@ const STATUS_FRAMES = [
 const status = { timer: null, frame: 0, enabled: process.stdout.isTTY && !process.env.DSH_TERM_NO_ANIM }
 
 function startStatus() {
-  if (!status.enabled || status.timer) return
+  if (UI.oneShot || !status.enabled || status.timer) return
   status.frame = 0
   const draw = () => {
     process.stdout.write(`\r\x1b[K${STATUS_FRAMES[status.frame % STATUS_FRAMES.length]}`)
@@ -290,8 +296,12 @@ function parseArgs(argv) {
     model: process.env.DSH_TERM_MODEL ?? 'deepseek-v4-flash',
     maxTokens: undefined,
     session: undefined,
+    prompt: undefined,       // -p/--prompt: one-shot режим (один ответ и выход)
     workspace: process.cwd(),
     dshBin: 'dsh',
+    format: undefined,       // пресет или свободное описание формата ответа
+    maxLength: undefined,    // лимит длины ответа в символах (мягко + обрезка показа)
+    stopMarker: undefined,   // маркер-стоп: рендер обрывается на нём
     help: false,
   }
   for (let i = 0; i < argv.length; i++) {
@@ -304,6 +314,10 @@ function parseArgs(argv) {
       case '--model': opts.model = next(); break
       case '--max-tokens': opts.maxTokens = Number(next()); break
       case '--session': case '--resume': opts.session = next(); break
+      case '--format': opts.format = next(); break
+      case '--max-length': opts.maxLength = Number(next()); break
+      case '--stop': opts.stopMarker = next(); break
+      case '-p': case '--prompt': opts.prompt = next(); break
       case '--workspace': opts.workspace = next(); break
       case '--dsh-bin': opts.dshBin = next(); break
       case '-h': case '--help': opts.help = true; break
@@ -430,6 +444,21 @@ function shortArgs(raw) {
   } catch {
     return raw.slice(0, 120)
   }
+}
+
+// ---------- формат/длина/стоп: пресеты и инструкции ----------
+const FORMAT_PRESETS = {
+  json: 'Отвечай СТРОГО валидным JSON: без markdown-обёртки (```), без текста вне JSON.',
+  plain: 'Отвечай простым текстом без markdown-разметки.',
+  markdown: 'Отвечай в формате Markdown.',
+  bullets: 'Отвечай короткими буллетами, каждый с новой строки через «- ».',
+  code: 'Отвечай кодом; пояснения — минимальные, вне блоков.',
+  table: 'Отвечай в виде Markdown-таблицы.',
+}
+function formatInstruction(v) {
+  const low = v.trim().toLowerCase()
+  if (FORMAT_PRESETS[low]) return FORMAT_PRESETS[low]
+  return `Формат ответа: ${v.trim()}. Строго следуй этому формату.`
 }
 
 // ---------- реестр команд REPL + git/gh (SKILLS) ----------
@@ -595,12 +624,20 @@ async function main() {
   if (opts.help) {
     log.line(`${C.bold}dsh-term${C.off} — интерактивная терминальная CLI для DeepSeek Harness (SDK JSON-RPC клиент)`)
     log.line('')
-    log.line('Использование: node dsh-term.mjs [опции]')
+    log.line('Использование:')
+    log.line('  dsh-term                     интерактивный REPL')
+    log.line('  dsh-term -p "вопрос" [флаги]  one-shot: один ответ с флагами и выход')
+    log.line('')
+    log.line('Опции:')
+    log.line('  -p, --prompt <text>  текст промпта (one-shot режим)')
     log.line('  --dsh-home <path>   Harness home (default: ~/.dsh-term)')
     log.line('  --profile <name>    профиль рантайма (default: sdk)')
     log.line('  --provider <id>     провайдер (default: deepseek-official; env DSH_TERM_PROVIDER)')
     log.line('  --model <name>      модель (default: deepseek-v4-flash; env DSH_TERM_MODEL)')
-    log.line('  --max-tokens <n>    лимит токенов ответа')
+    log.line('  --max-tokens <n>    лимит токенов ответа (жёсткий кап адаптера)')
+    log.line('  --format <spec>     формат ответа: пресет (json/plain/markdown/bullets/code/table) или описание')
+    log.line('  --max-length <n>    лимит длины ответа в символах: инструкция + обрезка показа')
+    log.line('  --stop <marker>     стоп-символ: передаётся с промптом; показ обрывается при генерации маркера')
     log.line('  --session <id>      продолжить конкретную сессию (синоним: --resume <id>)')
     log.line('  --workspace <path>  рабочая папка сессий (default: текущая)')
     log.line('  --dsh-bin <path>    путь к dsh (default: dsh из PATH)')
@@ -619,6 +656,20 @@ async function main() {
     log.line(`в ${credentialsPath(opts.dshHome)}; последняя сессия запоминается и автоматически продолжается.`)
     log.line('Пока модель думает, в терминале плывёт кит DeepSeek (отключить: DSH_TERM_NO_ANIM=1).')
     return
+  }
+
+  // One-shot (-p): весь вывод ответа в stdout, диагностика в stderr.
+  if (opts.prompt !== undefined) UI.oneShot = true
+
+  // Контролы ответа (--format / --max-length / --stop): применяются к ОДНОМУ
+  // следующему ответу, затем автосброс (скоуп «только на один ответ»).
+  let pendingControls = null
+  if (opts.format !== undefined || opts.maxLength !== undefined || opts.stopMarker !== undefined) {
+    pendingControls = {
+      format: opts.format ?? null,
+      maxChars: Number.isFinite(opts.maxLength) && opts.maxLength > 0 ? Math.floor(opts.maxLength) : null,
+      marker: opts.stopMarker ?? null,
+    }
   }
 
   // SIGINT (Ctrl+C) должен гасить процесс в ЛЮБОМ состоянии — регистрируем
@@ -652,8 +703,9 @@ async function main() {
   const state = {
     sessionId,
     children: new Set(),       // subagent-сессии текущего дерева
-    turn: null,                // { resolve, running, timer }
+    turn: null,                // { resolve, running, timer, maxChars, marker, … }
     streamedText: false,       // печатали ли текст за текущий ход
+    lastEndKind: null,         // чем закончился последний ход ('completed'/'error'/…)
   }
   saveState(opts.dshHome, sessionId)
 
@@ -682,6 +734,9 @@ async function main() {
     if (msg.method === 'session.event') {
       const { sessionId, event } = msg.params
       const mine = sessionId === state.sessionId || state.children.has(sessionId)
+      // Исход хода фиксируем ДО гейта по state.turn: порядок turn/end vs idle
+      // между двумя notify-каналами не гарантирован, а lastEndKind нужен и в -p.
+      if (mine && event.type === 'turn/end') state.lastEndKind = event.data?.reason?.kind ?? null
       if (!mine || !state.turn) return
       renderEvent(event)
     }
@@ -695,7 +750,35 @@ async function main() {
           // Пошёл видимый ответ — кит останавливается, текст стримится.
           stopStatus()
           state.streamedText = true
-          log.out(c.text)
+          const t = state.turn
+          if (!t || t.cut) break
+          // Детект маркера ЧЕРЕЗ ГРАНИЦЫ чанков: задерживаем вывод на
+          // (len-1) символов и ищем маркер в склейке «хвост + новый чанк».
+          const markLen = t.marker ? t.marker.length : 0
+          const combined = (t.tail ?? '') + c.text
+          let head = combined
+          let cut = null
+          if (t.marker) {
+            const i = combined.indexOf(t.marker)
+            if (i >= 0) { head = combined.slice(0, i); cut = 'marker' }
+          }
+          if (t.maxChars != null && !cut) {
+            const remain = t.maxChars - t.streamedCount
+            if (head.length > remain) { head = head.slice(0, Math.max(0, remain)); cut = 'length' }
+          }
+          const hold = !cut && markLen > 1 ? Math.min(markLen - 1, head.length) : 0
+          const flush = head.slice(0, head.length - hold)
+          if (flush) { log.out(flush); t.streamedCount += flush.length }
+          t.tail = !cut && markLen > 1 ? head.slice(head.length - hold) : ''
+          trace(`td flush=${JSON.stringify(flush)} tail=${JSON.stringify(t.tail)} cut=${cut}`)
+          if (cut === 'marker') {
+            t.cut = 'marker'
+            log.err(`…[стоп-маркер ${JSON.stringify(t.marker)} — показ обрезан]`)
+          } else if (cut === 'length') {
+            t.cut = 'length'
+            t.streamedCount = t.maxChars
+            log.err(`…[обрезано dsh-term: лимит ${t.maxChars} символов]`)
+          }
         }
         // reasoning-delta намеренно не печатаем: в это время плывёт кит
         // (капшон «deep diving…»), как в веб-приложении DeepSeek.
@@ -716,6 +799,9 @@ async function main() {
       }
       case 'turn/end': {
         stopStatus()
+        // Поток текста закончился: допечатать задержанный хвост ДО пустой строки,
+        // иначе перенос строки оказался бы посреди текста (см. -p и маркер).
+        flushTurnTail()
         // Текст стримился без перевода строки — отделяем от заголовка конца.
         if (state.streamedText) log.line('')
         const r = event.data.reason
@@ -736,33 +822,73 @@ async function main() {
     }
   }
 
+  /** Допечатать хвост, задержанный для детекта маркера (маркер не встретился). */
+  function flushTurnTail() {
+    const t = state.turn
+    if (!t || !t.tail) return
+    let tail = t.tail
+    t.tail = ''
+    if (t.maxChars != null) {
+      const remain = t.maxChars - (t.streamedCount ?? 0)
+      if (tail.length > remain) {
+        tail = tail.slice(0, Math.max(0, remain))
+        log.err(`…[обрезано dsh-term: лимит ${t.maxChars} символов]`)
+      }
+    }
+    if (tail) { log.out(tail); t.streamedCount += tail.length }
+  }
+
   function finishTurn() {
     stopStatus()
+    flushTurnTail() // хвост, если turn/end ещё не приходил (страховка)
     const t = state.turn
     state.turn = null
     clearTimeout(t.timer)
-    log.line('')
-    t.resolve()
+    if (!UI.oneShot) log.line('')
+    t?.resolve()
   }
 
-  function startTurn() {
+  function startTurn(controls) {
     state.streamedText = false
+    state.lastEndKind = null
     return new Promise((resolve) => {
-      state.turn = { resolve, running: false, timer: setTimeout(() => {
-        stopStatus()
-        log.err('— таймаут ожидания idle (агент не завершил ход)')
-        finishTurn()
-      }, 30 * 60 * 1000) }
+      state.turn = {
+        resolve,
+        running: false,
+        maxChars: controls?.maxChars ?? null,
+        marker: controls?.marker ?? null,
+        streamedCount: 0,
+        tail: '',    // задержанные символы для детекта маркера через границы чанков
+        cut: null, // 'marker' | 'length' | null
+        timer: setTimeout(() => {
+          stopStatus()
+          log.err('— таймаут ожидания idle (агент не завершил ход)')
+          finishTurn()
+        }, 30 * 60 * 1000),
+      }
     })
   }
 
   async function promptTurn(text) {
     trace(`promptTurn start: ${text}`)
-    const waiting = startTurn()
+    const controls = pendingControls
+    pendingControls = null // скоуп: применяется только к этому ответу
+    const waiting = startTurn(controls)
     try {
+      // Мягкие инструкции (формат/длина/стоп-маркер) — префиксом к промпту.
+      const instructions = []
+      if (controls?.format) instructions.push(formatInstruction(controls.format))
+      if (controls?.maxChars != null) instructions.push(`Не длиннее ${controls.maxChars} символов в основном ответе.`)
+      // Стоп-маркер передаётся С ПРОМТОМ: модель знает, что закончить ответ им,
+      // а клиент обрезает вывод в момент генерации маркера (см. renderEvent).
+      if (controls?.marker) {
+        instructions.push(`Заверши свой ответ ровно маркером ${JSON.stringify(controls.marker)} — маркер должен быть последним, после него ничего не пиши.`)
+      }
+      const body = instructions.length ? `${instructions.join('\n')}\n\n---\n\n${text}` : text
+      trace(`prompt body: ${body.slice(0, 200)}`)
       const res = await rpc.request('session/prompt', {
         sessionId: state.sessionId,
-        contentBlocks: [{ type: 'text', text }],
+        contentBlocks: [{ type: 'text', text: body }],
       })
       trace(`prompt queued: ${res.messageId}`)
       log.dim(`(queued ${res.messageId})`)
@@ -772,10 +898,11 @@ async function main() {
       trace(`prompt failed: ${e.message}`)
       log.err(`prompt failed: ${e.message}`)
       state.turn = null
-      return
+      return false
     }
     await waiting
     trace('promptTurn done (idle)')
+    return state.lastEndKind === 'completed'
   }
 
   // ---- сериализованная обработка строк (REPL-цикл) ----
@@ -906,6 +1033,20 @@ async function main() {
     process.exit(1)
   }
 
+  if (opts.prompt !== undefined) {
+    // One-shot (-p): один ответ с флагами (--format/--max-length/--stop/--max-tokens)
+    // → в stdout только ответ; выход 0 при completed, 1 при ошибке.
+    const text = opts.prompt.trim()
+    if (!text) {
+      log.err('-p требует непустой текст промпта: dsh-term -p "вопрос"')
+      process.exit(1)
+    }
+    const ok = await promptTurn(text)
+    if (UI.lastChar && UI.lastChar !== '\n') outWrite('\n')
+    try { await rpc.close() } catch {}
+    process.exit(ok ? 0 : 1)
+  }
+
   const resumed = opts.session || (saved?.lastSessionId && saved.lastSessionId === state.sessionId)
   log.dim(`${resumed ? 'resuming' : 'new'} session: ${state.sessionId}`)
   initialized = true
@@ -915,7 +1056,10 @@ async function main() {
 }
 
 process.on('unhandledRejection', (e) => { trace(`unhandledRejection: ${e?.stack ?? e}`) })
-process.on('uncaughtException', (e) => { trace(`uncaughtException: ${e?.stack ?? e}`) })
+process.on('uncaughtException', (e) => {
+  trace(`uncaughtException: ${e?.stack ?? e}`)
+  try { log.err(`internal error: ${e?.message ?? e}`) } catch {}
+})
 
 main().catch((e) => {
   stopStatus()
