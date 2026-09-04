@@ -32,7 +32,11 @@ dsh-term                       # интерактивный REPL
 dsh-term -p "вопрос"           # one-shot: один ответ и выход
 ```
 
-One-shot режим (`-p, --prompt <text>`) — как `claude -p` / `codex exec`: в stdout попадает **только ответ** (диагностика — в stderr), контролы `--format/--max-length/--stop/--max-tokens` применяются именно к этому ответу. Выход: 0 при `completed`, 1 при ошибке.
+One-shot режим (`-p, --print <text>`) — как `claude -p`: в stdout попадает **только ответ** (диагностика — в stderr), контролы `--format/--max-length/--stop/--max-tokens` применяются именно к этому ответу. Выход: 0 при `completed`, 1 при ошибке. Промпт из файла — как в claude, через подстановку:
+
+```powershell
+dsh-term -p "$(Get-Content prompt.md -Raw)"
+```
 
 ```powershell
 dsh-term -p "переведи в json: {…}" --format json --max-length 1000
