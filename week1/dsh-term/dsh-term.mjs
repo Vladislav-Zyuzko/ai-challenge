@@ -295,6 +295,7 @@ function parseArgs(argv) {
     provider: process.env.DSH_TERM_PROVIDER ?? 'deepseek-official',
     model: process.env.DSH_TERM_MODEL ?? 'deepseek-v4-flash',
     maxTokens: undefined,
+    temperature: undefined, // температура сэмплинга 0..2 (аналог --max-tokens, на агента)
     session: undefined,
     prompt: undefined,       // -p/--print: текст промпта (one-shot; claude-style)
     workspace: process.cwd(),
@@ -313,6 +314,7 @@ function parseArgs(argv) {
       case '--provider': opts.provider = next(); break
       case '--model': opts.model = next(); break
       case '--max-tokens': opts.maxTokens = Number(next()); break
+      case '--temperature': opts.temperature = Number(next()); break
       case '--session': case '--resume': opts.session = next(); break
       case '--format': opts.format = next(); break
       case '--max-length': opts.maxLength = Number(next()); break
@@ -445,6 +447,20 @@ function shortArgs(raw) {
     return raw.slice(0, 120)
   }
 }
+
+// Режим «только итог» для one-shot: агентные модели склонны «проговаривать
+// вслух» свои шаги обычным текстом, а протокол не отличает этот нарратив от
+// ответа (это не reasoning — это text-delta). Поэтому в -p просим модель
+// выводить исключительно финальный результат.
+const FINAL_ONLY_SUFFIX = `
+
+---
+
+ВАЖНО (режим «только итоговый результат»): верни ТОЛЬКО итоговый ответ на задачу.
+Запрещено: описывать свои действия или план, комментировать процесс, писать
+промежуточные заметки и рассуждения, пересказывать, что ты делаешь. Работай
+инструментами молча. Весь твой вывод сохраняется как результат — в нём не должно
+быть ничего, кроме итога.`
 
 // ---------- формат/длина/стоп: пресеты и инструкции ----------
 const FORMAT_PRESETS = {
@@ -636,6 +652,7 @@ async function main() {
     log.line('  --provider <id>     провайдер (default: deepseek-official; env DSH_TERM_PROVIDER)')
     log.line('  --model <name>      модель (default: deepseek-v4-flash; env DSH_TERM_MODEL)')
     log.line('  --max-tokens <n>    лимит токенов ответа (жёсткий кап адаптера)')
+    log.line('  --temperature <n>   температура сэмплинга 0..2 (по умолчанию — провайдерская, 1.0)')
     log.line('  --format <spec>     формат ответа: пресет (json/plain/markdown/bullets/code/table) или описание')
     log.line('  --max-length <n>    лимит длины ответа в символах: инструкция + обрезка показа')
     log.line('  --stop <marker>     стоп-символ: передаётся с промптом; показ обрывается при генерации маркера')
@@ -671,6 +688,13 @@ async function main() {
       maxChars: Number.isFinite(opts.maxLength) && opts.maxLength > 0 ? Math.floor(opts.maxLength) : null,
       marker: opts.stopMarker ?? null,
     }
+  }
+
+  // Температура сэмплинга: валидируем диапазон до запуска рантайма.
+  if (opts.temperature !== undefined
+    && (!Number.isFinite(opts.temperature) || opts.temperature < 0 || opts.temperature > 2)) {
+    log.err('--temperature должен быть числом в диапазоне 0..2')
+    process.exit(1)
   }
 
   // SIGINT (Ctrl+C) должен гасить процесс в ЛЮБОМ состоянии — регистрируем
@@ -1030,6 +1054,7 @@ async function main() {
       provider: opts.provider,
       model: opts.model,
       ...(opts.maxTokens ? { maxTokens: opts.maxTokens } : {}),
+      ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
     })
     log.dim(`runtime: ${res.serverInfo.name} ${res.serverInfo.version} · provider=${opts.provider} model=${opts.model}`)
   } catch (e) {
@@ -1046,7 +1071,7 @@ async function main() {
     // (--format/--max-length/--stop/--max-tokens) → в stdout только ответ;
     // выход 0 при completed, 1 при ошибке. Файл-промпт — как в claude:
     // -p "$(Get-Content prompt.md -Raw)".
-    const text = oneShotText.trim()
+    const text = oneShotText.trim() + FINAL_ONLY_SUFFIX
     if (!text) {
       log.err('one-shot требует непустой промпт: dsh-term -p "вопрос"')
       process.exit(1)

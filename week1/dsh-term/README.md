@@ -32,11 +32,13 @@ dsh-term                       # интерактивный REPL
 dsh-term -p "вопрос"           # one-shot: один ответ и выход
 ```
 
-One-shot режим (`-p, --print <text>`) — как `claude -p`: в stdout попадает **только ответ** (диагностика — в stderr), контролы `--format/--max-length/--stop/--max-tokens` применяются именно к этому ответу. Выход: 0 при `completed`, 1 при ошибке. Промпт из файла — как в claude, через подстановку:
+One-shot режим (`-p, --print <text>`) — как `claude -p`: в stdout попадает **только ответ** (диагностика — в stderr), контролы `--format/--max-length/--stop/--max-tokens/--temperature` применяются именно к этому ответу. Выход: 0 при `completed`, 1 при ошибке. Промпт из файла — как в claude, через подстановку:
 
 ```powershell
 dsh-term -p "$(Get-Content prompt.md -Raw)"
 ```
+
+В one-shot автоматически добавляется дисциплина «только итоговый результат» (без описания процесса/промежуточных заметок), чтобы при перенаправлении вывода в файл попадал финальный ответ, а не рабочий нарратив агента.
 
 ```powershell
 dsh-term -p "переведи в json: {…}" --format json --max-length 1000
@@ -58,6 +60,7 @@ dsh-term --dsh-home C:\Users\<you>\.dsh
 | `--provider <id>` | провайдер (default: `deepseek-official`; env `DSH_TERM_PROVIDER`) |
 | `--model <name>` | модель (default: `deepseek-v4-flash`; env `DSH_TERM_MODEL`) |
 | `--max-tokens <n>` | жёсткий кап токенов ответа (адаптер) |
+| `--temperature <n>` | температура сэмплинга 0..2 (умолчание — провайдерская, 1.0); действует на агента сессии |
 | `--format <spec>` | формат ответа: пресет (`json`/`plain`/`markdown`/`bullets`/`code`/`table`) или свободное описание |
 | `--max-length <n>` | лимит длины ответа в символах: инструкция модели + обрезка показа с пометкой |
 | `--stop <marker>` | стоп-символ: передаётся с промптом; показ обрывается при генерации маркера (сам маркер не печатается) |
