@@ -44,11 +44,15 @@ void main() {
     sw.stop();
     final sum = fw.query(0, 0, m - 1, n - 1) as int;
 
+    // Один и тот же набор запросов для каждой реализации: общий rnd
+    // продолжал бы крутиться и давал бы каждой модели свои запросы,
+    // из-за чего контрольные суммы были бы несравнимы.
+    final qrnd = Random(777);
     final qw = Stopwatch()..start();
     var acc = 0;
     for (var i = 0; i < 100000; i++) {
-      acc += fw.query(rnd.nextInt(m ~/ 2), rnd.nextInt(n ~/ 2),
-          m ~/ 2 + rnd.nextInt(m ~/ 2), n ~/ 2 + rnd.nextInt(n ~/ 2)) as int;
+      acc += fw.query(qrnd.nextInt(m ~/ 2), qrnd.nextInt(n ~/ 2),
+          m ~/ 2 + qrnd.nextInt(m ~/ 2), n ~/ 2 + qrnd.nextInt(n ~/ 2)) as int;
     }
     qw.stop();
 

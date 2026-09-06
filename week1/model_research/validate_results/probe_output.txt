@@ -9,34 +9,34 @@
 (b) рваная: [[1,2,3],[4,5]]
     haiku-4.5   throws RangeError
     sonnet-5    throws RangeError
-    opus-5      throws ArgumentError
+    opus-5      throws RangeError
 
 (c) рваная: [[1,2],[3,4,5]]
     haiku-4.5   вернул сумма 10 вместо 15 (элемент 5 потерян)
     sonnet-5    вернул сумма 10 вместо 15 (элемент 5 потерян)
-    opus-5      throws ArgumentError
+    opus-5      вернул сумма 10 вместо 15 (элемент 5 потерян)
 
 (d1) update(5,0,..) вне диапазона
     haiku-4.5   throws RangeError
     sonnet-5    throws RangeError
-    opus-5      throws IndexError
+    opus-5      throws RangeError
 
 (d2) update(0,-1,..) отрицательный col
     haiku-4.5   throws RangeError
     sonnet-5    throws RangeError
-    opus-5      throws IndexError
+    opus-5      throws RangeError
 
 (d3) query(0,0,9,9) за границей
     haiku-4.5   throws RangeError
     sonnet-5    throws RangeError
-    opus-5      throws IndexError
+    opus-5      throws RangeError
 
 (d4) query(-1,0,1,1) отрицательный row1
     haiku-4.5   вернул 10
     sonnet-5    вернул 10
-    opus-5      throws IndexError
+    opus-5      throws RangeError
 
 (e) query(1,1,0,0) перевёрнутый прямоугольник
     haiku-4.5   вернул 0
     sonnet-5    вернул 0
-    opus-5      throws RangeError
+    opus-5      вернул 0

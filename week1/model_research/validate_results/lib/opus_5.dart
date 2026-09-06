@@ -1,67 +1,97 @@
-// Код извлечён ДОСЛОВНО из ../opus_5.md (модель Opus 5).
-// Изменений нет, добавлен только этот комментарий.
-
-/// Двумерное дерево Фенвика: точечное присваивание и сумма по прямоугольнику.
+/// Двумерное дерево Фенвика (Binary Indexed Tree).
 ///
-/// Публичный API 0-based, внутреннее дерево 1-based.
-/// Построение: O(M*N). update: O(log M * log N). query: O(log M * log N).
-/// Память: O(M*N).
+/// Поддерживает точечную замену значения и сумму на произвольном
+/// подпрямоугольнике за O(log M * log N).
 class Fenwick2D {
-  final int _rows;
-  final int _cols;
+  /// Количество строк исходной матрицы.
+  final int rows;
 
-  /// Актуальные значения матрицы — нужны, чтобы update умел присваивать,
-  /// а не только прибавлять.
-  final List<List<int>> _values;
+  /// Количество столбцов исходной матрицы.
+  final int cols;
 
-  /// Дерево частичных сумм, индексы 1..rows / 1..cols.
+  /// Дерево Фенвика, 1-based по обеим осям: размер (rows + 1) x (cols + 1).
   final List<List<int>> _tree;
 
+  /// Актуальные значения матрицы — нужны, чтобы вычислять дельту при update.
+  final List<List<int>> _vals;
+
+  /// Строит структуру по матрице [matrix] за O(M * N).
+  ///
+  /// Матрица копируется, поэтому внешние изменения исходного списка
+  /// на структуру не влияют.
   Fenwick2D(List<List<int>> matrix)
-      : _rows = matrix.length,
-        _cols = matrix.isEmpty ? 0 : matrix.first.length,
-        _values = [for (final row in matrix) List<int>.of(row)],
-        _tree = List.generate(
+      : rows = matrix.length,
+        cols = matrix.isEmpty ? 0 : matrix[0].length,
+        _vals = List<List<int>>.generate(
+          matrix.length,
+          (i) => List<int>.of(matrix[i]),
+          growable: false,
+        ),
+        _tree = List<List<int>>.generate(
           matrix.length + 1,
           (_) => List<int>.filled(
-            (matrix.isEmpty ? 0 : matrix.first.length) + 1,
+            (matrix.isEmpty ? 0 : matrix[0].length) + 1,
             0,
           ),
           growable: false,
         ) {
-    for (final row in matrix) {
-      if (row.length != _cols) {
-        throw ArgumentError('Матрица должна быть прямоугольной');
-      }
-    }
     _build();
   }
 
-  int get rows => _rows;
-  int get cols => _cols;
-
-  /// Заменяет значение в ячейке (row, col) на newValue.
-  void update(int row, int col, int newValue) {
-    _checkCell(row, col);
-    final delta = newValue - _values[row][col];
-    if (delta == 0) return;
-    _values[row][col] = newValue;
-
-    for (var i = row + 1; i <= _rows; i += i & -i) {
+  /// Каскадное построение дерева за O(M * N).
+  void _build() {
+    // 1) Горизонтальный проход: внутри каждой строки собираем 1D-дерево Фенвика.
+    for (var i = 1; i <= rows; i++) {
       final treeRow = _tree[i];
-      for (var j = col + 1; j <= _cols; j += j & -j) {
+      final srcRow = _vals[i - 1];
+      for (var j = 1; j <= cols; j++) {
+        treeRow[j] += srcRow[j - 1];
+        final parent = j + (j & -j);
+        if (parent <= cols) {
+          treeRow[parent] += treeRow[j];
+        }
+      }
+    }
+    // 2) Вертикальный проход: собираем 1D-дерево Фенвика внутри каждого столбца.
+    for (var j = 1; j <= cols; j++) {
+      for (var i = 1; i <= rows; i++) {
+        final parent = i + (i & -i);
+        if (parent <= rows) {
+          _tree[parent][j] += _tree[i][j];
+        }
+      }
+    }
+  }
+
+  /// Заменяет значение в ячейке ([row], [col]) на [newValue].
+  ///
+  /// Сложность O(log M * log N).
+  void update(int row, int col, int newValue) {
+    if (row < 0 || row >= rows || col < 0 || col >= cols) {
+      throw RangeError('Индекс ($row, $col) вне матрицы ${rows}x$cols');
+    }
+    final delta = newValue - _vals[row][col];
+    if (delta == 0) return;
+    _vals[row][col] = newValue;
+
+    for (var i = row + 1; i <= rows; i += i & -i) {
+      final treeRow = _tree[i];
+      for (var j = col + 1; j <= cols; j += j & -j) {
         treeRow[j] += delta;
       }
     }
   }
 
-  /// Сумма элементов прямоугольника (row1, col1)..(row2, col2) включительно.
+  /// Сумма элементов подпрямоугольника с углами ([row1], [col1]) и ([row2], [col2])
+  /// включительно.
+  ///
+  /// Сложность O(log M * log N).
   int query(int row1, int col1, int row2, int col2) {
-    _checkCell(row1, col1);
-    _checkCell(row2, col2);
-    if (row1 > row2 || col1 > col2) {
-      throw RangeError('Ожидается row1 <= row2 и col1 <= col2');
+    if (row1 < 0 || col1 < 0 || row2 >= rows || col2 >= cols) {
+      throw RangeError('Прямоугольник ($row1, $col1)-($row2, $col2) '
+          'вне матрицы ${rows}x$cols');
     }
+    if (row1 > row2 || col1 > col2) return 0;
 
     return _prefix(row2 + 1, col2 + 1) -
         _prefix(row1, col2 + 1) -
@@ -69,37 +99,11 @@ class Fenwick2D {
         _prefix(row1, col1);
   }
 
-  /// Текущее значение ячейки — удобно для отладки и тестов.
-  int valueAt(int row, int col) {
-    _checkCell(row, col);
-    return _values[row][col];
-  }
+  /// Текущее значение ячейки ([row], [col]) — O(1).
+  int valueAt(int row, int col) => _vals[row][col];
 
-  /// Линейное построение: сначала по столбцам внутри каждой строки,
-  /// затем по строкам. Порядок проходов важен, объединять их нельзя.
-  void _build() {
-    for (var i = 1; i <= _rows; i++) {
-      final treeRow = _tree[i];
-      final sourceRow = _values[i - 1];
-      for (var j = 1; j <= _cols; j++) {
-        treeRow[j] += sourceRow[j - 1];
-        final parent = j + (j & -j);
-        if (parent <= _cols) treeRow[parent] += treeRow[j];
-      }
-    }
-
-    for (var i = 1; i <= _rows; i++) {
-      final parent = i + (i & -i);
-      if (parent > _rows) continue;
-      final from = _tree[i];
-      final to = _tree[parent];
-      for (var j = 1; j <= _cols; j++) {
-        to[j] += from[j];
-      }
-    }
-  }
-
-  /// Сумма подматрицы [0..r) x [0..c) в 1-based координатах дерева.
+  /// Сумма прямоугольника [0..r-1] x [0..c-1] (границы 1-based, эксклюзивные
+  /// в терминах 0-based индексов матрицы).
   int _prefix(int r, int c) {
     var sum = 0;
     for (var i = r; i > 0; i -= i & -i) {
@@ -109,14 +113,5 @@ class Fenwick2D {
       }
     }
     return sum;
-  }
-
-  void _checkCell(int row, int col) {
-    if (row < 0 || row >= _rows) {
-      throw RangeError.index(row, _values, 'row', 'Строка вне диапазона');
-    }
-    if (col < 0 || col >= _cols) {
-      throw RangeError.index(col, _values.first, 'col', 'Столбец вне диапазона');
-    }
   }
 }

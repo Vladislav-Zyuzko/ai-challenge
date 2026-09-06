@@ -14,7 +14,7 @@ typedef Factory = dynamic Function(List<List<int>> matrix);
 final claimed = {
   'haiku-4.5': ['45', '50', '38'],
   'sonnet-5': ['45', '50', '38'],
-  'opus-5': ['45', '50', '35'], // в коде примера // 35, в тексте — 38
+  'opus-5': ['45', '50', '38'],
 };
 
 final impls = <String, Factory>{
