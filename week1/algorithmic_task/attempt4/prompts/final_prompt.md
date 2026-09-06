@@ -1,0 +1,1 @@
+﻿Ты — техлид. Изучи фидбеки экспертов (analyst, engineer, critic) и выдай ФИНАЛЬНОЕ решение задачи из файла input.md на Dart: функцию minWindow(String s, String t) и, при желании, main() с проверкой примеров.

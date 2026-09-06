@@ -296,7 +296,7 @@ function parseArgs(argv) {
     model: process.env.DSH_TERM_MODEL ?? 'deepseek-v4-flash',
     maxTokens: undefined,
     session: undefined,
-    prompt: undefined,       // -p/--prompt: one-shot режим (один ответ и выход)
+    prompt: undefined,       // -p/--print: текст промпта (one-shot; claude-style)
     workspace: process.cwd(),
     dshBin: 'dsh',
     format: undefined,       // пресет или свободное описание формата ответа
@@ -317,7 +317,7 @@ function parseArgs(argv) {
       case '--format': opts.format = next(); break
       case '--max-length': opts.maxLength = Number(next()); break
       case '--stop': opts.stopMarker = next(); break
-      case '-p': case '--prompt': opts.prompt = next(); break
+      case '-p': case '--print': opts.prompt = next(); break
       case '--workspace': opts.workspace = next(); break
       case '--dsh-bin': opts.dshBin = next(); break
       case '-h': case '--help': opts.help = true; break
@@ -629,7 +629,8 @@ async function main() {
     log.line('  dsh-term -p "вопрос" [флаги]  one-shot: один ответ с флагами и выход')
     log.line('')
     log.line('Опции:')
-    log.line('  -p, --prompt <text>  текст промпта (one-shot режим)')
+    log.line('  -p, --print <text>  промпт (one-shot, чистый контекст); файл — как в claude:')
+    log.line('                      -p "$(Get-Content prompt.md -Raw)"')
     log.line('  --dsh-home <path>   Harness home (default: ~/.dsh-term)')
     log.line('  --profile <name>    профиль рантайма (default: sdk)')
     log.line('  --provider <id>     провайдер (default: deepseek-official; env DSH_TERM_PROVIDER)')
@@ -658,7 +659,7 @@ async function main() {
     return
   }
 
-  // One-shot (-p): весь вывод ответа в stdout, диагностика в stderr.
+  // One-shot (-p/--print): весь вывод ответа в stdout, диагностика в stderr.
   if (opts.prompt !== undefined) UI.oneShot = true
 
   // Контролы ответа (--format / --max-length / --stop): применяются к ОДНОМУ
@@ -698,8 +699,11 @@ async function main() {
   const token = await ensureToken(opts.dshHome)
 
   // Состояние REPL: продолжаем последнюю сессию, если не указана явная.
+  // ВАЖНО для one-shot: без --session всегда СВЕЖАЯ сессия (чистый контекст),
+  // авто-resume последней сессии в -p/--print отключён.
   const saved = loadState(opts.dshHome)
-  const sessionId = opts.session ?? saved?.lastSessionId ?? randomUUID()
+  const isOneShot = opts.prompt !== undefined
+  const sessionId = opts.session ?? (isOneShot ? randomUUID() : saved?.lastSessionId ?? randomUUID())
   const state = {
     sessionId,
     children: new Set(),       // subagent-сессии текущего дерева
@@ -707,7 +711,9 @@ async function main() {
     streamedText: false,       // печатали ли текст за текущий ход
     lastEndKind: null,         // чем закончился последний ход ('completed'/'error'/…)
   }
-  saveState(opts.dshHome, sessionId)
+  // В one-shot state не сохраняем: прогоны не должны затирать «последнюю сессию»
+  // для интерактивного режима (у каждого -p запуска и так своя свежая сессия).
+  if (!isOneShot) saveState(opts.dshHome, sessionId)
 
   const rpc = spawnRuntime(opts, token)
   rpcRef = rpc
@@ -1033,12 +1039,16 @@ async function main() {
     process.exit(1)
   }
 
+  const oneShotText = opts.prompt ?? ''
+
   if (opts.prompt !== undefined) {
-    // One-shot (-p): один ответ с флагами (--format/--max-length/--stop/--max-tokens)
-    // → в stdout только ответ; выход 0 при completed, 1 при ошибке.
-    const text = opts.prompt.trim()
+    // One-shot (-p / --print): один ответ с флагами
+    // (--format/--max-length/--stop/--max-tokens) → в stdout только ответ;
+    // выход 0 при completed, 1 при ошибке. Файл-промпт — как в claude:
+    // -p "$(Get-Content prompt.md -Raw)".
+    const text = oneShotText.trim()
     if (!text) {
-      log.err('-p требует непустой текст промпта: dsh-term -p "вопрос"')
+      log.err('one-shot требует непустой промпт: dsh-term -p "вопрос"')
       process.exit(1)
     }
     const ok = await promptTurn(text)
