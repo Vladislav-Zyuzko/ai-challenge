@@ -1,0 +1,7 @@
+name: fenwick2d_validation
+description: Валидация решений задачи "2D Fenwick Tree" от моделей haiku-4.5, sonnet-5, opus-5.
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
