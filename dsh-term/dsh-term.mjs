@@ -87,6 +87,16 @@ function promptTokensOf(u) {
   return (u?.inputTokens ?? 0) + (u?.cacheReadTokens ?? 0) + (u?.cacheWriteTokens ?? 0)
 }
 
+/** Кэш-токены запроса (чтение + запись) — показываются отдельно: они дешевле. */
+function cacheTokensOf(u) {
+  return (u?.cacheReadTokens ?? 0) + (u?.cacheWriteTokens ?? 0)
+}
+
+/** Пустые счётчики сессии: расход, кэш и число запросов к модели. */
+function emptyMetrics() {
+  return { prompts: 0, outputs: 0, cacheReads: 0, calls: 0 }
+}
+
 // ---------- живой счётчик токенов во время генерации ----------
 // Точный usage API присылает только в конце запроса, поэтому «живой» счётчик —
 // оценка по символам стрима (текст + reasoning); отношение chars/token
@@ -1468,7 +1478,7 @@ async function main() {
     turn: null,                // { resolve, running, timer, maxChars, marker, … }
     streamedText: false,       // печатали ли текст за текущий ход
     lastEndKind: null,         // чем закончился последний ход ('completed'/'error'/…)
-    metrics: { prompts: 0, outputs: 0 }, // накопленный расход токенов сессии (usage)
+    metrics: emptyMetrics(), // расход сессии: prompts/outputs/cacheReads/calls
     titles: { ...(saved?.titles ?? {}) }, // sessionId → короткий заголовок сессии
     titleLocked: new Set(saved?.titleLocked ?? []), // заголовки, которые харнесс не перебивает
     isNew: false,              // сессия создана в этом запуске (для авто-заголовка)
@@ -1611,7 +1621,8 @@ async function main() {
             : `— turn ${event.data.turn} ended: ${r.kind}`
           if (f) log.err(head)
           else log.dim(head)
-          log.dim(`  tokens: in ${fmtTok(state.metrics.prompts)} / out ${fmtTok(state.metrics.outputs)}`)
+          log.dim(`  tokens: in ${fmtTok(state.metrics.prompts)} (cache ${fmtTok(state.metrics.cacheReads)}) / out ${fmtTok(state.metrics.outputs)}`)
+          log.dim(`  requests: ${state.metrics.calls} (this turn: ${steps.length})`)
           log.dim(`  context: ${fmtTok(ctx)} / ${fmtTok(CTX_MAX)} (${fmtPct(ctx, CTX_MAX)}%)`)
         } else if (f) {
           log.err(`— turn ${event.data.turn} ended: ${r.kind} (${f.code ?? f.name}: ${f.message})`)
@@ -1631,9 +1642,12 @@ async function main() {
         if (u && t) {
           const prompt = promptTokensOf(u)
           const output = u.outputTokens ?? 0
+          const cache = cacheTokensOf(u)
           state.metrics.prompts += prompt
           state.metrics.outputs += output
-          t.steps.push({ prompt, output })
+          state.metrics.cacheReads += cache
+          state.metrics.calls += 1 // один запрос к модели = одно готовое сообщение шага
+          t.steps.push({ prompt, output, cache })
           // Калибровка «живого» счётчика по факту: символы стрима ↔ выходные токены.
           if (meter.stepChars > 20 && output > 0) {
             const r = meter.stepChars / output
@@ -1814,7 +1828,7 @@ async function main() {
           state.sessionId = resolved
           state.children.clear()
           state.isNew = false
-          state.metrics = { prompts: 0, outputs: 0 }
+          state.metrics = emptyMetrics()
           saveState(opts.dshHome, resolved, state.titles, state.titleLocked)
           log.line(`${C.dim}resuming session:${C.reset} ${fmtSession(resolved, state.titles[resolved])}`)
         } else {
@@ -1826,7 +1840,7 @@ async function main() {
           state.sessionId = chosen
           state.children.clear()
           state.isNew = false
-          state.metrics = { prompts: 0, outputs: 0 }
+          state.metrics = emptyMetrics()
           saveState(opts.dshHome, chosen, state.titles, state.titleLocked)
           log.line(`${C.dim}resuming session:${C.reset} ${fmtSession(chosen, state.titles[chosen])}`)
         }
@@ -1836,7 +1850,7 @@ async function main() {
         state.sessionId = randomUUID()
         state.children.clear()
         state.isNew = true
-        state.metrics = { prompts: 0, outputs: 0 }
+        state.metrics = emptyMetrics()
         saveState(opts.dshHome, state.sessionId, state.titles, state.titleLocked)
         log.dim(`new session: ${state.sessionId}`)
         break
