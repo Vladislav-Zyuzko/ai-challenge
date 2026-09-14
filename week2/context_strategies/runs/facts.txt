@@ -1,0 +1,148 @@
+runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
+ui: in-tty=0 out-tty=0 colors=0 md=0
+compress: off
+strategy: facts (окно 6) — контекстом управляет facts + окно сообщений (автокомпакция харнесса выключена)
+resuming session: 32036207-f6fa-410a-8e0b-90af0fad6792
+· контекст [facts (окно 6)]: 0 сообщений + 3 facts, 182 токенов ≈
+(queued 60da2884-2d0b-4f44-a169-64724f1cc605)
+· заголовок сессии: «Известные факты о зад»
+принял
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 7.7k (cache 7.3k) / out 4
+  requests: 1 (this turn: 1)
+  strategy: 1 facts update, 416 tokens
+  context: 7.7k / 1M (0.772%)
+
+· контекст [facts (окно 6)]: 2 сообщений + 4 facts, 344 токенов ≈
+(queued c416da49-3975-42ac-b456-693713067d4f)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 15.7k (cache 14.6k) / out 6
+  requests: 2 (this turn: 1)
+  strategy: 1 facts update, 749 tokens
+  context: 8k / 1M (0.796%)
+
+· контекст [facts (окно 6)]: 4 сообщений + 4 facts, 494 токенов ≈
+(queued 46316af5-4bce-4292-a0c7-79b5e71308a4)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 23.9k (cache 21.9k) / out 49
+  requests: 3 (this turn: 1)
+  strategy: 1 facts update, 1k tokens
+  context: 8.2k / 1M (0.817%)
+
+· контекст [facts (окно 6)]: 6 сообщений + 4 facts, 645 токенов ≈
+(queued 57b609eb-7433-42d5-839c-e6f03a42df66)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 32.2k (cache 29.2k) / out 72
+  requests: 4 (this turn: 1)
+  strategy: 1 facts update, 1.3k tokens
+  context: 8.4k / 1M (0.838%)
+
+· контекст [facts (окно 6)]: 6 сообщений + 4 facts, 716 токенов ≈
+(queued 989b7681-7619-4e68-a2b7-7ec05cba5b56)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 40.7k (cache 36.7k) / out 102
+  requests: 5 (this turn: 1)
+  strategy: 1 facts update, 1.6k tokens
+  context: 8.5k / 1M (0.847%)
+
+· контекст [facts (окно 6)]: 6 сообщений + 4 facts, 783 токенов ≈
+(queued bad10c95-4a4f-4b73-bb1d-bb65d1e4bf36)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 49.2k (cache 44.3k) / out 104
+  requests: 6 (this turn: 1)
+  strategy: 1 facts update, 1.8k tokens
+  context: 8.5k / 1M (0.854%)
+
+· контекст [facts (окно 6)]: 6 сообщений + 4 facts, 847 токенов ≈
+(queued b7568d96-0057-43f9-8c3a-0b254872cde0)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 57.9k (cache 52k) / out 122
+  requests: 7 (this turn: 1)
+  strategy: 1 facts update, 1.9k tokens
+  context: 8.6k / 1M (0.861%)
+
+· контекст [facts (окно 6)]: 6 сообщений + 4 facts, 900 токенов ≈
+(queued 57511dbc-c12d-4444-ba9c-91b6d8bf698d)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 66.5k (cache 59.8k) / out 124
+  requests: 8 (this turn: 1)
+  strategy: 1 facts update, 2.1k tokens
+  context: 8.7k / 1M (0.868%)
+
+· контекст [facts (окно 6)]: 6 сообщений + 4 facts, 891 токенов ≈
+(queued 605cffbf-e027-4886-9617-a823b073e103)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 75.2k (cache 67.7k) / out 159
+  requests: 9 (this turn: 1)
+  strategy: 1 facts update, 2.2k tokens
+  context: 8.7k / 1M (0.867%)
+
+· контекст [facts (окно 6)]: 6 сообщений + 4 facts, 880 токенов ≈
+(queued fd291f90-8e83-4914-97e8-4d5bf0bb760e)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 83.9k (cache 75.6k) / out 184
+  requests: 10 (this turn: 1)
+  strategy: 1 facts update, 2.2k tokens
+  context: 8.7k / 1M (0.866%)
+
+· контекст [facts (окно 6)]: 6 сообщений + 4 facts, 865 токенов ≈
+(queued 8d62d4bc-a751-424d-8f1e-fb1d119f9a71)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 92.5k (cache 83.6k) / out 186
+  requests: 11 (this turn: 1)
+  strategy: 1 facts update, 2.1k tokens
+  context: 8.6k / 1M (0.865%)
+
+· контекст [facts (окно 6)]: 6 сообщений + 4 facts, 800 токенов ≈
+(queued bfbf9cdd-adfd-4d6b-94a4-3d5536d893e0)
+KX-42
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 101.1k (cache 91.5k) / out 191
+  requests: 12 (this turn: 1)
+  strategy: 1 facts update, 2.1k tokens
+  context: 8.6k / 1M (0.856%)
+
+· контекст [facts (окно 6)]: 6 сообщений + 4 facts, 746 токенов ≈
+(queued 58b3b926-4dc1-4c39-98b0-4bec651ad123)
+Бюджет 2,4 млн руб. (400 тыс. — дизайн, 2 млн — разработка), дедлайн 30 апреля — жёсткий, приложение должно быть в сторах.
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 109.6k (cache 99.5k) / out 277
+  requests: 13 (this turn: 1)
+  strategy: 1 facts update, 2k tokens
+  context: 8.5k / 1M (0.848%)
+
+· контекст [facts (окно 6)]: 6 сообщений + 4 facts, 719 токенов ≈
+(queued 270adccf-b143-4860-bb80-9c765deccf5c)
+Интеграции: 1С (товары/остатки, обмен раз в 15 мин), СДЭК (расчёт и трекинг), ЮKassa (платежи) и Firebase (пуши); оплата через ЮKassa — картой и по СБП.
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 118k (cache 107.4k) / out 429
+  requests: 14 (this turn: 1)
+  strategy: 1 facts update, 1.9k tokens
+  context: 8.5k / 1M (0.846%)
+
+
+# ===== stderr (метрики) =====
