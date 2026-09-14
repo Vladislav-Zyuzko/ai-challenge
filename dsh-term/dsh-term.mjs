@@ -39,6 +39,7 @@ function outWrite(s) {
   drainMd() // сначала напечатать накопленный текст ответа (порядок вывода)
   meterEraseTail() // новый контент — сначала убрать хвостовой счётчик токенов
   UI.lastChar = s.length > 0 ? s[s.length - 1] : UI.lastChar
+  meterNoteText(s) // служебные строки тоже двигают курсор — иначе счётчик уедет за границу
   process.stdout.write(s)
 }
 const log = {
@@ -92,9 +93,82 @@ function cacheTokensOf(u) {
   return (u?.cacheReadTokens ?? 0) + (u?.cacheWriteTokens ?? 0)
 }
 
-/** Пустые счётчики сессии: расход, кэш и число запросов к модели. */
+/** Пустые счётчики сессии: расход, кэш, запросы и работа суммаризатора. */
 function emptyMetrics() {
-  return { prompts: 0, outputs: 0, cacheReads: 0, calls: 0 }
+  return { prompts: 0, outputs: 0, cacheReads: 0, calls: 0, lastPrompt: 0, compactions: 0, compactTokens: 0, compactFails: 0 }
+}
+
+// ---------- управление контекстом: компрессия истории ----------
+// Настройки передаются харнессу патч-оверлеем (`dsh --patch`), поэтому править
+// Program Files не нужно. Механизм харнесса: недавний «хвост» держится как есть
+// (retainTokens), остальное суммируется LLM-ом и подставляется в запрос вместо
+// полной истории (событие `compaction/summary`).
+const COMPRESS_DEFAULT_RATIO = 0.1   // срабатывать при 10% заполнения окна
+const COMPRESS_DEFAULT_KEEP = 50000  // «последние сообщения как есть» ≈ 50k токенов (5% окна)
+const COMPRESS_SYSTEM_FLOOR = 8000   // неподвижный префикс: системный промпт + описания инструментов
+
+/** Политика компрессии в токенах — единственная объективная метрика (сообщения субъективны). */
+function compressPolicyText(c) {
+  if (!c || c.mode !== 'on') return ''
+  return ` (compact at ${fmtTok(c.thresholdTokens)} tokens, keep last ${fmtTok(c.keep)} tokens)`
+}
+
+/**
+ * Замечания к выбранной политике компрессии (пусто — всё согласовано).
+ * Харнесс требует `retainTokens < thresholdRatio × contextWindow`: иначе спека
+ * отбрасывается (`TargetPressureConfigError`) и компакция НЕ работает — в логе
+ * харнесса остаётся только warning, а сессия молча едет без сжатия.
+ * @param {{mode: string, keep: number, thresholdTokens: number}} c - политика.
+ * @returns {string[]} human-readable замечания для диагностики.
+ */
+function compressNotes(c) {
+  if (!c || c.mode !== 'on') return []
+  const notes = []
+  if (c.keep >= c.thresholdTokens) {
+    notes.push(`keep ${fmtTok(c.keep)} >= threshold ${fmtTok(c.thresholdTokens)}: harness rejects this policy`
+      + ' (retainTokens must be < threshold), so compaction will NOT run — raise --compress or lower --compress-keep')
+  }
+  if (c.thresholdTokens < COMPRESS_SYSTEM_FLOOR + 5000) {
+    notes.push(`compact threshold ${fmtTok(c.thresholdTokens)} is close to the fixed prefix (${fmtTok(COMPRESS_SYSTEM_FLOOR)},`
+      + ' system prompt + tools) — in agentic turns compaction will fire at once; use --compress 0.05 for a sane default')
+  }
+  // За вычетом неподвижного префикса и хвоста «как есть» — сколько реально уходит в summary.
+  // Порог 5k: сам summary весит ≈1k, поэтому участок меньше ~5k даёт выигрыш, который
+  // не окупает вызов (он переигрывает префикс: in ≈ префикс + участок).
+  const compactable = c.thresholdTokens - COMPRESS_SYSTEM_FLOOR - c.keep
+  if (c.keep < c.thresholdTokens && compactable < 5000) {
+    notes.push(`only ≈ ${fmtTok(Math.max(0, compactable))} tokens per compaction (threshold ${fmtTok(c.thresholdTokens)}`
+      + ` − prefix ${fmtTok(COMPRESS_SYSTEM_FLOOR)} − keep ${fmtTok(c.keep)}), while the summary itself weighs ≈1k`
+      + ' (fixed 8-section structure) — such compactions reclaim almost nothing; raise --compress or lower --compress-keep')
+  }
+  return notes
+}
+
+/** YAML-патч для профиля: `on` — авто-компакция с нашими порогами, `off` — выключено. */
+function compressPatchYaml(compress) {
+  if (compress.mode === 'off') {
+    // Плагин НЕ отключаем: его сервис `compaction` нужен command-compact, иначе
+    // дерево плагинов не загрузится. Просто выключаем автоматическую компакцию.
+    return [
+      '# dsh-term: авто-компрессия истории выключена (baseline для сравнения)',
+      '- id: compaction-basic',
+      '  config:',
+      '    auto: false',
+      '',
+    ].join('\n')
+  }
+  return [
+    '# dsh-term: авто-компрессия истории (thresholdRatio × contextWindow).',
+    '# id-патч заменяет config целиком, поэтому задаём нужные поля явно.',
+    '- id: compaction-basic',
+    '  config:',
+    '    auto: true',
+    `    thresholdRatio: ${compress.ratio}`,
+    `    retainTokens: ${compress.keep}`,
+    '    maxTokens: 4096',
+    '    compactionRetries: 1',
+    '',
+  ].join('\n')
 }
 
 // ---------- живой счётчик токенов во время генерации ----------
@@ -103,7 +177,7 @@ function emptyMetrics() {
 // калибруется по факту на каждом usage. Растёт целыми шагами: 200 … 201;
 // больше 1000 — компактно: 1.1k, 1.2k. Пока видна анимация — счётчик рядом
 // с подписью (светлее), во время видимого ответа — хвостиком за текстом.
-const meter = { estChars: 0, stepChars: 0, ratio: 4, shown: 0, active: false, tail: 0, col: 0 }
+const meter = { estChars: 0, stepChars: 0, ratio: 4, shown: 0, active: false, tail: 0, col: 0, edge: false }
 
 function meterTarget() {
   return Math.floor(meter.estChars / meter.ratio)
@@ -133,16 +207,30 @@ function meterVis(s) {
   return w
 }
 
-/** Учесть выведенный чистый текст: позиция колонки (для гарда от переноса хвоста). */
+/**
+ * Учесть выведенный чистый текст: позиция колонки (для гарда от переноса хвоста).
+ * Учитываем `\n`/`\r` (сброс), табы (до следующей позиции кратной 8), ANSI-коды и
+ * астральные символы. `edge` — «строка заполнена до последней колонки»: терминал
+ * держит курсор в последней колонке (отложенный перенос), и следующий символ
+ * уйдёт на новую строку. В этом состоянии счётчик рисовать нельзя — он окажется
+ * на двух строках, и стирание до конца строки его не уберёт.
+ */
 function meterNoteText(s) {
   const cols = meterCols()
   for (let i = 0; i < s.length; i++) {
     const ch = s[i]
-    if (ch === '\n') { meter.col = 0; continue }
+    if (ch === '\n' || ch === '\r') { meter.col = 0; meter.edge = false; continue }
+    if (ch === '\x1b') {
+      const m = /^\x1b\[[0-9;]*m/.exec(s.slice(i))
+      if (m) i += m[0].length - 1
+      continue
+    }
+    if (ch === '\t') { meter.col += 8 - (meter.col % 8); continue }
     let w = 1
     if (s.codePointAt(i) > 0xffff) { w = 2; i++ }
-    meter.col += w
-    if (meter.col >= cols) meter.col %= cols
+    const next = meter.col + w
+    meter.edge = next >= cols
+    meter.col = meter.edge ? next - cols : next
   }
 }
 
@@ -166,9 +254,17 @@ function meterStepText() {
 }
 
 /**
- * Стереть хвостовой счётчик (он всегда в конце текущей строки).
- * tail — ВИДИМАЯ ширина (без ANSI): иначе backspace уходил бы на предыдущую
- * строку и стирал текст ответа.
+ * Стереть хвостовой счётчик: backspace-ами по его ВИДИМОЙ ширине.
+ *
+ * Так можно, потому что рисовать счётчик разрешено только когда он целиком
+ * помещается в текущую строку с запасом (см. meterDrawTail: `edge` запрещает
+ * рисовать в заполненной строке, плюс запас в колонку). Значит `\b`×tail не
+ * уходит на предыдущую строку, а пробелы не вызывают перенос.
+ * Раньше это ломалось: колонка считалась без табов/ANSI/служебных строк, счётчик
+ * рисовался у самой границы и уезжал на вторую строку — `\b` до него не доставал,
+ * и в тексте ответа оставались куски «(3.1k t». Регресс ловит
+ * tests/render-screen.test.mjs (в т.ч. DSH_TEST_IGNORE_SAVE=1 — терминал без
+ * ESC 7/8: счётчик не должен зависеть от сохранения курсора).
  */
 function meterEraseTail() {
   if (meter.tail <= 0) return
@@ -178,17 +274,19 @@ function meterEraseTail() {
 
 /**
  * Нарисовать счётчик в хвосте строки (после видимого текста, строка не закрыта).
- * Безопасно: только если хвост гарантированно помещается в строку — при
- * нехватке места (перенос строки сломал бы стирание) просто не рисуем.
+ * Если хвост не влезает с запасом в 1 колонку или строка уже заполнена до
+ * последней колонки (отложенный перенос) — не рисуем вовсе: тогда стирание
+ * backspace-ами гарантированно остаётся внутри строки.
  */
 function meterDrawTail() {
+  if (process.env.DSH_TERM_NO_METER) return // диагностика: выключить живой счётчик
   if (!meter.active || UI.oneShot) return
   if (!process.stdout.isTTY) return // хвостик — визуальный гаджет, только для терминала
   if (!UI.lastChar || UI.lastChar === '\n') return
   if (!meterBump()) return
   const text = ' ' + C.dim + meterTextOf(meter.shown) + C.reset
   const w = meterVis(text)
-  if (meter.col + w >= meterCols()) return // не влезает — пропускаем (безопасно)
+  if (meter.edge || meter.col + w + 1 >= meterCols()) return // не влезает — пропускаем (безопасно)
   meterEraseTail()
   process.stdout.write(text)
   meter.tail = w
@@ -286,7 +384,8 @@ function streamFlush(raw) {
   meterEraseTail()
   UI.lastChar = raw[raw.length - 1]
   meterNoteText(raw)
-  process.stdout.write(mdStyle(raw, mdCtx))
+  const styled = mdStyle(raw, mdCtx)
+  process.stdout.write(styled)
 }
 
 // Текст приходит крошечными чанками (1–2 символа), поэтому markdown-конструкции
@@ -351,7 +450,13 @@ function startStatus() {
     const f = status.frame++
     // Живой счётчик токенов — светлее, в скобках рядом с подписью.
     const suffix = meter.active ? ' ' + C.dim + meterStepText() + C.reset : ''
-    process.stdout.write(`\r\x1b[K${captionFor(f)}${suffix}`)
+    const caption = captionFor(f)
+    process.stdout.write(`\r\x1b[K${caption}${suffix}`)
+    // Строка под нашим контролем: счётчик затёрт, курсор — в конце подписи.
+    meter.tail = 0
+    const capW = meterVis(caption + suffix)
+    meter.edge = capW >= meterCols()
+    meter.col = meter.edge ? capW - meterCols() : capW
   }
   draw()
   status.timer = setInterval(draw, 140)
@@ -362,7 +467,25 @@ function stopStatus() {
   if (!status.timer) return
   clearInterval(status.timer)
   status.timer = null
-  if (status.enabled) process.stdout.write('\r\x1b[K')
+  if (status.enabled) {
+    process.stdout.write('\r\x1b[K')
+    meter.tail = 0 // строка очищена вместе с хвостовым счётчиком
+    meter.col = 0
+    meter.edge = false
+  }
+}
+
+/**
+ * Служебная строка при активной анимации: сначала погасить подпись, потом
+ * печатать (иначе текст приклеивается к «Deep diving… (N tokens)»), затем
+ * вернуть подпись.
+ * @param {() => void} fn - вывод одной служебной строки.
+ */
+function withStatusPaused(fn) {
+  const animated = status.timer !== null
+  stopStatus()
+  fn()
+  if (animated) startStatus()
 }
 
 // ---------- построчный читатель stdin (единая очередь для токена и REPL) ----------
@@ -655,8 +778,8 @@ function resolveSessionPick(pick, list, titles) {
 }
 
 /** Сохранённые сессии из `<home>/sessions` (рекурсивно). Раскладка:
- * `sessions/<ns-по-рабочей-папке>/<sessionId>/session.jsonl[.zstd]` —
- * id сессии это имя папки, в которой лежит лог `session.jsonl`. */
+ * `sessions/<ns-по-рабочей-папке>/<sessionId>/session[.vN].jsonl[.zstd]` —
+ * id сессии это имя папки, в которой лежит лог `session*.jsonl`. */
 function listSessions(dshHome) {
   const dir = join(dshHome, 'sessions')
   if (!existsSync(dir)) return []
@@ -667,7 +790,8 @@ function listSessions(dshHome) {
     for (const e of entries) {
       const p = join(d, e.name)
       if (e.isDirectory()) walk(p)
-      else if (e.name === 'session.jsonl' || e.name === 'session.jsonl.zstd') {
+      // Имя лога зависит от версии формата: session.jsonl[.zstd], session.v3.jsonl.zstd, …
+      else if (/^session(\.[\w-]+)?\.jsonl(\.zstd)?$/.test(e.name)) {
         out.push(basename(d)) // родительская папка = sessionId
       }
     }
@@ -692,6 +816,8 @@ function parseArgs(argv) {
     format: undefined,       // пресет или свободное описание формата ответа
     maxLength: undefined,    // лимит длины ответа в символах (мягко + обрезка показа)
     stopMarker: undefined,   // маркер-стоп: рендер обрывается на нём
+    compress: undefined,     // компрессия истории: 'on' | 'off' | <ratio 0..1>
+    compressKeep: undefined, // сколько последних токенов держать как есть
     help: false,
   }
   for (let i = 0; i < argv.length; i++) {
@@ -708,6 +834,8 @@ function parseArgs(argv) {
       case '--format': opts.format = next(); break
       case '--max-length': opts.maxLength = Number(next()); break
       case '--stop': opts.stopMarker = next(); break
+      case '--compress': opts.compress = next(); break
+      case '--compress-keep': opts.compressKeep = Number(next()); break
       case '-p': case '--print': opts.prompt = next(); break
       case '--workspace': opts.workspace = next(); break
       case '--dsh-bin': opts.dshBin = next(); break
@@ -795,6 +923,8 @@ class RpcError extends Error {
 // ---------- runtime spawn ----------
 function spawnRuntime(opts, token) {
   const args = ['--profile', opts.profile]
+  // Патч-оверлеи (наши настройки компрессии) накладываются поверх профиля.
+  for (const p of opts.patches ?? []) args.push('--patch', p)
   // Окружение для рантайма: токен через DEEPSEEK_API_KEY (для харнесса окружение
   // приоритетнее managed-файла) либо уже сохранён в его home.
   const env = {
@@ -869,7 +999,8 @@ function formatInstruction(v) {
 // ---------- реестр команд REPL + git/gh (SKILLS) ----------
 const COMMANDS = [
   { name: 'help', usage: '/help [команда]', desc: 'список команд / справка по команде' },
-  { name: 'session', usage: '/session', desc: 'показать id текущей сессии' },
+  { name: 'session', usage: '/session', desc: 'показать текущую сессию (заголовок и id)' },
+  { name: 'context', usage: '/context', desc: 'контекст: настройки компрессии, метрики, последний summary' },
   { name: 'resume', usage: '/resume [id]', desc: 'продолжить сессию: по id или выбором из списка' },
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
@@ -1397,6 +1528,8 @@ async function main() {
     log.line('  --format <spec>     формат ответа: пресет (json/plain/markdown/bullets/code/table) или описание')
     log.line('  --max-length <n>    лимит длины ответа в символах: инструкция + обрезка показа')
     log.line('  --stop <marker>     стоп-символ: передаётся с промптом; показ обрывается при генерации маркера')
+    log.line('  --compress <mode>   компрессия истории: on (default) | off | <ratio 0..1> (env DSH_TERM_COMPRESS)')
+    log.line('  --compress-keep <n> сколько последних токенов держать как есть (default 50000, ≈5% окна)')
     log.line('  --session <id>      продолжить конкретную сессию (синоним: --resume <id>)')
     log.line('  --workspace <path>  рабочая папка сессий (default: текущая)')
     log.line('  --dsh-bin <path>    путь к dsh (default: dsh из PATH)')
@@ -1404,7 +1537,8 @@ async function main() {
     log.line('Команды REPL:')
     log.line('  /    список доступных команд')
     log.line('  /help [команда]  справка')
-    log.line('  /session  показать id текущей сессии')
+    log.line('  /session  показать текущую сессию (заголовок и id)')
+    log.line('  /context  контекст: настройки компрессии, метрики, последний summary')
     log.line('  /resume [id]  продолжить сессию: по id или выбором из списка')
     log.line('  /new     начать новую сессию')
     log.line('  /token   сменить сохранённый API ключ')
@@ -1466,6 +1600,31 @@ async function main() {
   // Токен: окружение → хранилище → интерактивный запрос при первом входе.
   const token = await ensureToken(opts.dshHome)
 
+  // ---- управление контекстом: настройка компрессии истории ----
+  // Политика задаётся в токенах — объективная метрика (число сообщений субъективно:
+  // в агентной сессии «сообщение» — это шаг с инструментами, их размеры различаются
+  // на порядки). Режимы: 'on' (по умолчанию), 'off' (baseline) или число — доля окна.
+  const compressRaw = String(opts.compress ?? process.env.DSH_TERM_COMPRESS ?? 'on').trim().toLowerCase()
+  const compressOff = ['off', '0', 'false', 'no'].includes(compressRaw)
+  const ratioNum = Number(compressRaw)
+  const ratio = !compressOff && Number.isFinite(ratioNum) && ratioNum > 0 && ratioNum < 1
+    ? ratioNum
+    : COMPRESS_DEFAULT_RATIO
+  const compress = {
+    mode: compressOff ? 'off' : 'on',
+    ratio,
+    keep: Number.isFinite(opts.compressKeep) && opts.compressKeep > 0 ? Math.floor(opts.compressKeep) : COMPRESS_DEFAULT_KEEP,
+    thresholdTokens: Math.round(ratio * CTX_MAX),
+  }
+  try {
+    const patchPath = join(opts.dshHome, 'dsh-term-compress.patch.yml')
+    mkdirSync(opts.dshHome, { recursive: true })
+    writeFileSync(patchPath, compressPatchYaml(compress), 'utf8')
+    opts.patches = [...(opts.patches ?? []), patchPath]
+  } catch (e) {
+    log.err(`compress patch failed: ${e.message}`)
+  }
+
   // Состояние REPL: продолжаем последнюю сессию, если не указана явная.
   // ВАЖНО для one-shot: без --session всегда СВЕЖАЯ сессия (чистый контекст),
   // авто-resume последней сессии в -p/--print отключён.
@@ -1477,8 +1636,13 @@ async function main() {
     children: new Set(),       // subagent-сессии текущего дерева
     turn: null,                // { resolve, running, timer, maxChars, marker, … }
     streamedText: false,       // печатали ли текст за текущий ход
+    streamAttempts: new Map(), // attemptId → { turn, step } для живого стрима (session.assistant-stream)
+    liveStream: false,         // сервер присылал session.assistant-stream в этом процессе
+    compressHint: false,       // подсказка об убыточной компакции уже показана
     lastEndKind: null,         // чем закончился последний ход ('completed'/'error'/…)
     metrics: emptyMetrics(), // расход сессии: prompts/outputs/cacheReads/calls
+    compress,                  // настройки компрессии истории (см. --compress)
+    lastSummary: null,         // последний summary компакции: { text, model, shadowed, tokens }
     titles: { ...(saved?.titles ?? {}) }, // sessionId → короткий заголовок сессии
     titleLocked: new Set(saved?.titleLocked ?? []), // заголовки, которые харнесс не перебивает
     isNew: false,              // сессия создана в этом запуске (для авто-заголовка)
@@ -1510,8 +1674,35 @@ async function main() {
       startStatus()
       return
     }
+    // Живой стрим модели. В формате сессий v3 чанков в логе больше нет
+    // (события assistant/chunk исчезли), поэтому харнесс шлёт их отдельной
+    // нотификацией — её форвардит пропатченный SDK-сервер. Без патча
+    // нотификации нет: текст тогда печатает фолбэк по assistant/message.
+    if (msg.method === 'session.assistant-stream') {
+      // Диагностика: DSH_TERM_NO_STREAM=1 глушит живой стрим — так проверяется
+      // фолбэк по assistant/message (он же путь для харнесса без патча SDK-сервера).
+      if (process.env.DSH_TERM_NO_STREAM) return
+      const { sessionId, frame } = msg.params
+      const mine = sessionId === state.sessionId || state.children.has(sessionId)
+      if (!mine || !frame) return
+      state.liveStream = true // сервер отдаёт живой стрим — фолбэк не нужен
+      const key = `${sessionId}:${frame.attemptId ?? ''}`
+      if (frame.type === 'start') {
+        state.streamAttempts.set(key, { turn: frame.turn, step: frame.step })
+        return
+      }
+      if (frame.type === 'end') {
+        state.streamAttempts.delete(key)
+        return
+      }
+      if (frame.type !== 'chunk' || !frame.chunk || !state.turn) return
+      const at = state.streamAttempts.get(key)
+      renderEvent({ type: 'assistant/chunk', data: { turn: at?.turn, step: at?.step, chunk: frame.chunk } })
+      return
+    }
     if (msg.method === 'session.event') {
       const { sessionId, event } = msg.params
+      trace(`event ${event?.type}`)
       const mine = sessionId === state.sessionId || state.children.has(sessionId)
       // Исход хода фиксируем ДО гейта по state.turn: порядок turn/end vs idle
       // между двумя notify-каналами не гарантирован, а lastEndKind нужен и в -p.
@@ -1533,6 +1724,50 @@ async function main() {
           }
         }
       }
+      // Компрессия контекста: события log-only, приходят и между ходами.
+      if (mine && event.type === 'compaction/summary') {
+        const d = event.data ?? {}
+        const text = (d.summary ?? []).filter((b) => b?.type === 'text').map((b) => b.text).join('\n')
+        const tokens = d.usage?.outputTokens ?? Math.ceil(text.length / 4)
+        const callTokens = promptTokensOf(d.usage) + (d.usage?.outputTokens ?? 0)
+        state.lastSummary = { text, model: d.model ?? '', shadowed: d.shadowedTokenCount ?? 0, tokens, callTokens }
+        state.metrics.compactions += 1
+        state.metrics.compactTokens += callTokens
+        if (state.turn) {
+          state.turn.compactions = (state.turn.compactions ?? 0) + 1
+          state.turn.compactTokens = (state.turn.compactTokens ?? 0) + callTokens
+        }
+        withStatusPaused(() => {
+          // net — СКОЛЬКО СНЯТО С ОКНА: затенённый участок минус то, что встало на
+          // его место (summary + рамка). `call` — СКОЛЬКО СТОИЛ вызов суммаризатора
+          // (вход = переигранный префикс + участок, он же идёт в KV-кэш, плюс выход).
+          const net = state.lastSummary.shadowed - tokens
+          const netText = `net ≈ ${net >= 0 ? '−' : '+'}${fmtTok(Math.abs(net))}`
+          // net < 2k — почти весь прирост съедает фиксированная структура summary (~1k).
+          const wasteful = net < 2000 ? ', wasteful' : ''
+          log.dim(`· context compacted: shadowed ${fmtTok(state.lastSummary.shadowed)} → summary ${fmtTok(tokens)} (${netText}, call ${fmtTok(callTokens)}${wasteful})${d.model ? ` (${d.model})` : ''}`)
+          // Раз в сессию: объясняем убыточную компакцию и что с этим делать. Причина
+          // почти всегда одна — хвост «как есть» набирается ЦЕЛЫМИ сообщениями, и
+          // несколько крупных ответов съедают весь keep, оставляя сжимать крохи.
+          if (wasteful && !state.compressHint) {
+            state.compressHint = true
+            log.dim(`  hint: снято всего ≈${fmtTok(Math.abs(net))} (сам summary весит ≈1k) — хвост «как есть» (keep ${fmtTok(state.compress.keep)})`
+              + ' набирается целыми сообщениями, поэтому почти ничего старше него не осталось;'
+              + ` снизьте --compress-keep (например ${fmtTok(Math.max(1000, Math.round(state.compress.keep / 3)))}) или поднимите --compress`)
+          }
+        })
+      }
+      if (mine && event.type === 'compaction/prune') {
+        const shadowed = event.data?.shadowedTokenCount ?? 0
+        if (shadowed > 0) withStatusPaused(() => log.dim(`· tool output pruned: ${fmtTok(shadowed)} tokens shadowed`))
+      }
+      if (mine && event.type === 'compaction/end' && event.data?.error) {
+        // Отказ компакции: вызов суммаризатора уже потрачен, а usage харнесс в
+        // событии не пишет — считаем хотя бы количество (см. строку compression).
+        state.metrics.compactFails += 1
+        if (state.turn) state.turn.compactFails = (state.turn.compactFails ?? 0) + 1
+        withStatusPaused(() => log.err(`✖ compaction failed: ${event.data.error}`))
+      }
       if (!mine || !state.turn) return
       renderEvent(event)
     }
@@ -1547,40 +1782,7 @@ async function main() {
           meter.estChars += c.text.length
           meter.stepChars += c.text.length
         }
-        if (c.type === 'text-delta') {
-          // Пошёл видимый ответ — анимация останавливается, текст стримится.
-          stopStatus()
-          state.streamedText = true
-          const t = state.turn
-          if (!t || t.cut) break
-          // Детект маркера ЧЕРЕЗ ГРАНИЦЫ чанков: задерживаем вывод на
-          // (len-1) символов и ищем маркер в склейке «хвост + новый чанк».
-          const markLen = t.marker ? t.marker.length : 0
-          const combined = (t.tail ?? '') + c.text
-          let head = combined
-          let cut = null
-          if (t.marker) {
-            const i = combined.indexOf(t.marker)
-            if (i >= 0) { head = combined.slice(0, i); cut = 'marker' }
-          }
-          if (t.maxChars != null && !cut) {
-            const remain = t.maxChars - t.streamedCount
-            if (head.length > remain) { head = head.slice(0, Math.max(0, remain)); cut = 'length' }
-          }
-          const hold = !cut && markLen > 1 ? Math.min(markLen - 1, head.length) : 0
-          const flush = head.slice(0, head.length - hold)
-          if (flush) { mdFeed(flush); t.streamedCount += flush.length }
-          t.tail = !cut && markLen > 1 ? head.slice(head.length - hold) : ''
-          trace(`td flush=${JSON.stringify(flush)} tail=${JSON.stringify(t.tail)} cut=${cut}`)
-          if (cut === 'marker') {
-            t.cut = 'marker'
-            log.err(`…[стоп-маркер ${JSON.stringify(t.marker)} — показ обрезан]`)
-          } else if (cut === 'length') {
-            t.cut = 'length'
-            t.streamedCount = t.maxChars
-            log.err(`…[обрезано dsh-term: лимит ${t.maxChars} символов]`)
-          }
-        }
+        if (c.type === 'text-delta') feedTextDelta(c.text, event.data.step)
         // Живой счётчик токенов: перерисовать в хвосте строки после фрагмента.
         if (!state.turn?.cut) meterDrawTail()
         // reasoning-delta намеренно не печатаем: в это время идёт анимация
@@ -1623,6 +1825,11 @@ async function main() {
           else log.dim(head)
           log.dim(`  tokens: in ${fmtTok(state.metrics.prompts)} (cache ${fmtTok(state.metrics.cacheReads)}) / out ${fmtTok(state.metrics.outputs)}`)
           log.dim(`  requests: ${state.metrics.calls} (this turn: ${steps.length})`)
+          if (state.metrics.compactions || state.metrics.compactFails) {
+            const n = state.metrics.compactions
+            const fails = state.metrics.compactFails
+            log.dim(`  compression: ${n} summarize call${n === 1 ? '' : 's'}${fails ? `, ${fails} failed` : ''}, ${fmtTok(state.metrics.compactTokens)} tokens${fails ? ' (failed calls not metered)' : ''}`)
+          }
           log.dim(`  context: ${fmtTok(ctx)} / ${fmtTok(CTX_MAX)} (${fmtPct(ctx, CTX_MAX)}%)`)
         } else if (f) {
           log.err(`— turn ${event.data.turn} ended: ${r.kind} (${f.code ?? f.name}: ${f.message})`)
@@ -1636,6 +1843,13 @@ async function main() {
           stopStatus()
           log.dim('— (interrupted)')
         }
+        // Фолбэк вывода: только когда живого стрима в этом процессе не было
+        // (харнесс без патча SDK-сервера) — печатаем готовый текст шага целиком.
+        if (!state.liveStream && state.turn && state.turn.streamedStep !== event.data.step) {
+          const blocks = event.data.message?.content ?? []
+          const text = blocks.filter((b) => b?.type === 'text').map((b) => b.text).join('')
+          if (text) feedMessageText(text, event.data.step)
+        }
         // Метрики токенов: usage приходит на каждое готовое сообщение шага.
         const u = event.data.usage
         const t = state.turn
@@ -1647,6 +1861,7 @@ async function main() {
           state.metrics.outputs += output
           state.metrics.cacheReads += cache
           state.metrics.calls += 1 // один запрос к модели = одно готовое сообщение шага
+          state.metrics.lastPrompt = prompt // размер последнего запроса (заполнение окна)
           t.steps.push({ prompt, output, cache })
           // Калибровка «живого» счётчика по факту: символы стрима ↔ выходные токены.
           if (meter.stepChars > 20 && output > 0) {
@@ -1664,7 +1879,86 @@ async function main() {
         }
         break
       }
+      case 'assistant/attempt': {
+        // Попытка без готового сообщения (ошибка/отмена): показать то, что
+        // успело прийти, если живого стрима по этому шагу не было.
+        if (!state.liveStream && state.turn && state.turn.streamedStep !== event.data.step) {
+          const text = textFromAttemptStream(event.data.stream)
+          if (text) feedMessageText(text, event.data.step)
+        }
+        break
+      }
     }
+  }
+
+  /**
+   * Напечатать видимый текст ответа — стрим-чанк или (без живого стрима) весь
+   * текст шага целиком. Обрезка по стоп-маркеру и лимиту символов общая.
+   * @param {string} text - порция видимого текста модели.
+   * @param {number|undefined} step - шаг хода (для фолбэка по assistant/message).
+   */
+  function feedTextDelta(text, step) {
+    // Пошёл видимый ответ — анимация останавливается, текст стримится.
+    stopStatus()
+    state.streamedText = true
+    const t = state.turn
+    if (!t) return
+    if (step != null) t.streamedStep = step
+    if (t.cut) return
+    // Детект маркера ЧЕРЕЗ ГРАНИЦЫ чанков: задерживаем вывод на
+    // (len-1) символов и ищем маркер в склейке «хвост + новый чанк».
+    const markLen = t.marker ? t.marker.length : 0
+    const combined = (t.tail ?? '') + text
+    let head = combined
+    let cut = null
+    if (t.marker) {
+      const i = combined.indexOf(t.marker)
+      if (i >= 0) { head = combined.slice(0, i); cut = 'marker' }
+    }
+    if (t.maxChars != null && !cut) {
+      const remain = t.maxChars - t.streamedCount
+      if (head.length > remain) { head = head.slice(0, Math.max(0, remain)); cut = 'length' }
+    }
+    const hold = !cut && markLen > 1 ? Math.min(markLen - 1, head.length) : 0
+    const flush = head.slice(0, head.length - hold)
+    if (flush) { mdFeed(flush); t.streamedCount += flush.length }
+    t.tail = !cut && markLen > 1 ? head.slice(head.length - hold) : ''
+    trace(`td flush=${JSON.stringify(flush)} tail=${JSON.stringify(t.tail)} cut=${cut}`)
+    if (cut === 'marker') {
+      t.cut = 'marker'
+      log.err(`…[стоп-маркер ${JSON.stringify(t.marker)} — показ обрезан]`)
+    } else if (cut === 'length') {
+      t.cut = 'length'
+      t.streamedCount = t.maxChars
+      log.err(`…[обрезано dsh-term: лимит ${t.maxChars} символов]`)
+    }
+  }
+
+  /**
+   * Фолбэк вывода без живого стрима: учесть символы в «живом» счётчике,
+   * напечатать текст шага и перерисовать хвостовой счётчик.
+   * @param {string} text - готовый видимый текст шага.
+   * @param {number|undefined} step - шаг хода.
+   */
+  function feedMessageText(text, step) {
+    meter.estChars += text.length
+    meter.stepChars += text.length
+    feedTextDelta(text, step)
+    if (!state.turn?.cut) meterDrawTail()
+  }
+
+  /**
+   * Видимый текст из durable-потока попытки (assistant/attempt): записи
+   * `text-chunks` — это сжатые серии дельт с массивом `texts`.
+   * @param {Array<object>|undefined} stream - compact-записи потока модели.
+   * @returns {string} склеенный видимый текст.
+   */
+  function textFromAttemptStream(stream) {
+    let out = ''
+    for (const rec of stream ?? []) {
+      if (rec?.type === 'text-chunks' && Array.isArray(rec.texts)) out += rec.texts.join('')
+    }
+    return out
   }
 
   /** Допечатать хвост, задержанный для детекта маркера (маркер не встретился). */
@@ -1698,6 +1992,7 @@ async function main() {
   function startTurn(controls) {
     state.streamedText = false
     state.lastEndKind = null
+    state.streamAttempts.clear() // attemptId прошлого хода больше не встретятся
     return new Promise((resolve) => {
       state.turn = {
         resolve,
@@ -1705,6 +2000,7 @@ async function main() {
         maxChars: controls?.maxChars ?? null,
         marker: controls?.marker ?? null,
         streamedCount: 0,
+        streamedStep: null, // шаг, видимый текст которого уже напечатан
         tail: '',    // задержанные символы для детекта маркера через границы чанков
         cut: null, // 'marker' | 'length' | null
         steps: [],    // usage по шагам хода: { prompt, output }
@@ -1729,6 +2025,7 @@ async function main() {
     meter.shown = 0
     meter.tail = 0
     meter.col = 0
+    meter.edge = false
     // Markdown-состояние (кодовые блоки) и буфер — тоже с нуля.
     mdBuf.s = ''
     if (mdBuf.timer) { clearTimeout(mdBuf.timer); mdBuf.timer = null }
@@ -1818,6 +2115,33 @@ async function main() {
       }
       case 'session': {
         log.line(fmtSession(state.sessionId, state.titles[state.sessionId]))
+        break
+      }
+      case 'context': {
+        const m = state.metrics
+        const ctx = m.lastPrompt || 0
+        const c = state.compress ?? { mode: 'on', ratio: COMPRESS_DEFAULT_RATIO, keep: COMPRESS_DEFAULT_KEEP }
+        log.line(`${C.bold}context${C.off}`)
+        log.dim(`  session: ${fmtSession(state.sessionId, state.titles[state.sessionId])}`)
+        log.dim(`  compression: ${c.mode}${compressPolicyText(c)}`)
+        if (c.mode === 'on') {
+          const compactable = Math.max(0, c.thresholdTokens - COMPRESS_SYSTEM_FLOOR - c.keep)
+          log.dim(`  fixed prefix: ≈ ${fmtTok(COMPRESS_SYSTEM_FLOOR)} tokens (system prompt + tools) — не сжимается`)
+          log.dim(`  per compaction: keep last ${fmtTok(c.keep)} verbatim, up to ≈ ${fmtTok(compactable)} older tokens summarized`)
+          log.dim('    (это верхняя граница: хвост набирается целыми сообщениями, поэтому реально сжимается меньше — зависит от размеров ваших реплик)')
+        }
+        for (const note of compressNotes(c)) log.dim(`  note: ${note}`)
+        log.dim(`  window: ${fmtTok(ctx)} / ${fmtTok(CTX_MAX)} (${fmtPct(ctx, CTX_MAX)}%)`)
+        log.dim(`  tokens: in ${fmtTok(m.prompts)} (cache ${fmtTok(m.cacheReads)}) / out ${fmtTok(m.outputs)} · requests: ${m.calls}`)
+        if (m.compactions || m.compactFails) {
+          log.dim(`  summarize calls: ${m.compactions}${m.compactFails ? `, failed: ${m.compactFails} (их токены харнесс не пишет)` : ''} · ${fmtTok(m.compactTokens)} tokens`)
+        }
+        if (state.lastSummary) {
+          const s = state.lastSummary
+          log.dim(`  last summary: shadowed ${fmtTok(s.shadowed)} → ${fmtTok(s.tokens)} tokens${s.model ? ` (${s.model})` : ''}`)
+          const head = s.text.split('\n').slice(0, 14).join('\n')
+          log.dim(head.length > 900 ? head.slice(0, 900) + '…' : head)
+        } else log.dim('  last summary: —')
         break
       }
       case 'resume': {
@@ -1944,6 +2268,9 @@ async function main() {
     log.dim(`runtime: ${res.serverInfo.name} ${res.serverInfo.version} · provider=${opts.provider} model=${opts.model}`)
     // Диагностика UI: понятно, почему нет цветов/рендера (tty/NO_COLOR/one-shot).
     log.dim(`ui: in-tty=${process.stdin.isTTY ? 1 : 0} out-tty=${process.stdout.isTTY ? 1 : 0} colors=${C.cyan ? 1 : 0} md=${mdColorEnabled() ? 1 : 0}`)
+    log.dim(`compress: ${compress.mode}${compressPolicyText(compress)}`)
+    // Несогласованная политика: харнесс молча отбросит спеку (см. compressNotes).
+    for (const note of compressNotes(compress)) log.dim(`  note: ${note}`)
   } catch (e) {
     log.err(`initialize failed: ${e.message}`)
     log.err('Проверь credentials (DEEPSEEK_API_KEY или managed credentials в DSH_HOME) и доступность модели.')

@@ -1,0 +1,381 @@
+﻿runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
+ui: in-tty=0 out-tty=0 colors=0 md=0
+compress: on (thresholdRatio 0.009, retainTokens 300)
+new session: 5fdc02b0-112d-4ef5-9ff1-fa24cea8cb1c
+(queued af3d49ac-ac87-4449-b22b-d9d31556400a)
+· заголовок сессии: «Запоминание кода проекта KX-42»
+▶ write file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\project-" content="# Project code\n\nKX-42\n\n(Provided by the user at the start of"
+✔ done
+Запомнил: код проекта — **KX-42**.
+
+Дополнительно сохранил его в `project-code.md` в рабочей папке, чтобы он точно не потерялся, даже если диалог будет длинным. Когда понадобится — просто напомните, и я его назову.
+· step 2: in 8.5k / out 71
+
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 16.6k (cache 16.3k) / out 378
+  requests: 2 (this turn: 2)
+  context: 8.5k / 1M (0.846%)
+
+(queued d31f1b09-ea55-4803-a2db-d838e26911be)
+▶ write file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t" content="Океан покрывает почти три четверти поверхности нашей планеты"
+✔ done
+· context compacted: shadowed 582 tokens → summary 728 (deepseek-v4-flash)
+cmd.exe : ✖ compaction failed: summary is not smaller than the shadowed content (581 estimated framed tokens >= 580)
+At line:37 char:3
++   & cmd /c ("`"node`" `"$Mjs`" --dsh-home `"$dshHome`" --dsh-bin `"$D ...
++   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (✖ compaction fa... tokens >= 580):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+· step 2: in 10.5k / out 112
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Count words in oceans text"
+✔ done
+✖ compaction failed: summary is not smaller than the shadowed content (580 estimated framed tokens >= 580)
+· step 3: in 10.7k / out 1.9k
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t" old_string="смягчая климат целых континентов." new_string="смягчая климат целых континентов. Течения делают север Европ"
+✖ FsError: FS_STALE_VERSION
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t" old_string="почти на одиннадцать километров." new_string="почти на одиннадцать километров. Некоторые из этих существ н"
+✖ FsError: FS_STALE_VERSION
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t" old_string="коралловые рифы бледнеют, льды отступают." new_string="коралловые рифы бледнеют, льды отступают. Каждый год в него "
+✖ FsError: FS_STALE_VERSION
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t" old_string="хотя правильнее было бы назвать её Океаном." new_string="хотя правильнее было бы назвать её Океаном. Океан был первым"
+✖ FsError: FS_STALE_VERSION
+· context compacted: shadowed 2.4k tokens → summary 677 (deepseek-v4-flash)
+· context compacted: shadowed 761 tokens → summary 697 (deepseek-v4-flash)
+· step 4: in 10.7k / out 68
+▶ read file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t"
+✔ done
+· context compacted: shadowed 2.2k tokens → summary 971 (deepseek-v4-flash)
+· context compacted: shadowed 991 tokens → summary 965 (deepseek-v4-flash)
+· step 5: in 9.8k / out 490
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t" old_string="смягчая климат целых континентов." new_string="смягчая климат целых континентов. Течения делают север Европ"
+✔ done
+· context compacted: shadowed 1.7k tokens → summary 999 (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1052 estimated framed tokens >= 1021)
+· step 6: in 9.6k / out 258
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t" new_string="почти на одиннадцать километров. Некоторые из этих существ н" old_string="почти на одиннадцать километров."
+✔ done
+· context compacted: shadowed 1k tokens → summary 1.1k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (988 estimated framed tokens >= 988)
+· step 7: in 9.9k / out 159
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t" new_string="коралловые рифы бледнеют, льды отступают. Каждый год в него " old_string="коралловые рифы бледнеют, льды отступают."
+✔ done
+· context compacted: shadowed 1.3k tokens → summary 1k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1047 estimated framed tokens >= 1038)
+· step 8: in 9.6k / out 138
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t" new_string="хотя правильнее было бы назвать её Океаном. Океан был первым" old_string="хотя правильнее было бы назвать её Океаном."
+✔ done
+· context compacted: shadowed 1.3k tokens → summary 986 (deepseek-v4-flash)
+· context compacted: shadowed 1k tokens → summary 1.2k (deepseek-v4-flash)
+· step 9: in 9.5k / out 118
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Count words in oceans.txt"
+✔ done
+· context compacted: shadowed 1.2k tokens → summary 1.2k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1024 estimated framed tokens >= 1024)
+· step 10: in 9.5k / out 68
+▶ read file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t"
+✔ done
+· context compacted: shadowed 1.4k tokens → summary 860 (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (891 estimated framed tokens >= 888)
+· step 11: in 9.8k / out 160
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Count words in oceans text file"
+✔ done
+· context compacted: shadowed 888 tokens → summary 899 (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (887 estimated framed tokens >= 887)
+· step 12: in 10k / out 154
+▶ read file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\project-"
+✔ done
+· context compacted: shadowed 1.6k tokens → summary 785 (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (869 estimated framed tokens >= 851)
+· step 13: in 9.2k / out 60
+▶ read file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\oceans.t"
+✔ done
+· context compacted: shadowed 1.2k tokens → summary 841 (deepseek-v4-flash)
+· context compacted: shadowed 887 tokens → summary 895 (deepseek-v4-flash)
+· step 14: in 9.8k / out 162
+▶ pwsh command="$t = Get-Content -Raw .\\oceans.txt; $w = $t -split '\\s+' | W" description="Verify ocean text word count"
+✔ done
+· context compacted: shadowed 878 tokens → summary 904 (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (887 estimated framed tokens >= 874)
+Ровно 300 слов про океаны:
+
+Океан покрывает почти три четверти поверхности нашей планеты и остаётся самой большой и самой малоизученной её частью. Он хранит тепло, рождает облака, кормит миллиарды людей и управляет климатом всей Земли. Мировой океан представляет собой единую связанную систему, хотя люди издавна делят его на четыре больших части: Тихий, Атлантический, Индийский и Северный Ледовитый.
+
+Тихий океан самый огромный: в нём помещается вся суша Земли, и ещё остаётся место. Атлантический разделяет Европу и Америку, Индийский омывает берега Азии и Африки, а Северный Ледовитый скован льдами. Воды этих океанов не стоят на месте: их движут ветры, приливы, вращение планеты и разница температур и солёности. Тёплые и холодные течения переносят энергию за тысячи километров, смягчая климат целых континентов. Течения делают север Европы обитаемым, а тропики терпимыми.
+
+Глубины океана хранят собственный мир, почти не тронутый солнечным светом. Там, в полной темноте и чудовищном давлении, живут существа, которые светятся сами, охотятся на ощупь и питаются остатками, падающими сверху. Гигантские хребты, глубоководные желоба и подводные вулканы образуют рельеф более сложный, чем любой горный ландшафт на суше. Марианский желоб уходит вниз почти на одиннадцать километров. Некоторые из этих существ не встречаются больше нигде на планете.
+
+Океан даёт людям пищу, минералы, энергию и пути для торговли. Через него проходит большая часть мировых грузов, он кормит миллионы рыбаков, а его вода участвует в круговороте, без которого на Земле не было бы дождя. Но человек отвечает океану пластиком, разливами нефти, переловом рыбы и потеплением. Кислотность воды растёт, коралловые рифы бледнеют, льды отступают. Каждый год в него попадают миллионы тонн отходов, которые природа не успевает переработать.
+
+Мы называем нашу планету Землёй, хотя правильнее было бы назвать её Океаном. Океан был первым домом жизни и остаётся её опорой. От его здоровья зависит воздух, которым мы дышим, еда, которую мы едим, и климат, к которому мы привыкли. Изучить и сохранить его значит сохранить самих себя.
+
+Проверка: 300 слов.
+
+И, как вы просили запомнить, код проекта — **KX-42**.· step 15: in 9.9k / out 765
+
+───────────────────────────────────────────────────────────────────────────────
+— turn 2 ended: completed
+  tokens: in 163.7k (cache 145.3k) / out 6.9k
+  requests: 17 (this turn: 15)
+  compression: 17 summarize calls, 180.8k tokens
+  context: 9.9k / 1M (0.994%)
+
+(queued 34621fb6-bd81-4421-8452-5356a2f9af31)
+· context compacted: shadowed 1.8k tokens → summary 800 (deepseek-v4-flash)
+· context compacted: shadowed 857 tokens → summary 860 (deepseek-v4-flash)
+▶ pwsh command="$t = @'\nГоры занимают лишь пятую часть суши, но именно они о" description="Count words in draft mountains text"
+✔ done
+· context compacted: shadowed 1.5k tokens → summary 935 (deepseek-v4-flash)
+· context compacted: shadowed 998 tokens → summary 934 (deepseek-v4-flash)
+· step 2: in 10.6k / out 1.4k
+▶ write file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\mountain" content="Горы занимают лишь пятую часть суши, но именно они определяю"
+✔ done
+· context compacted: shadowed 2.4k tokens → summary 957 (deepseek-v4-flash)
+· context compacted: shadowed 1k tokens → summary 1.5k (deepseek-v4-flash)
+· step 3: in 10.5k / out 121
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Count words in mountains draft"
+✔ done
+· context compacted: shadowed 1k tokens → summary 1k (deepseek-v4-flash)
+· context compacted: shadowed 1k tokens → summary 1.1k (deepseek-v4-flash)
+· step 4: in 10.7k / out 168
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\mountain" old_string="здесь живут снежные барсы" new_string="живут снежные барсы"
+✔ done
+· context compacted: shadowed 2.1k tokens → summary 1.1k (deepseek-v4-flash)
+· context compacted: shadowed 1.1k tokens → summary 1.1k (deepseek-v4-flash)
+· step 5: in 9.5k / out 131
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Recount words in mountains file"
+✔ done
+· context compacted: shadowed 1.2k tokens → summary 1k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1090 estimated framed tokens >= 1077)
+· step 6: in 9.5k / out 71
+▶ read file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\mountain"
+✔ done
+· context compacted: shadowed 1.5k tokens → summary 1.1k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1157 estimated framed tokens >= 1150)
+· step 7: in 9.9k / out 212
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Verify word count of mountains text"
+✔ done
+· context compacted: shadowed 1.1k tokens → summary 1.2k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1184 estimated framed tokens >= 1147)
+Горы занимают лишь пятую часть суши, но именно они определяют облик многих стран и характеры целых народов. Они рождаются там, где сталкиваются тектонические плиты, где прорывается вулканическая лава или где ветер и вода веками разрушают породу. Высота создаёт особый мир: с каждым километром воздух становится холоднее и разреженнее, и жизнь требует всё больше сил.
+
+Вершины выше пяти километров называют крышей мира. Там лежат вечные снега и лёд, там начинаются реки, которые поят целые континенты. Эверест поднимается почти на девять километров над уровнем моря, а его склоны помнят сотни восхождений и десятки трагедий. Альпы, Кавказ, Анды, Гималаи, Урал, каждые горы имеют свой характер, свою погоду и свою историю.
+
+Геологи читают в горах историю планеты: слои известняка, гранита и базальта хранят следы древних морей и вулканов. На большой высоте человек ощущает нехватку кислорода, поэтому восходители берут с собой баллоны, тёплую одежду и запас времени. Здесь проверяются характер, выдержка и умение доверять товарищу. Горы не прощают ошибок.
+
+Климат в горах меняется быстрее, чем где-либо ещё. У подножия растут тёплые леса, выше начинаются альпийские луга, ещё выше лежат голые скалы и снега. Такая смена поясов повторяет движение от экватора к полюсу, только умещается на нескольких километрах подъёма. Растения и животные приспосабливаются к холоду, ветру и скудной пище: живут снежные барсы, горные козлы, орлы и эдельвейсы.
+
+Для человека горы всегда были и преградой, и убежищем. Через перевалы шли торговые пути, в ущельях прятались деревни, на склонах строили монастыри. Сегодня горы притягивают туристов, альпинистов и лыжников, дают воду, энергию и пастбища. Но они же остаются опасными: лавины, обвалы, сели и камнепады уносят жизни каждый год.
+
+Горы напоминают о том, как мал человек перед силой природы. Ледники тают, и это меняет реки и климат целых регионов. Сохранить горы значит сохранить воду, воздух и красоту, без которых мир станет беднее. Их вершины учат смирению и упорству одновременно.
+
+(Ровно 300 слов, проверено программным подсчётом.)· step 8: in 10.3k / out 670
+
+───────────────────────────────────────────────────────────────────────────────
+— turn 3 ended: completed
+  tokens: in 244.4k (cache 212.4k) / out 11.2k
+  requests: 25 (this turn: 8)
+  compression: 30 summarize calls, 321.8k tokens
+  context: 10.3k / 1M (1.03%)
+
+(queued 6f97009c-0f5d-4556-b7eb-59821c609dfc)
+· context compacted: shadowed 2.1k tokens → summary 1.1k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1193 estimated framed tokens >= 1179)
+▶ write file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\deserts." content="Пустыни покрывают примерно пятую часть поверхности суши, и в"
+✔ done
+· context compacted: shadowed 1.7k tokens → summary 1.4k (deepseek-v4-flash)
+· context compacted: shadowed 1.3k tokens → summary 1.5k (deepseek-v4-flash)
+· step 2: in 10.8k / out 137
+▶ pwsh command="$t = Get-Content -Raw 'deserts.txt'; $w = $t -split '\\s+' | " description="Count words in deserts draft" workdir="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws"
+✔ done
+✖ compaction failed: summary is not smaller than the shadowed content (1273 estimated framed tokens >= 1273)
+· step 3: in 10.9k / out 1.5k
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\deserts." old_string="Ветер годами переставляет дюны, стирает скалы и несёт пыль н" new_string="Ветер годами переставляет дюны, стирает скалы и несёт пыль н"
+✔ done
+· context compacted: shadowed 2.6k tokens → summary 1.2k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1262 estimated framed tokens >= 1262)
+· step 4: in 10.7k / out 121
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Count words in deserts.txt"
+✔ done
+✖ compaction failed: summary is not smaller than the shadowed content (1271 estimated framed tokens >= 1262)
+· step 5: in 11k / out 76
+▶ read file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\deserts."
+✔ done
+· context compacted: shadowed 2.5k tokens → summary 1.3k (deepseek-v4-flash)
+· context compacted: shadowed 1.4k tokens → summary 1.4k (deepseek-v4-flash)
+· step 6: in 10.2k / out 125
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Count words in deserts.txt"
+✔ done
+· context compacted: shadowed 1.4k tokens → summary 1.5k (deepseek-v4-flash)
+· context compacted: shadowed 1.4k tokens → summary 1.4k (deepseek-v4-flash)
+Пустыни покрывают примерно пятую часть поверхности суши, и всё же мы знаем о них меньше, чем о многих других краях Земли. Их главная черта не жара, а сухость: дожди здесь редки и скудны, влага быстро уходит в песок или испаряется под солнцем. Именно недостаток воды, а не температура, делает пустыню пустыней, поэтому среди них встречаются не только жаркие, но и холодные области.
+
+Сахара, Аравийская пустыня, Гоби, Атакама, Каракумы и Кызылкум, каждая из них по-своему сурова. Днём песок и камень раскаляются так, что воздух дрожит над горизонтом, а ночью температура падает порой ниже нуля. Такой перепад закаляет и растения, и животных. Ветер годами переставляет дюны, стирает скалы и несёт пыль на тысячи километров. Утром же солнце снова нещадно жжёт землю, и всё живое спешит поскорее укрыться в тень до наступления неумолимого полуденного зноя.
+
+Пустыня кажется безжизненной лишь на первый взгляд. Кактусы запасают воду в толстых стеблях, верблюжья колючка уходит корнями на десятки метров вглубь. Тушканчики, ящерицы, змеи и скорпионы прячутся в норах и выходят на охоту ночью. Верблюд переносит жажду и зной лучше всех: его горб хранит жир, а густая шерсть спасает от перегрева.
+
+Ветер здесь главный скульптор. Он создаёт барханы, выдувает целые котловины и полирует камни до блеска. Редкий дождь пробуждает спящие семена, и на несколько дней пустыня покрывается цветами, а затем снова замирает на годы. Миражи и пыльные бури довершают образ края, где человек чувствует себя гостем.
+
+Люди живут в пустынях тысячи лет. Кочевники водят караваны от колодца к колодцу, земледельцы выводят воду из оазисов, а современные города берут её из глубоких скважин. Но запас подземных вод ограничен, и там, где его тратят без меры, пески наступают на поля.
+
+Пустыня учит бережливости и терпению. Она напоминает, что жизнь держится на тонкой нити воды, и что человеку стоит ценить каждый её источник. Сохранить пустыни значит сохранить равновесие всей планеты.
+
+(Ровно 300 слов, проверено программным подсчётом.)· step 7: in 10.3k / out 666
+
+───────────────────────────────────────────────────────────────────────────────
+— turn 4 ended: completed
+  tokens: in 318.1k (cache 275.7k) / out 15.2k
+  requests: 32 (this turn: 7)
+  compression: 38 summarize calls, 415.2k tokens
+  context: 10.3k / 1M (1.03%)
+
+(queued 30ca0d54-2b7f-45de-bcb8-2aeea9ec11f3)
+· context compacted: shadowed 2.1k tokens → summary 1.3k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1322 estimated framed tokens >= 1306)
+▶ write file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\forests." content="Леса покрывают примерно треть суши и служат домом для больше"
+✔ done
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Count words in forests draft"
+✔ done
+· context compacted: shadowed 1.8k tokens → summary 1.5k (deepseek-v4-flash)
+· context compacted: shadowed 1.4k tokens → summary 1.4k (deepseek-v4-flash)
+· step 2: in 10.4k / out 673
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\forests." old_string="Деревья испаряют влагу, притягивают дожди и смягчают климат " new_string="Деревья испаряют влагу, притягивают дожди и смягчают климат "
+✔ done
+· context compacted: shadowed 2.2k tokens → summary 1.5k (deepseek-v4-flash)
+· context compacted: shadowed 1.6k tokens → summary 1.5k (deepseek-v4-flash)
+· step 3: in 10.3k / out 118
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Count words in forest draft"
+✔ done
+✖ compaction failed: summary is not smaller than the shadowed content (1560 estimated framed tokens >= 1560)
+· step 4: in 10.5k / out 69
+▶ read file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\forests."
+✔ done
+· context compacted: shadowed 2.3k tokens → summary 1.5k (deepseek-v4-flash)
+· context compacted: shadowed 1.5k tokens → summary 1.6k (deepseek-v4-flash)
+Леса покрывают примерно треть суши и служат домом для большей части наземных видов животных и растений. Они начинаются у самой кромки тундры, тянутся через умеренные широты и доходят до влажных тропиков, меняя облик и состав деревьев. Главное их богатство не в древесине, а в том, что они создают целый мир, где всё связано друг с другом.
+
+Тайга, смешанные леса, широколиственные дубравы, амазонская сельва, сибирская кедровая тайга и мангровые заросли, каждый из них по-своему устроен. В тропиках под кронами царит влажный полумрак, а на севере сосны и ели выдерживают морозы и короткое лето. Ярус за ярусом поднимаются деревья, кустарники, травы и мхи, и каждому находится своё место.
+
+Лес живёт по своим законам. Берёза и осина первыми занимают вырубки и гари, а под их защитой подрастают тенистые ели, которые со временем вытесняют пионеров. Грибы и бактерии разлагают опавшие листья и хвою, возвращая почве питательные вещества. Корни скрепляют склоны, не давая воде и ветру разрушать землю.
+
+Особенно важна роль леса в круговороте воды и воздуха. Деревья испаряют влагу, притягивают дожди и смягчают климат целых регионов. Зимой снежный покров под кронами тает медленнее, поэтому весной лес долго отдаёт влагу рекам и ручьям, питая поля и сады внизу, а летом смягчает жару и защищает почву от пересыхания в засуху. Они поглощают углекислый газ и выделяют кислород, а их кроны задерживают пыль и шум. Недаром лес называют лёгкими планеты, хотя это лишь часть его работы.
+
+Люди веками берут у леса древесину, топливо, ягоды, грибы и лекарственные травы. Охотники, пасечники, лесники и туристы находят здесь пропитание и отдых. Но вырубки, пожары и осушение болот губят целые массивы, а вместе с ними исчезают редкие виды, которые больше нигде не встречаются.
+
+Лес учит вниманию и терпению. Он напоминает, что всё живое связано невидимыми нитями, и что дерево, срубленное сегодня, вырастет не скоро. Сохранить леса значит сохранить дыхание самой Земли.
+
+(Ровно 300 слов, проверено программным подсчётом.)· step 5: in 10.3k / out 736
+
+───────────────────────────────────────────────────────────────────────────────
+— turn 5 ended: completed
+  tokens: in 369.5k (cache 319k) / out 17.6k
+  requests: 37 (this turn: 5)
+  compression: 45 summarize calls, 497.8k tokens
+  context: 10.3k / 1M (1.03%)
+
+(queued 874f84eb-c9e7-46b9-906d-ed59f6f31e93)
+· context compacted: shadowed 2.1k tokens → summary 1.5k (deepseek-v4-flash)
+· context compacted: shadowed 1.5k tokens → summary 1.7k (deepseek-v4-flash)
+▶ write file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\rivers.t" content="Реки начинаются с малого. Тонкая струйка талой воды сбегает "
+✔ done
+· context compacted: shadowed 2.2k tokens → summary 1.5k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1531 estimated framed tokens >= 1530)
+· step 2: in 10.3k / out 133
+▶ pwsh command="$t = Get-Content -Raw 'rivers.txt'; $w = $t -split '\\s+' | W" description="Count words in rivers draft" workdir="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws"
+✔ done
+· context compacted: shadowed 1.5k tokens → summary 1.5k (deepseek-v4-flash)
+· context compacted: shadowed 1.5k tokens → summary 1.4k (deepseek-v4-flash)
+· step 3: in 10.5k / out 1.4k
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\rivers.t" old_string="Питьевая вода, рыболовство и орошение до сих пор зависят от " new_string="Питьевая вода, рыболовство и орошение до сих пор зависят от "
+✔ done
+· context compacted: shadowed 2.3k tokens → summary 1.6k (deepseek-v4-flash)
+· context compacted: shadowed 1.6k tokens → summary 1.7k (deepseek-v4-flash)
+· step 4: in 11.1k / out 169
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Count words in rivers draft"
+✔ done
+· context compacted: shadowed 1.6k tokens → summary 1.6k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1563 estimated framed tokens >= 1560)
+· step 5: in 11.3k / out 445
+▶ edit file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\rivers.t" new_string="зависят урожай, птицы и рыба, а также здоровье всех людей." old_string="зависят урожай, птицы и рыба."
+✔ done
+· context compacted: shadowed 3k tokens → summary 1.6k (deepseek-v4-flash)
+· context compacted: shadowed 1.6k tokens → summary 1.7k (deepseek-v4-flash)
+· step 6: in 10.1k / out 120
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Count words in rivers draft"
+✔ done
+· context compacted: shadowed 1.6k tokens → summary 1.6k (deepseek-v4-flash)
+· context compacted: shadowed 1.6k tokens → summary 1.7k (deepseek-v4-flash)
+· step 7: in 10.4k / out 67
+▶ read file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\rivers.t"
+✔ done
+· context compacted: shadowed 2.2k tokens → summary 1.5k (deepseek-v4-flash)
+· context compacted: shadowed 1.6k tokens → summary 1.7k (deepseek-v4-flash)
+· step 8: in 10.4k / out 125
+▶ pwsh command="$t = Get-Content -Raw 'C:\\Users\\user\\AppData\\Local\\Temp\\dsh-" description="Count words in rivers.txt"
+✔ done
+✖ compaction failed: summary is not smaller than the shadowed content (1570 estimated framed tokens >= 1567)
+Реки начинаются с малого. Тонкая струйка талой воды сбегает по склону, сливается с другой, третьей, и вскоре по земле уже движется поток, способный пробить камень и перекроить целые долины. От родника до устья река проходит путь, который измеряется сотнями и тысячами километров, собирая по дороге воду дождей, снегов и подземных ключей.
+
+Среди великих рек мира называют Амазонку, Нил, Янцзы, Миссисипи, Обь, Енисей, Лену и Волгу. Амазонка несёт больше воды, чем несколько следующих за ней рек вместе взятых, а Нил и Янцзы веками кормят густонаселённые земли. В горах реки бурные и холодные, они ревут на порогах и перекатах, а на равнинах замедляются, петляют и разливаются широкими поймами.
+
+Река постоянно работает. Она размывает берега в одном месте и откладывает песок и ил в другом, образуя отмели, острова и дельты. Весной талые воды поднимают уровень, и река выходит из русла, оставляя на лугах плодородный слой. Летом она мелеет, зимой покрывается льдом, но течение не останавливается даже под ним.
+
+Вода реки питает поля, леса и города. По ней сплавляют лес, перевозят грузы, строят плотины и гидроэлектростанции. На берегах вырастали первые поселения, а реки становились дорогами, границами и торговыми путями. Питьевая вода, рыболовство и орошение до сих пор зависят от того, насколько чиста и полноводна река. Кроме того, река пополняет подземные воды, питает родники и болота, поддерживает пойменные луга, а от её состояния зависят урожай, птицы и рыба, а также здоровье всех людей.
+
+Но человек часто относится к рекам небрежно. Сточные воды, мусор, удобрения с полей и промышленные отходы отравляют их, а плотины перекрывают путь рыбе. Обмеление и загрязнение губят целые экосистемы, и там, где ещё недавно плескалась жизнь, остаётся мутная грязная канава.
+
+Река учит движению и настойчивости. Она не спорит с камнем, а обходит его и продолжает путь, находя дорогу к морю. Беречь реки значит беречь всё, что живёт вокруг них.
+
+(Ровно 300 слов, проверено программным подсчётом.)· step 9: in 10.6k / out 655
+
+───────────────────────────────────────────────────────────────────────────────
+— turn 6 ended: completed
+  tokens: in 464.5k (cache 396.3k) / out 21.5k
+  requests: 46 (this turn: 9)
+  compression: 59 summarize calls, 664.4k tokens
+  context: 10.6k / 1M (1.06%)
+
+(queued 60d02f15-2a40-4646-b048-c26c4aba38db)
+· context compacted: shadowed 2.4k tokens → summary 1.5k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1537 estimated framed tokens >= 1530)
+▶ read file_path="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-ab-compress-ws\\project-"
+✔ done
+· context compacted: shadowed 2k tokens → summary 1.8k (deepseek-v4-flash)
+✖ compaction failed: summary is not smaller than the shadowed content (1624 estimated framed tokens >= 1601)
+KX-42· step 2: in 10.1k / out 5
+
+───────────────────────────────────────────────────────────────────────────────
+— turn 7 ended: completed
+  tokens: in 484.8k (cache 415.1k) / out 21.7k
+  requests: 48 (this turn: 2)
+  compression: 61 summarize calls, 689.2k tokens
+  context: 10.1k / 1M (1.01%)
+
+(queued 1051595e-13c9-42d2-bac4-4a5ce9cc2227)
+✖ compaction failed: summary is not smaller than the shadowed content (1632 estimated framed tokens >= 1628)
+Пять тем — океаны, горы, пустыни, леса и реки, и пятыми по счёту были реки.
+───────────────────────────────────────────────────────────────────────────────
+— turn 8 ended: completed
+  tokens: in 494.9k (cache 425k) / out 21.9k
+  requests: 49 (this turn: 1)
+  compression: 61 summarize calls, 689.2k tokens
+  context: 10.1k / 1M (1.01%)
+
+context
+  session: «Запоминание кода проекта KX-42» 5fdc02b0-112d-4ef5-9ff1-fa24cea8cb1c
+  compression: on (thresholdRatio 0.009, retainTokens 300)
+  window: 10.1k / 1M (1.01%)
+  tokens: in 494.9k (cache 425k) / out 21.9k · requests: 49
+  last summary: shadowed 2k → 1.8k tokens (deepseek-v4-flash)
+## Primary Request and Intent
+- Original (Russian): «Код проекта: KX-42. Запомни его — он понадобится в конце диалога.» — memorize project code `KX-42` verbatim and recite it when the dialogue ends.
+- Recurring deliverable pattern with exact-count constraint: «Опиши ровно триста слов про <тему>.»
+- Themes requested and delivered in order: океаны, горы, пустыни, леса, реки.
+- Each deliverable: coherent Russian prose, exactly 300 words, pasted verbatim in chat.
+- Last user message: «Опиши ровно триста слов про реки.»
+- No new requests pending; next expected event is dialogue end, at which `KX-42` must be stated verbatim.
+
+## Key Technical Concepts
+- DSH sandbox: file policy `workspace-write`; workspace `C:\Users\user\AppData\Local\Temp\dsh-ab-compress-ws`; approval policy `ask`.
+- Authoritative word count (never count by eye): `$t = Get-Content -Raw '<path>'; $w = $t -split '\s+' | Where-O…
