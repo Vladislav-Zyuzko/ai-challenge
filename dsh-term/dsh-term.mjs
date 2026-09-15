@@ -95,7 +95,7 @@ function cacheTokensOf(u) {
 
 /** Пустые счётчики сессии: расход, кэш, запросы и работа суммаризатора. */
 function emptyMetrics() {
-  return { prompts: 0, outputs: 0, cacheReads: 0, calls: 0, lastPrompt: 0, compactions: 0, compactTokens: 0, compactFails: 0 }
+  return { prompts: 0, outputs: 0, cacheReads: 0, calls: 0, lastPrompt: 0, compactions: 0, compactTokens: 0, compactFails: 0, factsCalls: 0, factsTokens: 0 }
 }
 
 // ---------- управление контекстом: компрессия истории ----------
@@ -760,9 +760,249 @@ function summarizeTitle(prompt, { token, model, provider }) {
   })
 }
 
+/**
+ * Один служебный вызов DeepSeek вне сессии харнесса (facts и прочие вспомогательные
+ * задачи): возвращает текст, распарсенный JSON (если есть) и расход токенов —
+ * его обязательно считать отдельно, иначе сравнение стратегий будет нечестным.
+ */
+function llmJson({ token, model, provider }, system, user, maxTokens = 700) {
+  if (provider && provider !== 'deepseek-official') return Promise.resolve(null)
+  if (!token) return Promise.resolve(null)
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      model: model || 'deepseek-v4-flash',
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      max_tokens: maxTokens,
+      temperature: 0.2,
+      // thinking выключен: служебный ответ нужен целиком в content и дешевле.
+      thinking: { type: 'disabled' },
+      stream: false,
+    })
+    const req = httpsRequest('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        'Content-Length': Buffer.byteLength(body),
+      },
+      timeout: 30000,
+    }, (res) => {
+      let data = ''
+      res.setEncoding('utf8')
+      res.on('data', (d) => { data += d })
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(data)
+          const text = String(j?.choices?.[0]?.message?.content ?? '')
+          const u = j?.usage ?? {}
+          const promptTokens = u.prompt_tokens ?? 0
+          const outputTokens = u.completion_tokens ?? 0
+          let json = null
+          const m = /\{[\s\S]*\}/.exec(text)
+          if (m) { try { json = JSON.parse(m[0]) } catch { json = null } }
+          trace(`llm call: in ${promptTokens} out ${outputTokens}`)
+          resolve({ text, json, promptTokens, outputTokens, tokens: promptTokens + outputTokens })
+        } catch { resolve(null) }
+      })
+    })
+    req.on('error', (e) => { trace(`llm call err: ${e.message}`); resolve(null) })
+    req.on('timeout', () => { req.destroy(); resolve(null) })
+    req.write(body)
+    req.end()
+  })
+}
+
+// ---------- стратегии управления контекстом (day10) ----------
+// Контекст собирает КЛИЕНТ: dsh-term сам хранит диалог (транскрипт, facts, ветки)
+// и на каждый ход отправляет в харнесс ровно то, что выбрала стратегия. Поэтому
+// режим переключается на ходу (без перезапуска рантайма), а расход виден в метриках.
+// Харнесс-сессия на каждый ход берётся свежая: иначе его поверхность накапливала бы
+// полную историю и в модель уходило бы больше, чем решила стратегия.
+const STRATEGIES = [
+  { id: 'sliding', title: 'Sliding Window', desc: 'только последние N сообщений, остальное отбрасывается' },
+  { id: 'facts', title: 'Sticky Facts', desc: 'facts (ключ-значение) + последние N сообщений' },
+  { id: 'branch', title: 'Branching', desc: 'ветки диалога от чекпоинта + переключение между ними' },
+]
+/** Режим по умолчанию: контекстом управляет харнесс (компрессия из day9). */
+const STRATEGY_HARNESS = 'harness'
+const CTX_DEFAULT_WINDOW = 6   // N сообщений для окна
+const CTX_FACTS_WINDOW = 10    // сколько последних сообщений видит обновление facts
+const CTX_FACT_KEYS = ['цель', 'ограничения', 'предпочтения', 'решения', 'договорённости']
+
+function contextDir(dshHome) { return join(dshHome, 'context') }
+function contextPath(dshHome, id) { return join(contextDir(dshHome), id + '.json') }
+
+/** Хранилище диалога (создаётся при первом ходе в режиме стратегии). */
+function newContext(id, strategy, window) {
+  return {
+    id,
+    strategy,
+    window,
+    messages: [],        // вся линия диалога (main)
+    facts: {},           // ключ-значение: цель/ограничения/предпочтения/решения/договорённости
+    checkpoint: null,    // { atMessage, note } — место ветвления
+    branches: {},        // id ветки → { name, messages, createdAt }
+    activeBranch: 'main',
+    branchSeq: 0,
+    factsCalls: 0,
+    factsTokens: 0,
+  }
+}
+
+function loadContext(dshHome, id) {
+  try { return JSON.parse(readFileSync(contextPath(dshHome, id), 'utf8')) } catch { return null }
+}
+
+function saveContext(dshHome, ctx) {
+  try {
+    mkdirSync(contextDir(dshHome), { recursive: true })
+    ctx.updatedAt = new Date().toISOString()
+    writeFileSync(contextPath(dshHome, ctx.id), JSON.stringify(ctx, null, 2) + '\n', 'utf8')
+  } catch (e) { trace(`context save failed: ${e.message}`) }
+}
+
+/** Сообщения активной линии диалога (main или выбранной ветки). */
+function activeMessages(ctx) {
+  if (ctx.activeBranch === 'main') return ctx.messages
+  return ctx.branches[ctx.activeBranch]?.messages ?? []
+}
+
+/** Последние n сообщений активной линии. */
+function windowMessages(ctx, n) {
+  const m = activeMessages(ctx)
+  return n > 0 ? m.slice(-n) : []
+}
+
+/** Диалог в виде текста: «Пользователь: … / Ассистент: …». */
+function transcriptText(messages) {
+  return messages.map((m) => `${m.role === 'user' ? 'Пользователь' : 'Ассистент'}: ${m.text}`).join('\n\n')
+}
+
+/**
+ * Текст запроса по выбранной стратегии.
+ * `harness` — отдаём только сообщение пользователя (контекстом управляет харнесс).
+ * @param {object} ctx - хранилище диалога.
+ * @param {string} userText - новое сообщение пользователя.
+ * @param {{skipLast?: number}} [opts] - сколько последних сообщений не включать в окно
+ *   (само новое сообщение уже лежит в памяти — иначе оно попало бы дважды).
+ * @returns {{text: string, windowCount: number, factsCount: number}} что уйдёт в модель.
+ */
+function composeContextText(ctx, userText, opts = {}) {
+  const all = activeMessages(ctx)
+  const skip = Math.max(0, Math.min(opts.skipLast ?? 0, all.length))
+  const win = (skip ? all.slice(0, all.length - skip) : all).slice(-ctx.window)
+  const body = transcriptText(win)
+  if (ctx.strategy === 'sliding') {
+    if (!win.length) return { text: userText, windowCount: 0, factsCount: 0 }
+    return {
+      text: [
+        `Ниже — последние ${win.length} сообщений нашего диалога (более ранние недоступны).`,
+        '<диалог>',
+        body,
+        '</диалог>',
+        '',
+        'Новое сообщение пользователя:',
+        userText,
+      ].join('\n'),
+      windowCount: win.length,
+      factsCount: 0,
+    }
+  }
+  // facts и branch: блок facts (в branch он появляется, только если что-то накоплено) + окно
+  const lines = CTX_FACT_KEYS.filter((k) => ctx.facts[k]).map((k) => `- ${k}: ${ctx.facts[k]}`)
+  const parts = []
+  if (ctx.strategy === 'facts' || lines.length) {
+    parts.push('Известные факты о задаче (ключ-значение):', lines.length ? lines.join('\n') : '- (пока пусто)')
+  }
+  if (win.length) parts.push('', `Последние ${win.length} сообщений диалога:`, '<диалог>', body, '</диалог>')
+  parts.push('', 'Новое сообщение пользователя:', userText)
+  return { text: parts.join('\n'), windowCount: win.length, factsCount: lines.length }
+}
+
+/**
+ * Обновление facts после сообщения пользователя: отдельный дешёвый вызов DeepSeek
+ * (вне сессии харнесса). На вход — прошлые facts + последние CTX_FACTS_WINDOW
+ * сообщений, на выход — JSON с фиксированными ключами (пустые не затирают старые).
+ * @returns {Promise<{facts: object, tokens: number}|null>} новые facts и расход вызова.
+ */
+function updateFacts({ token, model, provider }, ctx) {
+  if (!token) return Promise.resolve(null)
+  const prev = CTX_FACT_KEYS.filter((k) => ctx.facts[k]).map((k) => `- ${k}: ${ctx.facts[k]}`).join('\n') || '(пусто)'
+  const dialog = transcriptText(windowMessages(ctx, CTX_FACTS_WINDOW))
+  const system = 'Ты ведёшь «facts» (ключ-значение) о задаче пользователя для агента-ассистента. '
+    + 'По диалогу обнови факты: цель, ограничения, предпочтения, решения, договорённости. '
+    + 'Пиши кратко (до 200 символов на ключ), сохраняй конкретику: числа, сроки, названия, имена. '
+    + 'НЕ удаляй известное, если оно не отменено явно; дополняй и уточняй. '
+    + `Отвечай ТОЛЬКО JSON-объектом с ключами: ${CTX_FACT_KEYS.join(', ')}. `
+    + 'Неизвестное оставляй пустой строкой.'
+  const user = `Уже известные факты:\n${prev}\n\nДиалог (последние ${Math.min(CTX_FACTS_WINDOW, activeMessages(ctx).length)} сообщений):\n${dialog}`
+  return llmJson({ token, model, provider }, system, user, 700).then((r) => {
+    if (!r) return null
+    const facts = { ...ctx.facts }
+    for (const k of CTX_FACT_KEYS) {
+      const v = r.json?.[k]
+      if (typeof v === 'string' && v.trim() && v.trim().toLowerCase() !== 'null') facts[k] = v.trim()
+    }
+    return { facts, tokens: r.tokens }
+  })
+}
+
+/** Текущее состояние стратегии для UI: «sliding (окно 6)» / «harness». */
+function strategyLabel(ctx) {
+  if (!ctx || ctx.strategy === STRATEGY_HARNESS) return STRATEGY_HARNESS
+  const win = ctx.strategy === 'branch' ? `ветка ${ctx.activeBranch}, окно ${ctx.window}` : `окно ${ctx.window}`
+  return `${ctx.strategy} (${win})`
+}
+
+/** Следующий свободный id ветки: A, B, C, … Z, A27, B28 … */
+function nextBranchId(ctx) {
+  const n = (ctx.branchSeq ?? 0) + 1
+  const letter = String.fromCharCode(65 + ((n - 1) % 26))
+  return n > 26 ? `${letter}${n}` : letter
+}
+
+/**
+ * Чекпоинт + ПАРА веток от одного места (стратегия branching): каждая ветка
+ * получает копию диалога на момент чекпоинта и дальше живёт независимо.
+ * @param {object} ctx - хранилище диалога.
+ * @param {string} name - подпись пары веток.
+ * @returns {string[]} id созданных веток.
+ */
+function createBranchPair(ctx, name) {
+  const base = activeMessages(ctx)
+  ctx.checkpoint = { atMessage: base.length, note: name, at: new Date().toISOString() }
+  const mk = (suffix) => {
+    ctx.branchSeq = (ctx.branchSeq ?? 0) + 1
+    const id = nextBranchId({ branchSeq: ctx.branchSeq - 1 })
+    ctx.branches[id] = {
+      name: `${name}${suffix}`,
+      messages: base.map((m) => ({ ...m })),
+      createdAt: new Date().toISOString(),
+    }
+    return id
+  }
+  const a = mk(' · A')
+  const b = mk(' · B')
+  ctx.activeBranch = a
+  return [a, b]
+}
+
+/** Переключить активную ветку диалога (main или созданная); id — без учёта регистра. */
+function switchBranch(ctx, id) {
+  if (typeof id !== 'string') return false
+  const want = id.toLowerCase()
+  if (want === 'main') { ctx.activeBranch = 'main'; return true }
+  const found = Object.keys(ctx.branches ?? {}).find((b) => b.toLowerCase() === want)
+  if (found === undefined) return false
+  ctx.activeBranch = found
+  return true
+}
+
 /** «Заголовок» + id тусклым, как в claude; без заголовка — просто id. */
-function fmtSession(id, title) {
-  return title ? `«${title}» ${C.dim}${id}${C.reset}` : id
+function fmtSession(id, title) {  return title ? `«${title}» ${C.dim}${id}${C.reset}` : id
 }
 
 /** Выбор сессии по номеру, id, префиксу id или части заголовка. */
@@ -792,7 +1032,10 @@ function listSessions(dshHome) {
       if (e.isDirectory()) walk(p)
       // Имя лога зависит от версии формата: session.jsonl[.zstd], session.v3.jsonl.zstd, …
       else if (/^session(\.[\w-]+)?\.jsonl(\.zstd)?$/.test(e.name)) {
-        out.push(basename(d)) // родительская папка = sessionId
+        const id = basename(d)
+        // Служебные сессии ходов в режиме стратегий (day10) в списке не нужны.
+        if (id.startsWith('ctx-')) continue
+        out.push(id) // родительская папка = sessionId
       }
     }
   }
@@ -818,6 +1061,8 @@ function parseArgs(argv) {
     stopMarker: undefined,   // маркер-стоп: рендер обрывается на нём
     compress: undefined,     // компрессия истории: 'on' | 'off' | <ratio 0..1>
     compressKeep: undefined, // сколько последних токенов держать как есть
+    strategy: undefined,     // стратегия управления контекстом: harness | sliding | facts | branch
+    window: undefined,       // N сообщений для стратегий
     help: false,
   }
   for (let i = 0; i < argv.length; i++) {
@@ -836,6 +1081,8 @@ function parseArgs(argv) {
       case '--stop': opts.stopMarker = next(); break
       case '--compress': opts.compress = next(); break
       case '--compress-keep': opts.compressKeep = Number(next()); break
+      case '--strategy': case '--mode': opts.strategy = next(); break
+      case '--window': opts.window = Number(next()); break
       case '-p': case '--print': opts.prompt = next(); break
       case '--workspace': opts.workspace = next(); break
       case '--dsh-bin': opts.dshBin = next(); break
@@ -1000,7 +1247,9 @@ function formatInstruction(v) {
 const COMMANDS = [
   { name: 'help', usage: '/help [команда]', desc: 'список команд / справка по команде' },
   { name: 'session', usage: '/session', desc: 'показать текущую сессию (заголовок и id)' },
-  { name: 'context', usage: '/context', desc: 'контекст: настройки компрессии, метрики, последний summary' },
+  { name: 'strategy', usage: '/strategy [id]', desc: 'стратегия контекста: sliding | facts | branch | harness (меню)' },
+  { name: 'branch', usage: '/branch [id|new]', desc: 'ветки диалога: чекпоинт, новая ветка, переключение (включает режим branch)' },
+  { name: 'context', usage: '/context', desc: 'контекст: стратегия, факты, метрики, последний summary' },
   { name: 'resume', usage: '/resume [id]', desc: 'продолжить сессию: по id или выбором из списка' },
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
@@ -1033,9 +1282,22 @@ function suggestCommands(input) {
     .map((x) => x.c)
 }
 
+/**
+ * Подсказка о текущем режиме прямо в списке команд: «/branch» имеет смысл только
+ * в режиме branch (команда сама в него переключает), а /strategy показывает, где
+ * мы сейчас. Значение обновляет main при каждом переключении режима/сессии.
+ */
+let strategyHint = STRATEGY_HARNESS
+
+function commandDesc(c) {
+  if (c.name === 'branch' && strategyHint !== 'branch') return `${c.desc} · переключит режим на branch`
+  if (c.name === 'strategy') return `${c.desc} · сейчас: ${strategyHint}`
+  return c.desc
+}
+
 function printCommandUsage(name) {
   const c = COMMANDS.find((x) => x.name === name)
-  if (c) log.line(`  ${C.cyan}${c.usage}${C.off} — ${c.desc}`)
+  if (c) log.line(`  ${C.cyan}${c.usage}${C.off} — ${commandDesc(c)}`)
 }
 
 function printCommandList() {
@@ -1115,8 +1377,8 @@ function editorRender(ed, force) {
         const sel = i === ed.menu.sel
         // Выбранный пункт — фирменный синий DeepSeek + ▸; остальные — спокойные.
         const row = sel
-          ? `${DS.blue}▸${C.off} ${C.bold}${DS.blue}/${c.name}${C.off}${C.dim} — ${c.desc}${C.off}`
-          : `  /${c.name}${C.dim} — ${c.desc}${C.off}`
+          ? `${DS.blue}▸${C.off} ${C.bold}${DS.blue}/${c.name}${C.off}${C.dim} — ${commandDesc(c)}${C.off}`
+          : `  /${c.name}${C.dim} — ${commandDesc(c)}${C.off}`
         rows.push(menuClip(row))
       }
     } else {
@@ -1396,6 +1658,129 @@ function pickSessionTTY(list, titles) {
   })
 }
 
+/**
+ * Универсальный выбор из списка в стиле /resume (для /strategy и /branch):
+ * стрелки, фильтр по подстроке, Enter — выбрать, Esc — отмена; в пайпе — номер или id.
+ * @param {{prompt: string, items: Array<{id: string, label: string, note?: string, current?: boolean}>}} spec
+ * @returns {Promise<string|null>} id выбранного пункта (null — отмена).
+ */
+function pickListTTY(spec) {
+  const items = spec.items
+  const filter = (q) => {
+    const s = String(q ?? '').trim().toLowerCase()
+    if (!s) return items.slice()
+    return items.filter((it) => it.id.toLowerCase().includes(s)
+      || it.label.toLowerCase().includes(s) || String(it.note ?? '').toLowerCase().includes(s))
+  }
+  if (!process.stdin.isTTY) {
+    items.forEach((it, i) => log.line(`  ${i + 1}. ${it.label}${it.note ? ` — ${it.note}` : ''}`))
+    return askLine('номер или id (Enter — отмена): ').then((pick) => {
+      const p = String(pick ?? '').trim()
+      if (!p) return null
+      const byNum = Number(p)
+      if (Number.isInteger(byNum) && byNum >= 1 && byNum <= items.length) return items[byNum - 1].id
+      const found = items.find((it) => it.id.toLowerCase() === p.toLowerCase())
+      return found ? found.id : null
+    })
+  }
+  const render = (st) => {
+    const row0 = st.prompt + st.query
+    const rows = []
+    const { start, count } = pickWindow(st.items.length, st.sel, 8)
+    if (st.items.length === 0) rows.push(menuClip(`${C.dim}  (ничего не найдено)${C.off}`))
+    for (let k = 0; k < count; k++) {
+      const it = st.items[start + k]
+      const sel = start + k === st.sel
+      const mark = sel ? `${DS.blue}▸${C.off}` : ' '
+      const dot = it.current ? `${DS.sky}•${C.off}` : ' '
+      const label = sel ? `${C.bold}${DS.blue}${it.label}${C.off}` : it.label
+      const note = it.note ? ` ${C.dim}${it.note}${C.reset}` : ''
+      rows.push(menuClip(`${mark} ${dot} ${label}${note}`))
+    }
+    process.stdout.write(`\r\x1b[J${row0}\n${[menuSeparator(), ...rows, `${C.dim}${SESSION_PICK_KEYS}${C.off}`].join('\n')}\x1b[${rows.length + 2}A\x1b[${meterVis(row0) + 1}G`)
+  }
+  return new Promise((resolve) => {
+    const st = { prompt: spec.prompt, query: '', sel: 0, items: filter('') }
+    let done = false
+    let onResize = () => {}
+    const recompute = () => {
+      st.items = filter(st.query)
+      if (st.sel >= st.items.length) st.sel = Math.max(0, st.items.length - 1)
+    }
+    const cleanup = () => {
+      input.editorActive = false
+      clearInterval(st.tick)
+      try { process.stdout.removeListener('resize', onResize) } catch {}
+      try { process.stdin.setRawMode(false) } catch {}
+      process.stdin.removeListener('data', onData)
+      process.stdin.removeListener('end', onEnd)
+    }
+    const finish = (id) => {
+      if (done) return
+      done = true
+      cleanup()
+      process.stdout.write(`\r\x1b[J${st.prompt}${st.query}\n`)
+      resolve(id)
+    }
+    const onEnd = () => finish(null)
+    const onData = (chunk) => {
+      const seq = chunk.toString()
+      for (let i = 0; i < seq.length; i++) {
+        const ch = seq[i]
+        if (ch === '\x1b') {
+          if (seq[i + 1] === '[') {
+            let j = i + 2
+            while (j < seq.length && !(seq.charCodeAt(j) >= 0x40 && seq.charCodeAt(j) <= 0x7e)) j++
+            if (j >= seq.length) break
+            const fn = seq[j]
+            if ((fn === 'A' || fn === 'B') && st.items.length > 1) {
+              const n = st.items.length
+              st.sel = fn === 'A' ? (st.sel + n - 1) % n : (st.sel + 1) % n
+              render(st)
+            }
+            i = j
+            continue
+          }
+          if (st.query) { st.query = ''; st.sel = 0; recompute(); render(st) } else { finish(null); return }
+          continue
+        }
+        if (ch === '\u0003') { done = true; cleanup(); process.emit('SIGINT'); return }
+        if (ch === '\u0004') { finish(null); return }
+        if (ch === '\r' || ch === '\n') { finish(st.items[st.sel]?.id ?? null); return }
+        if (ch === '\u007f' || ch === '\b') {
+          if (!st.query) continue
+          st.query = st.query.slice(0, -1)
+          st.sel = 0
+          recompute()
+          render(st)
+          continue
+        }
+        if (ch < ' ') continue
+        st.query += ch
+        st.sel = 0
+        recompute()
+        render(st)
+      }
+    }
+    input.editorActive = true
+    try {
+      process.stdin.setRawMode(true)
+    } catch {
+      input.editorActive = false
+      items.forEach((it, i) => log.line(`  ${i + 1}. ${it.label}`))
+      askLine('номер или id (Enter — отмена): ').then((pick) => resolve(String(pick ?? '').trim() || null))
+      return
+    }
+    onResize = () => { if (!done) render(st) }
+    st.tick = setInterval(() => { if (!done) render(st) }, 300)
+    if (st.tick.unref) st.tick.unref()
+    process.stdout.on('resize', onResize)
+    process.stdin.on('data', onData)
+    process.stdin.on('end', onEnd)
+    render(st)
+  })
+}
+
 async function askLine(question) {
   process.stdout.write(question)
   return takeInputLine()
@@ -1530,6 +1915,8 @@ async function main() {
     log.line('  --stop <marker>     стоп-символ: передаётся с промптом; показ обрывается при генерации маркера')
     log.line('  --compress <mode>   компрессия истории: on (default) | off | <ratio 0..1> (env DSH_TERM_COMPRESS)')
     log.line('  --compress-keep <n> сколько последних токенов держать как есть (default 50000, ≈5% окна)')
+    log.line('  --strategy <id>     стратегия контекста: harness (default) | sliding | facts | branch')
+    log.line('  --window <n>        N сообщений для стратегии sliding/facts/branch (default 6)')
     log.line('  --session <id>      продолжить конкретную сессию (синоним: --resume <id>)')
     log.line('  --workspace <path>  рабочая папка сессий (default: текущая)')
     log.line('  --dsh-bin <path>    путь к dsh (default: dsh из PATH)')
@@ -1538,7 +1925,9 @@ async function main() {
     log.line('  /    список доступных команд')
     log.line('  /help [команда]  справка')
     log.line('  /session  показать текущую сессию (заголовок и id)')
-    log.line('  /context  контекст: настройки компрессии, метрики, последний summary')
+    log.line('  /context  контекст: стратегия, настройки компрессии, метрики, последний summary')
+    log.line('  /strategy [id]  стратегия контекста: выбор из меню или sliding|facts|branch|harness')
+    log.line('  /branch [id|new]  ветки диалога (включает режим branch): чекпоинт, ветка, переключение')
     log.line('  /resume [id]  продолжить сессию: по id или выбором из списка')
     log.line('  /new     начать новую сессию')
     log.line('  /token   сменить сохранённый API ключ')
@@ -1616,6 +2005,42 @@ async function main() {
     keep: Number.isFinite(opts.compressKeep) && opts.compressKeep > 0 ? Math.floor(opts.compressKeep) : COMPRESS_DEFAULT_KEEP,
     thresholdTokens: Math.round(ratio * CTX_MAX),
   }
+  // Патч компрессии пишем ПОСЛЕ выбора стратегии: в режиме стратегии
+  // автокомпакция харнесса выключается, чтобы контекстом управлял только клиент.
+  const saved = loadState(opts.dshHome)
+  const isOneShot = opts.prompt !== undefined
+  const sessionId = opts.session ?? (isOneShot ? randomUUID() : saved?.lastSessionId ?? randomUUID())
+
+  // ---- стратегии управления контекстом (day10) ----
+  // Режим хранится В СЕССИИ: явный флаг перекрывает сохранённый, иначе берём
+  // сохранённый (так /strategy переключает режим на ходу и он держится для сессии).
+  const strategyIds = [STRATEGY_HARNESS, ...STRATEGIES.map((s) => s.id)]
+  const strategyFlag = opts.strategy === undefined ? null : String(opts.strategy).trim().toLowerCase()
+  if (strategyFlag !== null && !strategyIds.includes(strategyFlag)) {
+    log.err(`неизвестная стратегия контекста: ${strategyFlag}`)
+    log.err(`доступно: ${strategyIds.join(' | ')}`)
+    process.exit(1)
+  }
+  const envWindow = Number(process.env.DSH_TERM_WINDOW)
+  const windowN = Number.isFinite(opts.window) && opts.window > 0
+    ? Math.floor(opts.window)
+    : Number.isFinite(envWindow) && envWindow > 0 ? Math.floor(envWindow) : CTX_DEFAULT_WINDOW
+  const ctxStored = loadContext(opts.dshHome, sessionId)
+  const strategy = strategyFlag ?? ctxStored?.strategy ?? STRATEGY_HARNESS
+  const ctx = ctxStored ?? (strategy === STRATEGY_HARNESS ? null : newContext(sessionId, strategy, windowN))
+  if (ctx) {
+    ctx.strategy = strategy
+    if (opts.window !== undefined || process.env.DSH_TERM_WINDOW !== undefined) ctx.window = windowN
+    ctx.messages ??= []
+    ctx.facts ??= {}
+    ctx.branches ??= {}
+    ctx.activeBranch ??= 'main'
+    saveContext(opts.dshHome, ctx)
+  }
+  const strategyMode = strategy !== STRATEGY_HARNESS
+  strategyHint = strategy
+  if (strategyMode) compress.mode = 'off' // контекстом управляет стратегия, а не харнесс
+
   try {
     const patchPath = join(opts.dshHome, 'dsh-term-compress.patch.yml')
     mkdirSync(opts.dshHome, { recursive: true })
@@ -1625,14 +2050,12 @@ async function main() {
     log.err(`compress patch failed: ${e.message}`)
   }
 
-  // Состояние REPL: продолжаем последнюю сессию, если не указана явная.
-  // ВАЖНО для one-shot: без --session всегда СВЕЖАЯ сессия (чистый контекст),
-  // авто-resume последней сессии в -p/--print отключён.
-  const saved = loadState(opts.dshHome)
-  const isOneShot = opts.prompt !== undefined
-  const sessionId = opts.session ?? (isOneShot ? randomUUID() : saved?.lastSessionId ?? randomUUID())
   const state = {
     sessionId,
+    harnessSessionId: sessionId, // id сессии для ТЕКУЩЕГО хода (в режиме стратегии — свежий)
+    turnSeq: 0,                  // номер хода в этом процессе (для id сессий ходов)
+    context: ctx,                // хранилище диалога: транскрипт/facts/ветки (day10)
+    ctxAnswer: '',               // накопленный «сырой» текст ответа текущего хода
     children: new Set(),       // subagent-сессии текущего дерева
     turn: null,                // { resolve, running, timer, maxChars, marker, … }
     streamedText: false,       // печатали ли текст за текущий ход
@@ -1660,7 +2083,7 @@ async function main() {
     trace(`notif ${msg.method}`)
     if (msg.method === 'session.status') {
       const { sessionId, status } = msg.params
-      const mine = sessionId === state.sessionId || state.children.has(sessionId)
+      const mine = sessionId === state.harnessSessionId || state.children.has(sessionId)
       if (mine && state.turn) {
         if (status === 'running') state.turn.running = true
         if (status === 'idle' && state.turn) finishTurn()
@@ -1683,7 +2106,7 @@ async function main() {
       // фолбэк по assistant/message (он же путь для харнесса без патча SDK-сервера).
       if (process.env.DSH_TERM_NO_STREAM) return
       const { sessionId, frame } = msg.params
-      const mine = sessionId === state.sessionId || state.children.has(sessionId)
+      const mine = sessionId === state.harnessSessionId || state.children.has(sessionId)
       if (!mine || !frame) return
       state.liveStream = true // сервер отдаёт живой стрим — фолбэк не нужен
       const key = `${sessionId}:${frame.attemptId ?? ''}`
@@ -1703,7 +2126,7 @@ async function main() {
     if (msg.method === 'session.event') {
       const { sessionId, event } = msg.params
       trace(`event ${event?.type}`)
-      const mine = sessionId === state.sessionId || state.children.has(sessionId)
+      const mine = sessionId === state.harnessSessionId || state.children.has(sessionId)
       // Исход хода фиксируем ДО гейта по state.turn: порядок turn/end vs idle
       // между двумя notify-каналами не гарантирован, а lastEndKind нужен и в -p.
       if (mine && event.type === 'turn/end') state.lastEndKind = event.data?.reason?.kind ?? null
@@ -1830,6 +2253,12 @@ async function main() {
             const fails = state.metrics.compactFails
             log.dim(`  compression: ${n} summarize call${n === 1 ? '' : 's'}${fails ? `, ${fails} failed` : ''}, ${fmtTok(state.metrics.compactTokens)} tokens${fails ? ' (failed calls not metered)' : ''}`)
           }
+          // facts считаем ПО ХОДУ (в сводке), а не накопленным за процесс: иначе
+          // строка печаталась бы и после переключения на стратегию без facts.
+          if (state.turn?.factsCalls) {
+            const fc = state.turn.factsCalls
+            log.dim(`  strategy: ${fc} facts update${fc === 1 ? '' : 's'}, ${fmtTok(state.turn.factsTokens)} tokens`)
+          }
           log.dim(`  context: ${fmtTok(ctx)} / ${fmtTok(CTX_MAX)} (${fmtPct(ctx, CTX_MAX)}%)`)
         } else if (f) {
           log.err(`— turn ${event.data.turn} ended: ${r.kind} (${f.code ?? f.name}: ${f.message})`)
@@ -1898,6 +2327,9 @@ async function main() {
    * @param {number|undefined} step - шаг хода (для фолбэка по assistant/message).
    */
   function feedTextDelta(text, step) {
+    // Сырой текст ответа — в память диалога (стратегии day10): до всех клиентских
+    // обрезок по стоп-маркеру и лимиту, чтобы в истории остался полный ответ.
+    state.ctxAnswer += text
     // Пошёл видимый ответ — анимация останавливается, текст стримится.
     stopStatus()
     state.streamedText = true
@@ -2043,6 +2475,48 @@ async function main() {
       }
       const body = instructions.length ? `${instructions.join('\n')}\n\n---\n\n${text}` : text
       trace(`prompt body: ${body.slice(0, 200)}`)
+      // ---- стратегия контекста (day10) ----
+      // Клиент сам решает, что уйдёт в модель: [facts] + последние N сообщений +
+      // новое сообщение. Ход идёт в СВЕЖУЮ harness-сессию, иначе его поверхность
+      // накапливала бы полную историю и в модель попадало бы больше задуманного.
+      let sendText = body
+      let sendSession = state.sessionId
+      state.ctxAnswer = ''
+      if (state.context && state.context.strategy !== STRATEGY_HARNESS) {
+        const c = state.context
+        state.turnSeq += 1
+        // 1) сообщение пользователя — в память диалога (потом обновляем facts);
+        activeMessages(c).push({ role: 'user', text, at: new Date().toISOString() })
+        if (c.strategy === 'facts') {
+          const r = await updateFacts({ token, model: opts.model, provider: opts.provider }, c)
+          if (r) {
+            c.facts = r.facts
+            c.factsCalls += 1
+            c.factsTokens += r.tokens
+            state.metrics.factsCalls += 1
+            state.metrics.factsTokens += r.tokens
+            if (state.turn) {
+              state.turn.factsCalls = (state.turn.factsCalls ?? 0) + 1
+              state.turn.factsTokens = (state.turn.factsTokens ?? 0) + r.tokens
+            }
+            trace(`facts updated (${r.tokens} tokens): ${JSON.stringify(r.facts).slice(0, 200)}`)
+          }
+        }
+        // 2) контекст по стратегии (само сообщение уже добавлено — не дублируем)
+        const composed = composeContextText(c, body, { skipLast: 1 })
+        sendText = composed.text
+        state.lastCompose = { ...composed, strategy: c.strategy, branch: c.activeBranch, messages: activeMessages(c).length }
+        saveContext(opts.dshHome, c)
+        // 3) свежая сессия харнесса на этот ход
+        if (state.turnSeq > 1) {
+          sendSession = `ctx-${sessionId.slice(0, 8)}-t${state.turnSeq}-${randomUUID().slice(0, 4)}`
+        }
+        state.harnessSessionId = sendSession
+        trace(`strategy ${c.strategy}: session=${sendSession} window=${composed.windowCount} facts=${composed.factsCount} chars=${sendText.length}`)
+        trace(`strategy prompt:\n${sendText}`)
+        // В one-shot это уходит в stderr — как и остальная диагностика.
+        log.dim(`· контекст [${strategyLabel(c)}]: ${composed.windowCount} сообщений${composed.factsCount ? ` + ${composed.factsCount} facts` : ''}, ${fmtTok(Math.ceil(sendText.length / 4))} токенов ≈`)
+      }
       // Заголовок для новой сессии: сразу черновой (из промпта), затем в фоне —
       // LLM-саммаризация сути запроса (≤10 слов), которая его заменит.
       if (!UI.oneShot && state.isNew && !state.titles[state.sessionId]) {
@@ -2064,8 +2538,8 @@ async function main() {
         }).catch(() => {})
       }
       const res = await rpc.request('session/prompt', {
-        sessionId: state.sessionId,
-        contentBlocks: [{ type: 'text', text: body }],
+        sessionId: sendSession,
+        contentBlocks: [{ type: 'text', text: sendText }],
       })
       trace(`prompt queued: ${res.messageId}`)
       log.dim(`(queued ${res.messageId})`)
@@ -2081,6 +2555,12 @@ async function main() {
     }
     await waiting
     drainMd() // гарантированно допечатать остаток буфера (если таймер не успел)
+    // Ответ — в память диалога (сырой текст, без клиентских обрезок).
+    if (state.context && state.context.strategy !== STRATEGY_HARNESS && state.ctxAnswer) {
+      activeMessages(state.context).push({ role: 'assistant', text: state.ctxAnswer, at: new Date().toISOString() })
+      saveContext(opts.dshHome, state.context)
+      trace(`context: ${activeMessages(state.context).length} сообщений, ветка ${state.context.activeBranch}`)
+    }
     trace('promptTurn done (idle)')
     return state.lastEndKind === 'completed'
   }
@@ -2088,6 +2568,59 @@ async function main() {
   // ---- сериализованная обработка строк (REPL-цикл) ----
   let busy = false
   let exiting = false
+
+  /**
+   * Переключить активный диалог: подтянуть его стратегию и память (day10).
+   * @param {string} newId - id сессии (он же ключ хранилища контекста).
+   * @param {{isNew?: boolean}} [o] - новая сессия (для авто-заголовка).
+   */
+  function switchSession(newId, o = {}) {
+    state.sessionId = newId
+    state.harnessSessionId = newId
+    state.turnSeq = 0
+    state.ctxAnswer = ''
+    state.lastCompose = null
+    state.children.clear()
+    state.isNew = o.isNew === true
+    state.metrics = emptyMetrics()
+    const stored = loadContext(opts.dshHome, newId)
+    state.context = stored ?? (strategyMode ? newContext(newId, strategy, windowN) : null)
+    if (state.context) {
+      state.context.messages ??= []
+      state.context.facts ??= {}
+      state.context.branches ??= {}
+      state.context.activeBranch ??= 'main'
+      if (strategyMode) state.context.strategy = strategy
+      saveContext(opts.dshHome, state.context)
+    }
+    strategyHint = state.context?.strategy ?? STRATEGY_HARNESS
+    saveState(opts.dshHome, newId, state.titles, state.titleLocked)
+  }
+
+  /**
+   * Переключить стратегию контекста ТЕКУЩЕЙ сессии (применяется со следующего
+   * сообщения: контекст собирается клиентом, перезапуск рантайма не нужен).
+   * @param {string} id - harness | sliding | facts | branch.
+   */
+  function applyStrategy(id) {
+    const c = state.context ?? newContext(state.sessionId, id, windowN)
+    c.strategy = id
+    c.window = c.window || windowN
+    c.messages ??= []
+    c.facts ??= {}
+    c.branches ??= {}
+    c.activeBranch ??= 'main'
+    state.context = c
+    saveContext(opts.dshHome, c)
+    strategyHint = id
+    if (id === STRATEGY_HARNESS) {
+      log.dim(`· стратегия контекста: ${STRATEGY_HARNESS} — контекстом снова управляет харнесс (компрессия day9)`)
+    } else {
+      const info = STRATEGIES.find((s) => s.id === id)
+      log.dim(`· стратегия контекста: ${id} — ${info?.title ?? ''}, окно ${c.window}`)
+      log.dim('  применится со следующего сообщения; в этом режиме автокомпакция харнесса выключена')
+    }
+  }
 
   /** Диспетчер команд: «/» — список, /help — справка, /publish-day — SKILLS-макрос. */
   async function handleCommand(text) {
@@ -2113,6 +2646,84 @@ async function main() {
         } else printCommandList()
         break
       }
+      case 'strategy': {
+        const ids = [STRATEGY_HARNESS, ...STRATEGIES.map((s) => s.id)]
+        let chosen = (parts[1] ?? '').toLowerCase() || null
+        if (chosen && !ids.includes(chosen)) {
+          log.err(`неизвестная стратегия: ${chosen}`)
+          log.dim(`доступно: ${ids.join(' | ')}`)
+          break
+        }
+        if (!chosen) {
+          const cur = state.context?.strategy ?? STRATEGY_HARNESS
+          const items = STRATEGIES.map((s) => ({
+            id: s.id,
+            label: `${s.id} — ${s.title}`,
+            note: s.desc,
+            current: s.id === cur,
+          }))
+          items.push({
+            id: STRATEGY_HARNESS,
+            label: `${STRATEGY_HARNESS} — по умолчанию`,
+            note: 'контекстом управляет харнесс (компрессия + прунер)',
+            current: cur === STRATEGY_HARNESS,
+          })
+          chosen = await pickListTTY({ prompt: 'strategy> ', items })
+          if (!chosen) { log.line('отменено'); break }
+        }
+        applyStrategy(chosen)
+        break
+      }
+      case 'branch': {
+        // Ветки — часть режима branch, поэтому команда ВСЕГДА приводит сессию в
+        // этот режим. Раньше она молча работала поверх sliding/facts: ветки
+        // создавались, а контекст продолжал собираться по прежней стратегии —
+        // состояние было неочевидным.
+        if (state.context?.strategy !== 'branch') applyStrategy('branch')
+        const c = state.context
+        const arg = (parts[1] ?? '').toLowerCase()
+        const branchIds = () => Object.keys(c.branches)
+        if (arg === 'new' || arg === 'create') {
+          const name = parts.slice(2).join(' ') || `ветка ${c.branchSeq + 1}`
+          createBranchPair(c, name)
+          saveContext(opts.dshHome, c)
+          log.dim(`· чекпоинт на ${c.checkpoint.atMessage} сообщениях; созданы ветки: ${branchIds().join(', ')}`)
+          log.dim(`  активная: ${state.context.activeBranch} — продолжайте диалог здесь`)
+          log.dim(`  стратегия: ${strategyLabel(c)}`)
+          break
+        }
+        if (arg && (arg === 'main' || branchIds().some((b) => b.toLowerCase() === arg))) {
+          switchBranch(c, arg)
+          saveContext(opts.dshHome, c)
+          log.dim(`· активная ветка: ${c.activeBranch} (${activeMessages(c).length} сообщений)`)
+          break
+        }
+        if (arg) { log.err(`нет такой ветки: ${arg} (есть: main${branchIds().length ? ', ' + branchIds().join(', ') : ''})`); break }
+        // Без аргумента — меню в стиле /resume.
+        const items = [{ id: 'main', label: 'main — основная линия', note: `${c.messages.length} сообщений`, current: c.activeBranch === 'main' }]
+        for (const id of branchIds()) {
+          items.push({
+            id,
+            label: `${id} — ${c.branches[id].name}`,
+            note: `${c.branches[id].messages.length} сообщений`,
+            current: c.activeBranch === id,
+          })
+        }
+        items.push({ id: '__new__', label: '+ новая ветка от текущего места', note: 'чекпоинт + пара веток' })
+        const chosen = await pickListTTY({ prompt: 'branch> ', items })
+        if (!chosen) { log.line('отменено'); break }
+        if (chosen === '__new__') {
+          createBranchPair(c, `ветка ${c.branchSeq + 1}`)
+          saveContext(opts.dshHome, c)
+          log.dim(`· чекпоинт на ${c.checkpoint.atMessage} сообщениях; созданы ветки: ${branchIds().join(', ')}`)
+          log.dim(`  активная: ${c.activeBranch}`)
+          break
+        }
+        switchBranch(c, chosen)
+        saveContext(opts.dshHome, c)
+        log.dim(`· активная ветка: ${c.activeBranch} (${activeMessages(c).length} сообщений) · стратегия: ${strategyLabel(c)}`)
+        break
+      }
       case 'session': {
         log.line(fmtSession(state.sessionId, state.titles[state.sessionId]))
         break
@@ -2123,7 +2734,16 @@ async function main() {
         const c = state.compress ?? { mode: 'on', ratio: COMPRESS_DEFAULT_RATIO, keep: COMPRESS_DEFAULT_KEEP }
         log.line(`${C.bold}context${C.off}`)
         log.dim(`  session: ${fmtSession(state.sessionId, state.titles[state.sessionId])}`)
-        log.dim(`  compression: ${c.mode}${compressPolicyText(c)}`)
+        log.dim(`  strategy: ${strategyLabel(state.context)}${state.lastCompose ? ` · последний запрос: ${state.lastCompose.windowCount} сообщений${state.lastCompose.factsCount ? ` + ${state.lastCompose.factsCount} facts` : ''}` : ''}`)
+        if (state.context && state.context.strategy !== STRATEGY_HARNESS) {
+          const sc = state.context
+          const brs = Object.keys(sc.branches ?? {})
+          log.dim(`  dialogue: ${activeMessages(sc).length} сообщений, ветка ${sc.activeBranch}${brs.length ? `, веток: ${brs.join(', ')}` : ''}`)
+          const fl = CTX_FACT_KEYS.filter((k) => sc.facts[k]).map((k) => `    - ${k}: ${sc.facts[k]}`)
+          if (fl.length) { log.dim('  facts:'); for (const l of fl) log.dim(l) }
+          if (sc.factsCalls) log.dim(`  facts updates: ${sc.factsCalls} calls, ${fmtTok(sc.factsTokens)} tokens`)
+        }
+        log.dim(`  compression: ${c.mode}${compressPolicyText(c)}${strategyMode ? ' (в режиме стратегии автокомпакция выключена)' : ''}`)
         if (c.mode === 'on') {
           const compactable = Math.max(0, c.thresholdTokens - COMPRESS_SYSTEM_FLOOR - c.keep)
           log.dim(`  fixed prefix: ≈ ${fmtTok(COMPRESS_SYSTEM_FLOOR)} tokens (system prompt + tools) — не сжимается`)
@@ -2149,34 +2769,24 @@ async function main() {
         if (target) {
           const known = listSessions(opts.dshHome)
           const resolved = resolveSessionPick(target, known, state.titles) ?? target
-          state.sessionId = resolved
-          state.children.clear()
-          state.isNew = false
-          state.metrics = emptyMetrics()
-          saveState(opts.dshHome, resolved, state.titles, state.titleLocked)
+          switchSession(resolved)
           log.line(`${C.dim}resuming session:${C.reset} ${fmtSession(resolved, state.titles[resolved])}`)
+          if (state.context) log.dim(`  стратегия сессии: ${strategyLabel(state.context)}`)
         } else {
           const list = listSessions(opts.dshHome)
           if (list.length === 0) { log.err('нет сохранённых сессий в этом home'); break }
           const chosen = await pickSessionTTY(list, state.titles)
           if (!chosen) { log.line('отменено'); break }
-          if (!chosen) { log.err('нет такой сессии'); break }
-          state.sessionId = chosen
-          state.children.clear()
-          state.isNew = false
-          state.metrics = emptyMetrics()
-          saveState(opts.dshHome, chosen, state.titles, state.titleLocked)
+          switchSession(chosen)
           log.line(`${C.dim}resuming session:${C.reset} ${fmtSession(chosen, state.titles[chosen])}`)
+          if (state.context) log.dim(`  стратегия сессии: ${strategyLabel(state.context)}`)
         }
         break
       }
       case 'new': {
-        state.sessionId = randomUUID()
-        state.children.clear()
-        state.isNew = true
-        state.metrics = emptyMetrics()
-        saveState(opts.dshHome, state.sessionId, state.titles, state.titleLocked)
+        switchSession(randomUUID(), { isNew: true })
         log.dim(`new session: ${state.sessionId}`)
+        if (state.context) log.dim(`  стратегия: ${strategyLabel(state.context)}`)
         break
       }
       case 'token': {
@@ -2269,6 +2879,11 @@ async function main() {
     // Диагностика UI: понятно, почему нет цветов/рендера (tty/NO_COLOR/one-shot).
     log.dim(`ui: in-tty=${process.stdin.isTTY ? 1 : 0} out-tty=${process.stdout.isTTY ? 1 : 0} colors=${C.cyan ? 1 : 0} md=${mdColorEnabled() ? 1 : 0}`)
     log.dim(`compress: ${compress.mode}${compressPolicyText(compress)}`)
+    if (strategyMode) {
+      log.dim(`strategy: ${strategyLabel(ctx)} — контекстом управляет ${
+        ctx.strategy === 'facts' ? 'facts + окно сообщений' : ctx.strategy === 'branch' ? 'ветки диалога + окно сообщений' : 'окно сообщений'
+      } (автокомпакция харнесса выключена)`)
+    }
     // Несогласованная политика: харнесс молча отбросит спеку (см. compressNotes).
     for (const note of compressNotes(compress)) log.dim(`  note: ${note}`)
   } catch (e) {

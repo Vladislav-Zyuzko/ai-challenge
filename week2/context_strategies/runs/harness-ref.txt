@@ -1,0 +1,119 @@
+runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
+ui: in-tty=0 out-tty=0 colors=0 md=0
+compress: off
+resuming session: 2ecabe2b-b402-4318-8429-88340c00ea02
+(queued d13e08f5-aa6e-4ff1-bca6-e63b908dc96f)
+· заголовок сессии: «Привет! Собираем ТЗ на»
+принял
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 7.6k (cache 768) / out 4
+  requests: 1 (this turn: 1)
+  context: 7.6k / 1M (0.76%)
+
+(queued a130b729-160e-4300-9838-b68264964217)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 2 ended: completed
+  tokens: in 15.3k (cache 8.3k) / out 6
+  requests: 2 (this turn: 1)
+  context: 7.7k / 1M (0.773%)
+
+(queued 48747578-a6b1-4925-a9bb-fc17a38100c0)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 3 ended: completed
+  tokens: in 23.2k (cache 16k) / out 137
+  requests: 3 (this turn: 1)
+  context: 7.8k / 1M (0.784%)
+
+(queued 72a25ab4-4ba7-4133-8558-e776624ea967)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 4 ended: completed
+  tokens: in 31.3k (cache 23.9k) / out 219
+  requests: 4 (this turn: 1)
+  context: 8.1k / 1M (0.81%)
+
+(queued 8b02fd70-edfe-4016-ad22-d2b82443110a)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 5 ended: completed
+  tokens: in 39.6k (cache 32k) / out 221
+  requests: 5 (this turn: 1)
+  context: 8.3k / 1M (0.83%)
+
+(queued c3174a4f-76cc-4abf-b5b7-39affed67f5c)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 6 ended: completed
+  tokens: in 48k (cache 40.2k) / out 223
+  requests: 6 (this turn: 1)
+  context: 8.4k / 1M (0.842%)
+
+(queued 8d4bc137-70d4-4ee5-a59b-dc867e914b28)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 7 ended: completed
+  tokens: in 56.5k (cache 48.5k) / out 225
+  requests: 7 (this turn: 1)
+  context: 8.5k / 1M (0.855%)
+
+(queued 88ffee63-5c46-4c46-bf61-62617ce70df7)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 8 ended: completed
+  tokens: in 65.2k (cache 57k) / out 331
+  requests: 8 (this turn: 1)
+  context: 8.7k / 1M (0.867%)
+
+(queued 3b7cdf98-55b2-4c25-9732-ffb7d0ebcf19)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 9 ended: completed
+  tokens: in 74.1k (cache 65.7k) / out 345
+  requests: 9 (this turn: 1)
+  context: 8.9k / 1M (0.889%)
+
+(queued 140f9843-28a5-4935-9758-952d7ed9c310)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 10 ended: completed
+  tokens: in 83.1k (cache 74.5k) / out 347
+  requests: 10 (this turn: 1)
+  context: 9k / 1M (0.901%)
+
+(queued 24757859-5b22-40d7-8db6-7fd1ab9fd274)
+ок
+───────────────────────────────────────────────────────────────────────────────
+— turn 11 ended: completed
+  tokens: in 92.2k (cache 83.5k) / out 349
+  requests: 11 (this turn: 1)
+  context: 9.1k / 1M (0.911%)
+
+(queued 921c348a-8aad-448f-b30a-72644e6d289b)
+KX-42
+───────────────────────────────────────────────────────────────────────────────
+— turn 12 ended: completed
+  tokens: in 101.4k (cache 92.4k) / out 354
+  requests: 12 (this turn: 1)
+  context: 9.2k / 1M (0.915%)
+
+(queued dab8e690-aca2-42de-82ba-93e0cd321f6f)
+Бюджет 2.4 млн рублей (400 тыс. на дизайн, 2 млн на разработку), дедлайн — 30 апреля, жёсткий: приложение должно быть в сторах.
+───────────────────────────────────────────────────────────────────────────────
+— turn 13 ended: completed
+  tokens: in 110.6k (cache 101.4k) / out 402
+  requests: 13 (this turn: 1)
+  context: 9.2k / 1M (0.919%)
+
+(queued cb94c9c8-7404-4827-b57b-407878a4028f)
+Интеграции — 1С (товары и остатки, обмен раз в 15 минут), СДЭК (расчёт и трекинг), ЮKassa (платежи), Firebase (пуши); оплата через ЮKassa — карта и СБП.
+───────────────────────────────────────────────────────────────────────────────
+— turn 14 ended: completed
+  tokens: in 119.8k (cache 110.5k) / out 515
+  requests: 14 (this turn: 1)
+  context: 9.3k / 1M (0.927%)
+
+
+# ===== stderr (метрики) =====
