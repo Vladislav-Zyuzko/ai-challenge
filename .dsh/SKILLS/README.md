@@ -7,13 +7,14 @@
 | Скилл (файл) | Команда dsh-term | Что делает |
 |---|---|---|
 | [publish-day.md](publish-day.md) | `/publish-day` | коммит на ветке дня → push → PR day→week с описанием |
+| [publish-week.md](publish-week.md) | `/publish-week` | сводка недели → push → PR feature/weekN→develop с итогами недели |
 
 ## Факты окружения (проверено)
 
 - Репозиторий: `Vladislav-Zyuzko/ai-challenge` (публичный); remote origin — HTTPS
 - Авторизация: `gh` (GitHub CLI) в keyring; `git push` идёт через gh-credential-helper
 - Модель веток: `main → develop → feature/weekN → weekN/dayM`
-- Правила ниже обязательны и для `/publish-day`, и для ручных просьб «оформи коммит / запушь / открой PR»
+- Правила ниже обязательны и для `/publish-day`, и для `/publish-week`, и для ручных просьб «оформи коммит / запушь / открой PR»
 
 ## Правила (обязательные)
 
