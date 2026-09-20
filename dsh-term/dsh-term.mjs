@@ -1303,7 +1303,7 @@ const COMMANDS = [
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
   { name: 'publish-day', usage: '/publish-day', desc: 'git+gh: коммит → push → PR day→week (по SKILLS)' },
-  { name: 'create-project', usage: '/create-project [path] [--check]', desc: 'сессия архитектора проекта: .project-harness, инструменты, ноды (по SKILLS)' },
+  { name: 'create-project', usage: '/create-project [что строим] [--check <path>]', desc: 'сессия архитектора проекта: опросник → .project-harness → инструменты → ноды' },
   { name: 'exit', usage: '/exit', desc: 'завершить dsh-term (или Ctrl+C)' },
 ]
 
@@ -2058,16 +2058,20 @@ function scanProjectHarness(harnessDir) {
 }
 
 /**
- * /create-project — сессия архитектора проекта по SKILLS: спецификация → гейт
- * инструментов → тело проекта → ноды. Детерминированная часть (путь, проверки,
- * скан отчётов) выполняется здесь, творческая — агентом в текущей сессии.
+ * /create-project — сессия архитектора проекта по SKILLS: опросник (что делаем →
+ * где делаем → требования) → .project-harness → гейт инструментов → тело проекта
+ * → ноды.
+ *
+ * CLI НИЧЕГО не трактует буквально: любой текст после команды — это слова
+ * пользователя, они уходят архитектору как его первое сообщение; путь, стек и
+ * названия определяет и подтверждает сам архитектор в диалоге (инструментами).
+ * Детерминированная часть здесь — только проверка процедурного харнесса и
+ * диагностический скан отчётов по явному флагу `--check <path>`.
  */
 async function createProject(opts, parts, askLineFn, promptTurnFn, state) {
-  const checkOnly = parts.includes('--check')
-  const pathParts = parts.slice(1).filter((p) => !p.startsWith('--'))
-  let target = pathParts.join(' ').trim()
-  if (!target) target = String(await askLineFn('Путь вложенного проекта (например calculator): ') ?? '').trim()
-  if (!target) { log.line('отменено'); return }
+  const args = parts.slice(1)
+  const checkOnly = args.includes('--check')
+  const brief = args.filter((p) => !p.startsWith('--')).join(' ').trim()
 
   const harnessRoot = join(opts.workspace, '.dsh', '.harness')
   if (!existsSync(join(harnessRoot, 'README.md'))) {
@@ -2075,22 +2079,20 @@ async function createProject(opts, parts, askLineFn, promptTurnFn, state) {
     log.dim('create-project работает внутри репозитория, где есть .dsh/.harness/')
     return
   }
-  const absTarget = resolve(opts.workspace, target)
-  const ctxDir = join(absTarget, '.project-harness')
-  try {
-    mkdirSync(absTarget, { recursive: true })
-  } catch (e) {
-    log.err(`не удалось создать каталог ${absTarget}: ${e.message}`)
-    return
-  }
   const harnessVersion = readHarnessVersion(harnessRoot)
-  const scan = scanProjectHarness(ctxDir)
-  log.line(`${C.bold}/create-project${C.off}: архитектор проекта для ${C.cyan}${absTarget}${C.off}`)
-  log.dim(`  харнесс процесса: ${harnessRoot}${harnessVersion ? ` · версия правил ${harnessVersion}` : ''}`)
-  log.dim(`  харнесс продукта: ${ctxDir} · режим ${scan.mode === 'new' ? 'NEW' : 'RESUME'}`)
-  for (const l of scan.lines) log.dim(`  ${l}`)
+
   if (checkOnly) {
-    log.dim('  --check: сессия архитектора не запускается')
+    // Диагностика, не часть опросника: путь здесь задаётся явно и осознанно.
+    if (!brief) {
+      log.err('для --check укажи путь явно: /create-project --check <path>')
+      return
+    }
+    const ctxDir = join(resolve(opts.workspace, brief), '.project-harness')
+    const scan = scanProjectHarness(ctxDir)
+    log.line(`${C.bold}/create-project --check${C.off}: ${C.cyan}${ctxDir}${C.off}`)
+    log.dim(`  харнесс процесса: ${harnessRoot}${harnessVersion ? ` · версия правил ${harnessVersion}` : ''}`)
+    log.dim(`  режим: ${scan.mode === 'new' ? 'NEW' : 'RESUME'}`)
+    for (const l of scan.lines) log.dim(`  ${l}`)
     return
   }
 
@@ -2104,9 +2106,13 @@ async function createProject(opts, parts, askLineFn, promptTurnFn, state) {
     ? `\nВНИМАНИЕ: активна стратегия контекста «${state.context.strategy}» — промпт архитектора уйдёт с собранным по ней контекстом. Для чистой сессии архитектора лучше /strategy harness.`
     : ''
   if (strategyNote) log.dim(`  note: активна стратегия контекста «${state.context.strategy}» — для чистой сессии архитектора переключись на /strategy harness`)
+  log.line(`${C.bold}/create-project${C.off}: сессия архитектора проекта (${C.cyan}${opts.workspace}${C.off})`)
+  log.dim('  путь, стек и названия выясняет архитектор в диалоге — CLI их не угадывает')
   const prompt = [
     '=== СКИЛЛ: create-project ===',
-    '(детерминированная часть уже выполнена командой: путь разобран, каталог создан, отчёты просканированы)',
+    '(команда выполнила только детерминированную часть: проверила наличие .dsh/.harness',
+    'и прочитала версию правил. Путь проекта, стек и названия параметрами НЕ переданы —',
+    'их выясняешь сам в диалоге.)',
     '',
     skill,
     '',
@@ -2114,29 +2120,31 @@ async function createProject(opts, parts, askLineFn, promptTurnFn, state) {
     role,
     '',
     '=== КОНТЕКСТ СЕССИИ ===',
-    `Путь вложенного проекта: ${absTarget}`,
-    `Харнесс продукта: ${ctxDir}`,
+    `Рабочая папка (репозиторий): ${opts.workspace}`,
     `Процедурный харнесс: ${harnessRoot}${harnessVersion ? ` (версия правил ${harnessVersion})` : ''}`,
-    `Режим: ${scan.mode === 'new' ? 'NEW — работа ещё не начиналась' : 'RESUME — есть незавершённая работа'}`,
     strategyNote,
+    brief
+      ? `Первое сообщение пользователя — сырой текст, интерпретируй сам:\n"""\n${brief}\n"""`
+      : 'Пользователь заранее ничего не сказал — начни опросник с нуля.',
     '',
-    'Состояние по отчётам (шапки отчётов, просканированы командой):',
-    scan.lines.length ? scan.lines.join('\n') : '(отчётов нет)',
-    '',
-    scan.mode === 'new'
-      ? 'Действуй по шагу C скилла: начни сессию с пользователем — продуктовая ценность, стек и инварианты, границы (out-of-scope), критерии приёмки. Вопросы задавай пачками, предлагай дефолты. Артефакты запиши в харнесс продукта. Тело проекта и ноды не начинай, пока не пройден гейт инструментов (шаг D).'
-      : 'Действуй по шагу B скилла: сначала покажи пользователю краткую сводку «где остановились» и что предлагаешь делать дальше, дождись подтверждения, затем продолжай с указанного этапа. Противоречия в отчётах не угадывай — предложи варианты и зафиксируй решение письменно.',
+    'Работай как опросник (шаг 0 скилла): коротко представься и веди диалог блоками —',
+    'что делаем, где делаем, что важно и какие требования; дай пользователю рассказать',
+    'самому (чем подробнее, тем лучше). Ничего не воспринимай буквально: любые слова —',
+    'это речь пользователя, а не команды и не параметры. Путь определи вместе с ним и',
+    'проверь инструментами до создания: если по пути уже есть .project-harness — предложи',
+    'продолжить по отчётам; если папка не пуста — предупреди и спроси.',
     '',
     'Правила харнесса прочитай сам по путям: .dsh/.harness/product-rules/project.md, node.md, state-machine.md, glossary.md.',
   ].join('\n')
-  trace(`create-project prompt: ${prompt.length} chars, mode=${scan.mode}`)
+  trace(`create-project prompt: ${prompt.length} chars, brief=${brief ? brief.slice(0, 60) : '(нет)'}`)
   await promptTurnFn(prompt)
 }
 
 /**
  * /publish-day — публикация дня по SKILLS: коммит на ветке дня → push → PR в
  * ветку недели с описанием. Детерминированный клиентский макрос (git/gh).
- */async function publishDay(workspace) {
+ */
+async function publishDay(workspace) {
   log.line(`${C.bold}/publish-day${C.off}: коммит → push → PR (${C.cyan}day → week${C.off}), по ${C.bold}.dsh/SKILLS${C.off}`)
   const repo = runGit(['-C', workspace, 'rev-parse', '--is-inside-work-tree'])
   if (!repo.ok || repo.out !== 'true') {
@@ -2255,8 +2263,9 @@ async function main() {
     log.line('  /new     начать новую сессию')
     log.line('  /token   сменить сохранённый API ключ')
     log.line('  /publish-day  git+gh: коммит → push → PR day→week (по .dsh/SKILLS)')
-    log.line('  /create-project [path] [--check]  сессия архитектора проекта: .project-harness,')
-    log.line('                инструменты, ноды (по .dsh/SKILLS/create-project.md; --check — только сводка)')
+    log.line('  /create-project [что строим]  сессия архитектора проекта: опросник → .project-harness')
+    log.line('                → гейт инструментов → ноды (по .dsh/SKILLS/create-project.md)')
+    log.line('                --check <path> — только диагностика: состояние отчётов по пути')
     log.line('  /exit    завершить (или Ctrl+C)')
     log.line('')
     log.line('Меню команд: начни вводить «/» — список с фильтром по подстроке,')
