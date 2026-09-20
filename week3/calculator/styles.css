@@ -1,0 +1,130 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --screen: #101216;
+  --key-bg: #2a2f3a;
+  --key-bg-hover: #363d4b;
+  --key-bg-active: #1f242e;
+  --op-bg: #33405a;
+  --accent: #4a7fc1;
+  --text: #eef1f6;
+  --muted: #8b93a3;
+}
+
+html,
+body {
+  margin: 0;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, sans-serif;
+}
+
+.calculator {
+  width: min(22rem, 92vw);
+  padding: 1rem;
+  border-radius: 1rem;
+  background: var(--panel);
+}
+
+.calculator__title {
+  margin: 0 0 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.display {
+  min-height: 4.5rem;
+  margin-bottom: 1rem;
+  padding: 0.75rem;
+  border-radius: 0.65rem;
+  background: var(--screen);
+  overflow-x: auto;
+  overflow-wrap: anywhere;
+  text-align: right;
+  font-size: 2rem;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
+
+#keypad {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.5rem;
+}
+
+.key {
+  min-height: 3.25rem;
+  padding: 0.9rem 0.5rem;
+  border: 0;
+  border-radius: 0.6rem;
+  background: var(--key-bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 1.2rem;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+}
+
+.key:hover {
+  background: var(--key-bg-hover);
+}
+
+.key:active {
+  background: var(--key-bg-active);
+  transform: translateY(1px);
+}
+
+.key:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.key--op {
+  background: var(--op-bg);
+}
+
+.key--op:hover {
+  background: #3d4d6c;
+}
+
+[data-key="C"] {
+  grid-column: 1 / -1;
+}
+
+.key--clear {
+  background: var(--accent);
+  font-weight: 600;
+}
+
+.key--clear:hover {
+  background: #5a8fd1;
+}
+
+.key--equals {
+  background: var(--accent);
+  font-weight: 600;
+}
+
+.key--equals:hover {
+  background: #5a8fd1;
+}
+
+.key--dot {
+  font-size: 1.4rem;
+}
