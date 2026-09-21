@@ -1,0 +1,49 @@
+runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
+ui: in-tty=0 out-tty=0 colors=0 md=0
+compress: on (compact at 100k tokens, keep last 50k tokens)
+profile: «Большой тест» (big-test) · ~878 токенов в system prompt · файл: C:\Users\user\AppData\Local\Temp\dsh-temp-verify2-home\user-profiles\big-test.md
+resuming session: 5fba47a6-1fb1-4194-9569-52b4f0bf0230
+(queued fa1f433b-f1f1-4c1a-aed3-0353e8b84d90)
+· заголовок сессии: «И ещё: в примерах всег»
+  · профиль: +2 пункт(ов) (формат: 2) → в промпт со следующего хода
+  · профиль перерос бюджет ~700 токенов и сжат до ~561
+▶ pwsh command="node --version" description="Show installed Node.js version" workdir="C:\\Users\\user\\AppData\\Local\\Temp\\dsh-day12-big-ws"
+✔ done
+· step 2: in 9.8k / out 87
+▶ pwsh command="node --version; (Get-Location).Path" description="Show Node version and current directory"
+✔ done
+· step 3: in 9.9k / out 306
+▶ pwsh command="node --version; Test-Path 'C:\\Users\\user\\AppData\\Local\\Temp\\" description="Show Node version and test workspace path" workdir="C:\\Users\\user"
+✔ done
+· step 4: in 10.3k / out 184
+▶ glob pattern="*"
+Принято: в каждом примере первой строкой блока идёт версия Node.js, вступлений перед кодом не будет.
+
+Формат, который буду использовать:
+
+```js
+// Node.js 22.11.0 (ESM, "type": "module" в package.json)
+import { readFile } from 'node:fs/promises';
+
+const text = await readFile(new URL('./data.json', import.meta.url), 'utf8');
+console.log(JSON.parse(text));
+```
+
+Версию подтвердить не удалось: сессионный workspace `C:\Users\user\AppData\Local\Temp\dsh-day12-big-ws` не существует, и инструменты не работают. Что именно сломано, по фактам проверок:
+
+- `pwsh` падает до запуска команды: `Error: ENOENT: no such file or directory, realpath 'C:\Users\user\AppData\Local\Temp\dsh-day12-big-ws'` — с явным `workdir: C:\Users\user` результат тот же, значит падение не связано с рабочим каталогом команды.
+- `glob` по `*` возвращает `Error: glob subprocess failed before reporting an outcome (ripgrep provider failure)`, то есть чтение файлов тоже недоступно.
+- `node --version` получить не получилось, поэтому версию в примере выше я взял из известных релизов, а не из твоего окружения; после починки workspace подставлю фактический вывод `node --version`.
+
+Чтобы продолжить, нужно, чтобы каталог `C:\Users\user\AppData\Local\Temp\dsh-day12-big-ws` существовал и был доступен на чтение; создать его я не могу — запись тоже идёт через тот же сломанный слой.
+· step 5: in 10.5k / out 1k
+
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 49.3k (cache 48.3k) / out 2.4k
+  requests: 5 (this turn: 5)
+  context: 10.5k / 1M (1.05%)
+
+
+# ===== stderr (диагностика dsh-term) =====
+✖ SearchError: SEARCH_FAILED

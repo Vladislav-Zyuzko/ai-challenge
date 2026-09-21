@@ -1,0 +1,27 @@
+Зависит от того, куда правка уйдёт. Если в main/trunk идёт CI, ревью или релизные теги — да, ветка нужна: она даёт PR, проверку и возможность откатить, а стоит секунды. Если это твой личный WIP-фикс, который тут же мёржится fast-forward'ом, ветка — лишний ритуал.
+
+Практическое правило: ветка оправдана, когда правку кто-то увидит до мёржа (review, CI, коллеги) или когда её надо будет откатывать отдельно от остального. Иначе коммить прямо.
+
+```bash
+git switch -c fix/typo-config   # если есть ревью/CI
+git commit -am "fix typo in config"   # иначе — сразу в текущую ветку
+```
+
+# ===== stderr (метрики) =====
+node.exe : runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
+At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
++     $stdout = & node @nodeArgs 2> $errFile
++               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (runtime: deepse...epseek-v4-flash:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ui: in-tty=0 out-tty=0 colors=0 md=0
+compress: on (compact at 100k tokens, keep last 50k tokens)
+profile: «Кратко и по делу» (kratko) · ~197 токенов в system prompt · файл: C:\Users\user\.dsh-term\user-profiles\kratk
+o.md
+(queued 73a36156-638f-4ab4-be68-a96295198fff)
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 8.2k (cache 7.8k) / out 240
+  requests: 1 (this turn: 1)
+  context: 8.2k / 1M (0.819%)

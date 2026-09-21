@@ -1,0 +1,156 @@
+# Чтение JSON-файла в Node.js с обработкой ошибок
+
+Коротко суть: надёжное чтение JSON — это всегда **две отдельные операции с двумя разными наборами ошибок**. Сначала вы читаете файл (`fs`), и там ошибки системные — `ENOENT`, `EACCES`, `EISDIR` — у них есть свойство `err.code`. Потом вы разбираете строку (`JSON.parse`), и там ошибка совсем другого рода — `SyntaxError`, у которой `err.code` нет вообще. Если смешать это в один `try/catch`, вы не сможете отличить «файла нет» от «в файле опечатка», а это два принципиально разных сценария для пользователя. Ниже — разбор по пунктам, затем полный пример и подводные камни (в том числе специфичные для Windows).
+
+## Разбор по пунктам
+
+**1. Выбирайте `node:fs/promises`, а не колбэки и не `*Sync`.** Асинхронный API не блокирует event loop, а промисы естественно ложатся в `async/await` и в `try/catch`. Вариант `fs.readFileSync` уместен только в скриптах, которые выполняются один раз при старте и завершаются (например, чтение конфига в CLI). Колбэчный `fs.readFile(path, 'utf8', cb)` работает, но даёт «callback hell» при нескольких последовательных чтениях — я его здесь отбрасываю именно поэтому, а не потому что он неверен.
+
+**2. Всегда указывайте кодировку `'utf8'`, иначе получите `Buffer`.** Без кодировки `readFile` вернёт `Buffer`, и `JSON.parse(buffer)` формально сработает (буфер приводится к строке), но вы потеряете контроль над декодированием. Явное `'utf8'` делает намерение очевидным и позволяет сразу применить обработку BOM (см. пункт 6).
+
+**3. Разделяйте чтение и парсинг в два `try/catch`.** Это ключевой приём. Первый `catch` ловит ошибки файловой системы и вы можете ветвиться по `err.code`; второй ловит только `SyntaxError` от парсера и добавляет к сообщению имя файла, которого в тексте ошибки `JSON.parse` нет. Проверено на Node v24.17.0: сообщение парсера выглядит как `Expected double-quoted property name in JSON at position 10 (line 1 column 11)` — позиция и строка есть, а пути к файлу нет, поэтому добавить его нужно самому.
+
+```js
+let raw;
+try {
+  raw = await fs.readFile(filePath, 'utf8');   // только I/O-ошибки
+} catch (err) {
+  // err.code: 'ENOENT' | 'EACCES' | 'EPERM' | 'EISDIR' | ...
+}
+
+try {
+  return JSON.parse(text);                     // только SyntaxError
+} catch (err) {
+  // err.message содержит позицию, но не содержит путь
+}
+```
+
+**4. Ветвитесь по `err.code`, а не по тексту сообщения.** Свойство `code` — стабильный контракт Node.js; человекочитаемый `message` локализуется и меняется между версиями. В проверке выше `ENOENT` для несуществующего файла вернул `err.name === 'Error'` и `err.code === 'ENOENT'`, так что ориентироваться надо именно на код. Практически важны: `ENOENT` (нет файла — часто это нормальная ситуация «использовать значения по умолчанию»), `EACCES`/`EPERM` (нет прав), `EISDIR` (передали каталог), `EMFILE` (исчерпан лимит дескрипторов).
+
+**5. Перебрасывайте ошибку с `cause`, а не глотайте её.** Конструкция `new Error('сообщение', { cause: err })` (поддерживается с Node 16.9; в проверке на v24.17.0 `cause` возвращает переданное значение) сохраняет исходную ошибку для логов и отладки. Альтернатива — `throw err` без обёртки, но тогда вы теряете контекст вроде «какой именно файл из десяти не прочитался». Третий вариант — свои классы ошибок (`class ConfigError extends Error`), он оправдан в библиотеках, где вызывающий код должен различать типы программно.
+
+**6. Снимайте BOM — на Windows это обязательный шаг.** Файлы, сохранённые «Блокнотом» или старым PowerShell, часто начинаются с UTF-8 BOM (`EF BB BF`). Проверка показала: `readFile(..., 'utf8')` возвращает первый символ с кодом `65279`, и `JSON.parse` падает с `Unexpected token '', "{"bom":true}" is not valid JSON`. Достаточно одной строки:
+
+```js
+const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+```
+
+После этого тот же файл разбирается успешно. Если файл вообще в UTF-16 (тоже типично для Windows), `'utf8'` не поможет — нужно читать как `'utf16le'` или определять кодировку по первым байтам.
+
+**7. `require('./file.json')` и ESM-импорт — не замена, а другой инструмент.** `require` читает файл синхронно, кэширует результат навсегда (повторный вызов вернёт тот же объект, даже если файл изменился) и не даёт вам поймать ошибку I/O отдельно. При этом ошибка парсинга содержит путь: `C:\...\bad2.json: Expected double-quoted property name in JSON at position 10`. Импорт в ESM (`await import('./f.json', { with: { type: 'json' } })`) ведёт себя похоже, но интересная деталь: он **сам снимает BOM** — импорт BOM-файла прошёл успешно, тогда как `JSON.parse` на том же содержимом падал. Такой способ годится для статических данных, вшитых в сборку, и не годится для файла, который меняется во время работы.
+
+**8. Помните, что `JSON.parse` не валидирует структуру.** Валидный JSON вида `{"port": "не число"}` разберётся без ошибок. Если поля критичны, проверяйте их отдельно (руками или через `zod`/`ajv`) сразу после парсинга — иначе ошибка всплывёт где-то далеко от места чтения. Это самая частая причина «загадочных» падений: файл прочитан «успешно», а падает совершенно другой код.
+
+## Полный пример
+
+```js
+// load-json.cjs (CommonJS)
+const fs = require('node:fs/promises');
+const path = require('node:path');
+
+function stripBom(text) {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+async function loadJson(relativePath) {
+  const filePath = path.resolve(__dirname, relativePath);
+
+  let raw;
+  try {
+    raw = await fs.readFile(filePath, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      throw new Error(`Файл не найден: ${filePath}`, { cause: err });
+    }
+    if (err.code === 'EACCES' || err.code === 'EPERM') {
+      throw new Error(`Нет прав на чтение: ${filePath}`, { cause: err });
+    }
+    if (err.code === 'EISDIR') {
+      throw new Error(`Это каталог, а не файл: ${filePath}`, { cause: err });
+    }
+    throw err; // неизвестная I/O-ошибка — не прячем её
+  }
+
+  const text = stripBom(raw);
+
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    // err.message уже содержит позицию и строку/столбец
+    throw new Error(`Некорректный JSON в ${filePath}: ${err.message}`, {
+      cause: err,
+    });
+  }
+}
+
+(async () => {
+  try {
+    const config = await loadJson('config.json');
+    console.log('OK:', config);
+  } catch (err) {
+    console.error(err.message);
+    if (err.cause?.code) console.error('код ошибки:', err.cause.code);
+    process.exitCode = 1; // не process.exit(1) — дайте потокам вывода дописаться
+  }
+})();
+```
+
+Два замечания к примеру. `path.resolve(__dirname, ...)` (или `path.join`) обязателен: относительный путь в `fs` разрешается от текущего рабочего каталога, а не от файла скрипта, и на Windows это особенно часто даёт `ENOENT`, когда скрипт запущен из другой папки. И `process.exitCode = 1` вместо `process.exit(1)`: при немедленном `exit` буферизованный вывод в консоль может не успеть сброситься.
+
+Нужен `Sync`-вариант — меняется ровно одна строка, структура та же:
+
+```js
+const fs = require('node:fs');
+let raw;
+try {
+  raw = fs.readFileSync(filePath, 'utf8');
+} catch (err) { /* те же ветки по err.code */ }
+```
+
+## Что учесть
+
+- **Проверьте у себя:** версию Node (`node -v`) — формулировки ошибок парсера с указанием строки и столбца появились в Node 20+; наличие BOM в ваших файлах (`Format-Hex .\config.json | Select-Object -First 2` покажет `EF BB BF` в начале); и реальный `err.code` для вашей ситуации, выведя `console.error(err)` целиком.
+- **Большие файлы.** `JSON.parse` держит в памяти и строку, и результат, и блокирует event loop на время разбора. Для файлов в десятки мегабайт используйте потоковый парсер (`stream-json`) или переносите данные в SQLite.
+- **Конкурентная запись.** Если файл в этот момент перезаписывается другой программой, вы можете прочитать пустую или обрезанную строку и получить `SyntaxError` там, где ожидали данные. На Windows надёжная замена «атомарной» перезаписи — писать во временный файл и затем `fs.rename` его на место.
+- **Пути в Windows.** `path.join` сам подставит `\`, поэтому не склеивайте пути строками с `/` — смешанные слеши обычно работают, но ломаются в некоторых API. И не забывайте, что `\` внутри строкового литерала — escape-символ.
+- **Осторожно с кэшем `require`.** Если JSON обновляется, а сервис работает долго, `require` вернёт старое значение. Здесь нужен именно `fs.readFile`, при желании с `fs.watch` для перечитывания.
+
+## Итого
+
+1. Разделяйте два этапа: чтение файла (`try/catch` по `err.code`) и парсинг (`try/catch` на `SyntaxError`) — иначе не отличите отсутствующий файл от опечатки в данных.
+2. Указывайте `'utf8'`, снимайте BOM (`0xfeff`) и добавляйте путь к файлу в сообщение об ошибке — на Windows это устраняет самые частые ложные `SyntaxError`.
+3. Используйте `fs/promises` с `async/await`, оборачивайте ошибки через `{ cause: err }`, проверяйте структуру данных после парсинга и закладывайтесь на то, что `require` кэширует JSON навсегда.
+
+# ===== stderr (метрики) =====
+node.exe : runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
+At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
++     $stdout = & node @nodeArgs 2> $errFile
++               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (runtime: deepse...epseek-v4-flash:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ui: in-tty=0 out-tty=0 colors=0 md=0
+compress: on (compact at 100k tokens, keep last 50k tokens)
+profile: «Подробно с объяснением» (podrobno) · ~217 токенов в system prompt · файл: C:\Users\user\.dsh-term\user-profil
+es\podrobno.md
+(queued 93481235-6a42-4584-a940-4a7d10277793)
+▶ pwsh command="node -v; $d = \"C:\\Users\\user\\AppData\\Local\\Temp\\dsh-day12-ws" description="Check Node version an
+d create test JSON files"
+✔ done
+▶ pwsh command="$d = \"C:\\Users\\user\\AppData\\Local\\Temp\\dsh-day12-ws-podrobno" description="Probe BOM, parse erro
+r and ENOENT behavior"
+✔ done
+· step 2: in 10.4k / out 730
+▶ pwsh command="$d = \"C:\\Users\\user\\AppData\\Local\\Temp\\dsh-day12-ws-podrobno" description="Probe parse errors, B
+OM strip, require and ESM import"
+✔ done
+· step 3: in 11.3k / out 373
+▶ pwsh command="Remove-Item -Recurse -Force \"C:\\Users\\user\\AppData\\Local\\Tem" description="Remove temporary test 
+directory"
+✔ done
+· step 4: in 11.7k / out 2.8k
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 41.7k (cache 32.8k) / out 5.9k
+  requests: 4 (this turn: 4)
+  context: 11.7k / 1M (1.17%)

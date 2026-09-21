@@ -1,0 +1,43 @@
+Проблема в том, что `forEach` **не умеет работать с асинхронными колбэками** — он вызывает их и полностью игнорирует возвращаемые промисы. Поэтому:
+
+1. **`forEach` ничего не ждёт.** Он синхронно пробегает по массиву, запускает обе `save(v)` и сразу завершается. Внешний код не может дождаться окончания сохранения — `await` перед `forEach` не поможет, потому что `forEach` возвращает `undefined`, а не промис.
+
+2. **Ошибки теряются.** Если `save` упадёт (reject), этот промис никем не обработан → `unhandledRejection` (в некоторых окружениях это падение процесса), и `try/catch` вокруг `forEach` такой reject **не поймает**.
+
+3. **Нет управления порядком/нагрузкой.** Все вызовы стартуют параллельно и неуправляемо — при большом массиве это может забить пул соединений. При этом await внутри колбэка не даёт последовательности: `await save(v)` ждёт только внутри своей функции, а `forEach` уже ушёл к следующему элементу.
+
+4. **`async (v) => await save(v)` — избыточно.** Это эквивалент `(v) => save(v)`; `async`/`await` здесь ничего не меняют, потому что результат всё равно отбрасывается.
+
+**Как исправить:**
+
+```js
+// Последовательно (по одному, с ожиданием):
+for (const v of x) {
+  await save(v);
+}
+
+// Либо параллельно, но с ожиданием всех:
+await Promise.all(x.map((v) => save(v)));
+
+// Параллельно с ограничением, если нужно беречь ресурсы:
+// p-limit / ручной пул воркеров / for await (const v of ...) в библиотеках
+```
+
+Правило: `forEach` — только для синхронных побочных эффектов; для промисов используйте `for...of` с `await` или `map` + `Promise.all`.
+
+# ===== stderr (метрики) =====
+node.exe : runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
+At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
++     $stdout = & node @nodeArgs 2> $errFile
++               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (runtime: deepse...epseek-v4-flash:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ui: in-tty=0 out-tty=0 colors=0 md=0
+compress: on (compact at 100k tokens, keep last 50k tokens)
+(queued 34a251ea-0282-42dc-a544-d491c7f649ab)
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 8k (cache 7.6k) / out 691
+  requests: 1 (this turn: 1)
+  context: 8k / 1M (0.796%)

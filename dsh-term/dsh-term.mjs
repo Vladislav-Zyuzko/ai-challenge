@@ -97,7 +97,7 @@ function cacheTokensOf(u) {
 
 /** Пустые счётчики сессии: расход, кэш, запросы и работа суммаризатора. */
 function emptyMetrics() {
-  return { prompts: 0, outputs: 0, cacheReads: 0, calls: 0, lastPrompt: 0, compactions: 0, compactTokens: 0, compactFails: 0, factsCalls: 0, factsTokens: 0 }
+  return { prompts: 0, outputs: 0, cacheReads: 0, calls: 0, lastPrompt: 0, compactions: 0, compactTokens: 0, compactFails: 0, factsCalls: 0, factsTokens: 0, profileCalls: 0, profileTokens: 0 }
 }
 
 // ---------- управление контекстом: компрессия истории ----------
@@ -1093,6 +1093,8 @@ function parseArgs(argv) {
     compressKeep: undefined, // сколько последних токенов держать как есть
     strategy: undefined,     // стратегия управления контекстом: harness | sliding | facts | branch
     window: undefined,       // N сообщений для стратегий
+    withProfiles: undefined, // --with-profiles: выбрать профиль пользователя в начале сессии
+    userProfile: undefined,  // --user-profile <slug>: включить конкретный профиль пользователя
     autoApprove: undefined,  // разрешать запросы доступа без вопросов (env DSH_TERM_AUTO_APPROVE)
     help: false,
   }
@@ -1115,6 +1117,8 @@ function parseArgs(argv) {
       case '--strategy': case '--mode': opts.strategy = next(); break
       case '--window': opts.window = Number(next()); break
       case '--auto-approve': opts.autoApprove = true; break
+      case '--with-profiles': opts.withProfiles = true; break
+      case '--user-profile': opts.userProfile = next(); break
       case '-p': case '--print': opts.prompt = next(); break
       case '--workspace': opts.workspace = next(); break
       case '--dsh-bin': opts.dshBin = next(); break
@@ -1299,6 +1303,7 @@ const COMMANDS = [
   { name: 'strategy', usage: '/strategy [id]', desc: 'стратегия контекста: sliding | facts | branch | harness (меню)' },
   { name: 'branch', usage: '/branch [id|new]', desc: 'ветки диалога: чекпоинт, новая ветка, переключение (включает режим branch)' },
   { name: 'context', usage: '/context', desc: 'контекст: стратегия, факты, метрики, последний summary' },
+  { name: 'profile', usage: '/profile [show|list|use <slug>|new|off]', desc: 'профиль пользователя (персонализация): показать, сменить, создать, выключить' },
   { name: 'resume', usage: '/resume [id]', desc: 'продолжить сессию: по id или выбором из списка' },
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
@@ -1898,6 +1903,248 @@ function buildPrBody({ dayBranch, weekBranch, subject, body, statOut, porcelainO
   return lines.join('\n')
 }
 
+// ---------- профили пользователя (day12): персонализация поверх памяти ----------
+// Профиль — предпочтения пользователя (стиль, формат, ограничения, интересы,
+// явные просьбы, чего избегать). Живёт в ~/.dsh-term/user-profiles/<slug>.md
+// (человекочитаемо, правится руками), а в модель попадает через system prompt:
+// оверлей `- id: system-prompt` + `personaPrefix`. Папка `profiles/` занята
+// рантайм-профилями харнесса (sdk/web), поэтому профили пользователя отдельно.
+const USER_PROFILE_SECTIONS = [
+  { key: 'style', title: 'Стиль' },
+  { key: 'format', title: 'Формат' },
+  { key: 'constraints', title: 'Ограничения' },
+  { key: 'interests', title: 'Интересы и контекст' },
+  { key: 'explicit', title: 'Явные просьбы' },
+  { key: 'avoid', title: 'Чего избегать' },
+]
+const USER_PROFILE_MAX_ITEMS = 6       // пунктов в секции (после слияния)
+const USER_PROFILE_ITEM_CHARS = 180    // длина пункта
+const USER_PROFILE_BUDGET_TOKENS = 700 // бюджет текста профиля внутри system prompt
+
+function userProfilesDir(dshHome) { return join(dshHome, 'user-profiles') }
+function userProfilePath(dshHome, slug) { return join(userProfilesDir(dshHome), `${slug}.md`) }
+
+/** Слаг из заголовка: латиница/цифры/дефис (кириллица транслитерируется грубо). */
+function userProfileSlug(title) {
+  const map = {
+    а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'e', ж: 'zh', з: 'z', и: 'i', й: 'y',
+    к: 'k', л: 'l', м: 'm', н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f',
+    х: 'h', ц: 'c', ч: 'ch', ш: 'sh', щ: 'sch', ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya',
+  }
+  const slug = String(title ?? '').toLowerCase().split('').map((ch) => map[ch] ?? ch).join('')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32)
+  return slug || 'default'
+}
+
+/** Собрать текст профиля — он же уходит в system prompt (personaPrefix). */
+function renderUserProfile({ title, sections }) {
+  const lines = [`# Профиль пользователя: ${title}`]
+  for (const s of USER_PROFILE_SECTIONS) {
+    const items = (sections?.[s.key] ?? []).filter(Boolean)
+    if (!items.length) continue
+    lines.push('', `## ${s.title}`, ...items.map((i) => `- ${i}`))
+  }
+  return lines.join('\n')
+}
+
+/** Разобрать профиль из md: `# Заголовок` + секции `## Название` со списком пунктов. */
+function readUserProfile(dshHome, slug) {
+  const raw = readTextIfExists(userProfilePath(dshHome, slug))
+  if (raw === null) return null
+  // Без снятия BOM первая строка не матчится и заголовок теряется (профиль,
+  // сохранённый «Блокнотом»/VS Code с BOM, встречается регулярно).
+  const text = raw.replace(/^\uFEFF/, '')
+  const title = (/^#\s+(.+)$/m.exec(text)?.[1] ?? slug).trim().replace(/^Профиль пользователя:\s*/i, '')
+  const sections = {}
+  for (const s of USER_PROFILE_SECTIONS) sections[s.key] = []
+  let current = null
+  for (const line of text.split('\n')) {
+    const head = /^##\s+(.+?)\s*$/.exec(line)
+    if (head) {
+      const found = USER_PROFILE_SECTIONS.find((s) => s.title.toLowerCase() === head[1].toLowerCase())
+      current = found === undefined ? null : found.key
+      continue
+    }
+    const item = /^\s*[-*]\s+(.+?)\s*$/.exec(line)
+    if (item && current !== null) sections[current].push(item[1])
+  }
+  return { slug, title, sections, text: renderUserProfile({ title, sections }) }
+}
+
+/** Список профилей: slug, заголовок, размер в токенах, время изменения. */
+function listUserProfiles(dshHome) {
+  const dir = userProfilesDir(dshHome)
+  let entries = []
+  try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return [] }
+  const out = []
+  for (const e of entries) {
+    if (!e.isFile() || !e.name.endsWith('.md')) continue
+    const slug = e.name.slice(0, -3)
+    const parsed = readUserProfile(dshHome, slug)
+    if (parsed === null) continue
+    let mtime = 0
+    try { mtime = statSync(join(dir, e.name)).mtimeMs } catch {}
+    out.push({ slug, title: parsed.title, tokens: userProfileTokens(parsed), mtime })
+  }
+  return out.sort((a, b) => b.mtime - a.mtime)
+}
+
+function writeUserProfile(dshHome, slug, { title, sections }) {
+  try {
+    mkdirSync(userProfilesDir(dshHome), { recursive: true })
+    writeFileSync(userProfilePath(dshHome, slug), renderUserProfile({ title, sections }) + '\n', 'utf8')
+    return true
+  } catch (e) {
+    trace(`user profile write failed: ${e.message}`)
+    return false
+  }
+}
+
+/** Сколько токенов занимает профиль в промпте (оценка по символам). */
+function userProfileTokens(profile) {
+  return Math.ceil(renderUserProfile(profile).length / 4)
+}
+
+/** YAML-оверлей: профиль как personaPrefix системного промпта. */
+function userProfileOverlayYaml(text) {
+  const indented = String(text).split('\n').map((l) => `      ${l}`).join('\n')
+  return [
+    '# dsh-term: профиль пользователя в system prompt (personaPrefix).',
+    '- id: system-prompt',
+    '  config:',
+    '    personaPrefix: |-',
+    indented,
+    '',
+  ].join('\n')
+}
+
+/** Слить новые пункты в секции: без дублей, с лимитом пунктов на секцию. */
+function mergeProfileSections(current, incoming) {
+  const sections = {}
+  const added = []
+  for (const s of USER_PROFILE_SECTIONS) {
+    const have = [...(current?.[s.key] ?? [])]
+    const seen = new Set(have.map((i) => i.toLowerCase().replace(/\s+/g, ' ').trim()))
+    for (const raw of incoming?.[s.key] ?? []) {
+      const item = String(raw ?? '').replace(/\s+/g, ' ').trim().slice(0, USER_PROFILE_ITEM_CHARS)
+      if (item.length < 3) continue
+      const key = item.toLowerCase().replace(/\s+/g, ' ')
+      if (seen.has(key)) continue
+      seen.add(key)
+      have.push(item)
+      added.push({ section: s.key, item })
+    }
+    sections[s.key] = have.slice(-USER_PROFILE_MAX_ITEMS)
+  }
+  return { sections, added }
+}
+
+/**
+ * Персонализация по одному сообщению пользователя: что нового узнать о нём и о
+ * том, как с ним работать. Возвращает только НОВЫЕ пункты (по секциям).
+ */
+function analyzePersonalization(llm, profile, userText, onUsage) {
+  const system = 'Ты ведёшь профиль пользователя для ассистента-агента. По очередному сообщению '
+    + 'пользователя найди ТОЛЬКО новое о нём и о том, как с ним работать: стиль общения, формат ответов, '
+    + 'ограничения, интересы и рабочий контекст, явные просьбы, чего избегать. '
+    + 'Не повторяй то, что уже есть в профиле, и не дублируй один пункт в разных разделах: '
+    + 'каждый пункт идёт ровно в одну секцию — самую точную по смыслу (стиль и формат — как отвечать, '
+    + 'ограничения — чего нельзя, интересы — контекст пользователя, явные просьбы — прямые просьбы о поведении, '
+    + 'чего избегать — нелюбимое). Не создавай мета-пункты вида «запомнить предпочтения»: каждый пункт — '
+    + 'самостоятельная инструкция. '
+    + 'Пиши короткие императивные пункты (до 180 символов), '
+    + 'без воды и без выводов о личности. Если нового нет — верни пустые массивы. '
+    + `Отвечай ТОЛЬКО JSON с ключами: ${USER_PROFILE_SECTIONS.map((s) => s.key).join(', ')}.`
+  const user = `Текущий профиль:\n${renderUserProfile(profile)}\n\nСообщение пользователя:\n"""\n${String(userText).slice(0, 4000)}\n"""`
+  return llmJson(llm, system, user, 700).then((r) => {
+    if (r) onUsage?.(r)
+    return r?.json ?? null
+  })
+}
+
+/** Собрать профиль из первоначального описания пользователя (+ заголовок ≤5 слов). */
+function buildUserProfile(llm, description) {
+  const system = 'Ты собираешь профиль пользователя для ассистента-агента по его описанию. '
+    + 'Верни ТОЛЬКО JSON: title (2–5 слов, без кавычек) и массивы коротких императивных пунктов '
+    + `(до 180 символов): ${USER_PROFILE_SECTIONS.map((s) => s.key).join(', ')}. `
+    + 'Пустые разделы оставляй пустыми массивами, ничего не выдумывай.'
+  return llmJson(llm, system, String(description).slice(0, 4000), 800).then((r) => r?.json ?? null)
+}
+
+/** Сжать профиль, если он перестал влезать в бюджет system prompt. */
+function compactUserProfile(llm, profile) {
+  const system = 'Сожми профиль пользователя, сохранив все важные предпочтения и убрав повторы. '
+    + `Верни ТОЛЬКО JSON с ключами: title (2–5 слов) и массивы (не больше ${USER_PROFILE_MAX_ITEMS} пунктов в каждом): `
+    + `${USER_PROFILE_SECTIONS.map((s) => s.key).join(', ')}.`
+  return llmJson(llm, system, renderUserProfile(profile), 900).then((r) => r?.json ?? null)
+}
+
+/**
+ * Персонализация на каждом ходу: разобрать сообщение пользователя и дописать в
+ * профиль то, что в нём нового. Работает фоном (не задерживает ход модели),
+ * найденные пункты попадут в system prompt со следующего запроса — перед ним
+ * рантайм перезапустится по флагу state.profileDirty. Если профиль перерос
+ * бюджет — сжимаем его, чтобы он не съедал контекст.
+ */
+function learnFromUserMessage(env, text) {
+  const { llmCfg, state, dshHome } = env
+  const profile = state.userProfile
+  if (!profile || !llmCfg?.token) return
+  if (state.profileLearning) { trace('personalization: пропуск, предыдущий разбор ещё идёт'); return }
+  state.profileLearning = true
+  const count = (u) => {
+    state.metrics.profileCalls += 1
+    state.metrics.profileTokens += u.tokens
+    // Плюс к счётчикам хода: строка «personalization: …» печатается рядом с facts.
+    if (state.turn) {
+      state.turn.profileCalls = (state.turn.profileCalls ?? 0) + 1
+      state.turn.profileTokens = (state.turn.profileTokens ?? 0) + u.tokens
+    }
+  }
+  state.profileLearnPromise = analyzePersonalization(llmCfg, profile, text, count)
+    .then(async (found) => {
+      if (!found) return
+      const { sections, added } = mergeProfileSections(profile.sections, found)
+      if (!added.length) { trace('personalization: нового нет'); return }
+      let next = { slug: profile.slug, title: profile.title, sections }
+      let compacted = false
+      const byTitle = USER_PROFILE_SECTIONS
+        .filter((s) => added.some((a) => a.section === s.key))
+        .map((s) => `${s.title.toLowerCase()}: ${added.filter((a) => a.section === s.key).length}`)
+      if (userProfileTokens(next) > USER_PROFILE_BUDGET_TOKENS) {
+        const squeezed = await compactUserProfile(llmCfg, next).catch(() => null)
+        state.metrics.profileCalls += 1
+        // Сжатый профиль заменяет прежний (а не добавляется к нему), иначе
+        // слияние вернуло бы все старые пункты и компакция была бы пустой.
+        const clean = squeezed ? mergeProfileSections({}, squeezed).sections : null
+        if (clean && Object.values(clean).some((items) => items.length)) {
+          next = {
+            slug: profile.slug,
+            title: String(squeezed.title ?? profile.title).slice(0, 80),
+            sections: clean,
+          }
+          compacted = true
+          trace(`personalization: профиль сжат до ~${userProfileTokens(next)} токенов`)
+        }
+      }
+      if (!writeUserProfile(dshHome, profile.slug, next)) return
+      state.userProfile = { ...next, text: renderUserProfile(next) }
+      state.profileDirty = true
+      log.dim(`  · профиль: +${added.length} пункт(ов) (${byTitle.join(', ')}) → в промпт со следующего хода`)
+      // Сжатие меняет уже записанные пункты — об этом стоит сказать вслух.
+      if (compacted) log.dim(`  · профиль перерос бюджет ~${USER_PROFILE_BUDGET_TOKENS} токенов и сжат до ~${userProfileTokens(next)}`)
+    })
+    .catch((e) => trace(`personalization failed: ${e.message}`))
+    .finally(() => { state.profileLearning = false })
+}
+
+/** Дождаться фонового разбора профиля перед выходом (иначе запись потеряется). */
+async function flushProfileLearning(state, ms = 6000) {
+  const p = state.profileLearnPromise
+  if (!p) return
+  await Promise.race([p.catch(() => {}), new Promise((r) => setTimeout(r, ms))])
+}
+
 // ---------- скилл create-project: харнесс продукта ----------
 // Детерминированная часть скилла: найти/создать .project-harness, просканировать
 // отчёты и определить, где остановилась работа (восстановление по репортам).
@@ -2248,6 +2495,8 @@ async function main() {
     log.line('  --strategy <id>     стратегия контекста: harness (default) | sliding | facts | branch')
     log.line('  --window <n>        N сообщений для стратегии sliding/facts/branch (default 6)')
     log.line('  --auto-approve      не спрашивать подтверждения доступа (env DSH_TERM_AUTO_APPROVE=1)')
+    log.line('  --with-profiles     выбрать профиль пользователя в начале сессии (меню)')
+    log.line('  --user-profile <id> включить конкретный профиль пользователя (env DSH_TERM_USER_PROFILE)')
     log.line('  --session <id>      продолжить конкретную сессию (синоним: --resume <id>)')
     log.line('  --workspace <path>  рабочая папка сессий (default: текущая)')
     log.line('  --dsh-bin <path>    путь к dsh (default: dsh из PATH)')
@@ -2418,17 +2667,98 @@ async function main() {
     titles: { ...(saved?.titles ?? {}) }, // sessionId → короткий заголовок сессии
     titleLocked: new Set(saved?.titleLocked ?? []), // заголовки, которые харнесс не перебивает
     isNew: false,              // сессия создана в этом запуске (для авто-заголовка)
+    userProfile: null,         // профиль пользователя (day12) — ставится ниже, до спавна
+    profileDirty: false,       // профиль обновился — нужен перезапуск рантайма перед ходом
+    profileLearning: false,    // фоновый разбор текущего сообщения на персонализацию
   }
   // В one-shot state не сохраняем: прогоны не должны затирать «последнюю сессию»
   // для интерактивного режима (у каждого -p запуска и так своя свежая сессия).
   state.isNew = !isOneShot && !(opts.session || (saved?.lastSessionId === sessionId))
   if (!isOneShot) saveState(opts.dshHome, sessionId, state.titles, state.titleLocked)
 
-  const rpc = spawnRuntime(opts, token)
+  // ---- профиль пользователя (day12): персонализация через system prompt ----
+  // Профиль уходит оверлеем `- id: system-prompt` (personaPrefix), поэтому он
+  // должен быть известен ДО спавна рантайма. `--with-profiles` показывает меню,
+  // `--user-profile <slug>` берёт профиль сразу (для скриптов и прогонов).
+  const llmCfg = { token, model: opts.model, provider: opts.provider }
+
+  /** Меню профилей: выбрать существующий или создать новый по описанию. */
+  async function pickOrCreateUserProfile() {
+    const list = listUserProfiles(opts.dshHome)
+    if (!list.length) {
+      log.dim('профилей пользователя ещё нет — создаём первый')
+      return await createUserProfileInteractive()
+    }
+    const items = list.map((p) => ({ id: p.slug, label: `${p.slug} — ${p.title}`, note: `~${p.tokens} токенов` }))
+    items.push({ id: '__new__', label: '+ создать новый профиль', note: 'по вашему описанию' })
+    const chosen = await pickListTTY({ prompt: 'профиль> ', items })
+    if (!chosen) {
+      log.line('профиль не выбран — сессия без персонализации')
+      return null
+    }
+    if (chosen === '__new__') return await createUserProfileInteractive()
+    return readUserProfile(opts.dshHome, chosen)
+  }
+
+  /** Создание профиля: описание от пользователя → LLM (заголовок ≤5 слов) → файл. */
+  async function createUserProfileInteractive() {
+    log.line('Опишите профиль: как с вами лучше работать (стиль, формат ответов, ограничения, интересы, чего избегать).')
+    const description = String(await askLine('описание профиля> ') ?? '').trim()
+    if (!description) log.dim('пустое описание — соберу нейтральный профиль')
+    const built = await buildUserProfile(llmCfg, description || 'Нейтральный профиль без особых предпочтений.')
+    const title = String(built?.title ?? 'Профиль по умолчанию')
+      .replace(/^["'«»\s]+|["'«»\s]+$/g, '').slice(0, 48) || 'Профиль по умолчанию'
+    const sections = {}
+    for (const s of USER_PROFILE_SECTIONS) sections[s.key] = Array.isArray(built?.[s.key]) ? built[s.key] : []
+    const slug = userProfileSlug(title)
+    writeUserProfile(opts.dshHome, slug, { title, sections })
+    log.dim(`· профиль создан: «${title}» (${slug}) → ${userProfilePath(opts.dshHome, slug)}`)
+    return readUserProfile(opts.dshHome, slug)
+  }
+
+  const personaPatchPath = join(opts.dshHome, 'dsh-term-persona.patch.yml')
+  const profileSlug = opts.userProfile ?? process.env.DSH_TERM_USER_PROFILE ?? null
+  let userProfile = null
+  if (profileSlug) {
+    userProfile = readUserProfile(opts.dshHome, profileSlug)
+    if (userProfile === null) {
+      log.err(`профиль пользователя «${profileSlug}» не найден в ${userProfilesDir(opts.dshHome)}`)
+      const known = listUserProfiles(opts.dshHome)
+      if (known.length) log.dim(`доступно: ${known.map((p) => p.slug).join(', ')}`)
+      process.exit(1)
+    }
+  } else if (opts.withProfiles && !UI.oneShot) {
+    userProfile = await pickOrCreateUserProfile()
+  }
+
+  /**
+   * Подключить профиль к рантайму (или отключить при profile = null): профиль
+   * едет в system prompt оверлеем `- id: system-prompt` + personaPrefix, а
+   * system prompt фиксируется при спавне — поэтому смена профиля помечается
+   * флагом profileDirty, и перед следующим ходом рантайм перезапускается.
+   */
+  function applyUserProfile(profile, { dirty = true } = {}) {
+    state.userProfile = profile
+    let patches = (opts.patches ?? []).filter((p) => p !== personaPatchPath)
+    if (profile !== null) {
+      try {
+        mkdirSync(opts.dshHome, { recursive: true })
+        writeFileSync(personaPatchPath, userProfileOverlayYaml(profile.text), 'utf8')
+        patches = [...patches, personaPatchPath]
+      } catch (e) {
+        log.err(`persona patch failed: ${e.message}`)
+      }
+    }
+    opts.patches = patches
+    if (dirty) state.profileDirty = true
+  }
+  applyUserProfile(userProfile, { dirty: false })
+
+  let rpc = spawnRuntime(opts, token)
   rpcRef = rpc
 
   // ---- нотификации ----
-  rpc.onNotification = (msg) => {
+  function handleNotification(msg) {
     trace(`notif ${msg.method}`)
     if (msg.method === 'session.status') {
       const { sessionId, status } = msg.params
@@ -2624,7 +2954,7 @@ async function main() {
   // (подтверждения → unavailable, вопросы → ошибка инструмента).
   // На время диалога гасим подпись «Deep diving…» и живой счётчик: их тики пишут в
   // текущую строку, то есть ровно поверх меню вопроса (мигание «выбор> ↔ Deep diving»).
-  rpc.onRequest = async (method, params) => {
+  async function handleClientRequest(method, params) {
     trace(`client request ${method}`)
     const wasAnimating = status.timer !== null
     stopStatus()
@@ -2638,6 +2968,45 @@ async function main() {
       if (wasAnimating) startStatus() // модель продолжает ход — подпись возвращается
     }
   }
+
+  /** Параметры initialize — одни и те же при старте и при перезапуске рантайма. */
+  const initParams = {
+    cwd: opts.workspace,
+    provider: opts.provider,
+    model: opts.model,
+    ...(opts.maxTokens ? { maxTokens: opts.maxTokens } : {}),
+    ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+  }
+
+  /** Подписать клиента на нотификации и запросы рантайма. */
+  function bindRuntime(client) {
+    client.onNotification = handleNotification
+    client.onRequest = handleClientRequest
+  }
+
+  /**
+   * Перезапустить рантайм с текущими opts (в т.ч. с обновлённым оверлеем профиля)
+   * и заново поздороваться. Сессия та же — харнесс её резюмирует, поэтому меняется
+   * только системный промпт (personaPrefix) для следующих запросов.
+   * Нужно потому, что system prompt фиксируется при спавне, а профиль в сессии
+   * учится (обновляется после сообщений).
+   */
+  async function restartRuntime(reason) {
+    log.dim(`  перезапуск рантайма: ${reason}`)
+    const previous = rpc
+    const next = spawnRuntime(opts, token)
+    rpc = next
+    rpcRef = next
+    bindRuntime(next)
+    try {
+      await next.request('initialize', initParams)
+    } catch (e) {
+      log.err(`перезапуск рантайма не удался: ${e.message}`)
+    }
+    try { await previous.close() } catch {}
+  }
+
+  bindRuntime(rpc)
 
   function renderEvent(event) {
     switch (event.type) {
@@ -2890,6 +3259,19 @@ async function main() {
 
   async function promptTurn(text) {
     trace(`promptTurn start: ${text}`)
+    // Профиль обновился в прошлом ходу — system prompt фиксируется при спавне,
+    // поэтому перед новым запросом перезапускаем рантайм (сессия та же).
+    if (state.profileDirty) {
+      state.profileDirty = false
+      // Профиль мог обновиться фоновым разбором уже ПОСЛЕ записи оверлея —
+      // перезапуск с прежним файлом подхватил бы старую версию профиля.
+      applyUserProfile(state.userProfile, { dirty: false })
+      try {
+        await restartRuntime(state.userProfile ? 'профиль пользователя обновлён' : 'профиль пользователя отключён')
+      } catch (e) {
+        trace(`profile restart failed: ${e.message}`)
+      }
+    }
     const controls = pendingControls
     pendingControls = null // скоуп: применяется только к этому ответу
     const waiting = startTurn(controls)
@@ -2987,6 +3369,12 @@ async function main() {
       trace(`prompt queued: ${res.messageId}`)
       log.dim(`(queued ${res.messageId})`)
       startStatus() // модель думает — крутится «Deep diving…»
+      // Персонализация (day12): каждый prompt анализируем на новое о профиле —
+      // не блокируя ход. Найденное дописывается в профиль и попадёт в system
+      // prompt со следующего запроса (перед ним рантайм перезапустится).
+      // В one-shot (-p) не учимся: прогоны должны быть воспроизводимыми и не
+      // менять профиль, к тому же процесс завершается сразу после ответа.
+      if (state.userProfile && !UI.oneShot) learnFromUserMessage({ llmCfg, state, dshHome: opts.dshHome }, text)
     } catch (e) {
       meter.active = false
       meterEraseTail()
@@ -3196,6 +3584,9 @@ async function main() {
         for (const note of compressNotes(c)) log.dim(`  note: ${note}`)
         log.dim(`  window: ${fmtTok(ctx)} / ${fmtTok(CTX_MAX)} (${fmtPct(ctx, CTX_MAX)}%)`)
         log.dim(`  tokens: in ${fmtTok(m.prompts)} (cache ${fmtTok(m.cacheReads)}) / out ${fmtTok(m.outputs)} · requests: ${m.calls}`)
+        if (state.userProfile) {
+          log.dim(`  profile: «${state.userProfile.title}» (${state.userProfile.slug}) · ~${userProfileTokens(state.userProfile)} токенов в промпте${m.profileCalls ? ` · обновлений: ${m.profileCalls} вызов(ов), ${fmtTok(m.profileTokens)} tokens` : ''}`)
+        } else log.dim('  profile: не подключён')
         if (m.compactions || m.compactFails) {
           log.dim(`  summarize calls: ${m.compactions}${m.compactFails ? `, failed: ${m.compactFails} (их токены харнесс не пишет)` : ''} · ${fmtTok(m.compactTokens)} tokens`)
         }
@@ -3205,6 +3596,70 @@ async function main() {
           const head = s.text.split('\n').slice(0, 14).join('\n')
           log.dim(head.length > 900 ? head.slice(0, 900) + '…' : head)
         } else log.dim('  last summary: —')
+        break
+      }
+      case 'profile': {
+        const sub = (parts[1] ?? '').toLowerCase()
+        const show = (p) => {
+          log.line(`${C.bold}profile${C.off} «${p.title}» (${p.slug}) · ~${userProfileTokens(p)} токенов в system prompt`)
+          log.dim(`  файл: ${userProfilePath(opts.dshHome, p.slug)}`)
+          for (const l of renderUserProfile(p).split('\n').slice(1)) log.dim(`  ${l}`)
+          const m = state.metrics
+          if (m.profileCalls) log.dim(`  personalization calls: ${m.profileCalls}, ${fmtTok(m.profileTokens)} tokens`)
+          log.dim('  профиль правится в файле или дополняется автоматически по вашим сообщениям')
+        }
+        if (!sub || sub === 'show' || sub === 'status') {
+          if (state.userProfile) show(state.userProfile)
+          else log.dim('профиль не подключён — /profile use <slug>, /profile new или запуск с --with-profiles')
+          break
+        }
+        if (sub === 'list') {
+          const list = listUserProfiles(opts.dshHome)
+          if (!list.length) { log.dim('профилей ещё нет — /profile new'); break }
+          for (const p of list) {
+            const cur = p.slug === state.userProfile?.slug ? ' *' : ''
+            log.dim(`  ${p.slug.padEnd(20)} ${p.title} · ~${p.tokens} токенов${cur}`)
+          }
+          log.dim(`  каталог: ${userProfilesDir(opts.dshHome)}`)
+          break
+        }
+        if (sub === 'off' || sub === 'none') {
+          if (!state.userProfile) { log.dim('профиль и так не подключён'); break }
+          applyUserProfile(null)
+          log.dim('профиль отключён — system prompt без персонализации со следующего сообщения')
+          break
+        }
+        if (sub === 'new') {
+          const created = await createUserProfileInteractive()
+          if (!created) break
+          applyUserProfile(created)
+          show(created)
+          log.dim('  применится со следующего сообщения')
+          break
+        }
+        if (sub === 'use') {
+          const slug = (parts[2] ?? '').trim()
+          if (!slug) {
+            const chosen = await pickOrCreateUserProfile()
+            if (!chosen) { log.dim('профиль не выбран'); break }
+            applyUserProfile(chosen)
+            show(chosen)
+            break
+          }
+          const found = readUserProfile(opts.dshHome, slug)
+          if (found === null) {
+            log.err(`профиль «${slug}» не найден`)
+            const known = listUserProfiles(opts.dshHome)
+            if (known.length) log.dim(`доступно: ${known.map((p) => p.slug).join(', ')}`)
+            break
+          }
+          applyUserProfile(found)
+          show(found)
+          log.dim('  применится со следующего сообщения')
+          break
+        }
+        log.err(`неизвестное действие: ${sub}`)
+        log.dim('использование: /profile [show|list|use <slug>|new|off]')
         break
       }
       case 'resume': {
@@ -3250,6 +3705,7 @@ async function main() {
       }
       case 'exit': {
         exiting = true
+        await flushProfileLearning(state)
         try { await rpc.close() } catch {}
         process.exit(0)
         break
@@ -3305,6 +3761,7 @@ async function main() {
       if (!exiting && input.eof) exiting = true
       if (exiting) {
         stopStatus()
+        await flushProfileLearning(state, 4000)
         try { await rpc.close() } catch {}
         process.exit(0)
       }
@@ -3315,17 +3772,16 @@ async function main() {
 
   // ---- handshake ----
   try {
-    const res = await rpc.request('initialize', {
-      cwd: opts.workspace,
-      provider: opts.provider,
-      model: opts.model,
-      ...(opts.maxTokens ? { maxTokens: opts.maxTokens } : {}),
-      ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
-    })
+    const res = await rpc.request('initialize', initParams)
     log.dim(`runtime: ${res.serverInfo.name} ${res.serverInfo.version} · provider=${opts.provider} model=${opts.model}`)
     // Диагностика UI: понятно, почему нет цветов/рендера (tty/NO_COLOR/one-shot).
     log.dim(`ui: in-tty=${process.stdin.isTTY ? 1 : 0} out-tty=${process.stdout.isTTY ? 1 : 0} colors=${C.cyan ? 1 : 0} md=${mdColorEnabled() ? 1 : 0}`)
     log.dim(`compress: ${compress.mode}${compressPolicyText(compress)}`)
+    if (state.userProfile) {
+      log.dim(`profile: «${state.userProfile.title}» (${state.userProfile.slug}) · ~${userProfileTokens(state.userProfile)} токенов в system prompt · файл: ${userProfilePath(opts.dshHome, state.userProfile.slug)}`)
+    } else if (opts.withProfiles || profileSlug) {
+      log.dim('profile: не выбран — сессия без персонализации')
+    }
     if (strategyMode) {
       log.dim(`strategy: ${strategyLabel(ctx)} — контекстом управляет ${
         ctx.strategy === 'facts' ? 'facts + окно сообщений' : ctx.strategy === 'branch' ? 'ветки диалога + окно сообщений' : 'окно сообщений'

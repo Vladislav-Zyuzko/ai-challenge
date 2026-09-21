@@ -1,0 +1,34 @@
+runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
+ui: in-tty=0 out-tty=0 colors=0 md=0
+compress: on (compact at 100k tokens, keep last 50k tokens)
+profile: «Учебный (до обучения)» (auto-learn) · ~20 токенов в system prompt · файл: C:\Users\user\.dsh-term\user-profiles\auto-learn.md
+resuming session: 78f48f29-dc3f-4ffb-95bd-d5b9bfb3fc3d
+(queued d98d7316-f30b-4e1a-ab50-07e5dde1b42e)
+· заголовок сессии: «Запомни про меня: эмод»
+  · профиль: +3 пункт(ов) (формат: 3) → в промпт со следующего хода
+▶ glob pattern="**/*"
+✔ done
+▶ pwsh command="Get-ChildItem -Force | Select-Object Mode,Name | Format-Tabl" description="List workspace root entries"
+✔ done
+· step 2: in 8.2k / out 54
+▶ read file_path="USER_PREFERENCES.md"
+✔ done
+Проверил рабочее пространство: файл `USER_PREFERENCES.md` уже существует, и все три пункта в нём записаны ровно в той формулировке, которую вы просите:
+
+1. Эмодзи не использовать — ни в ответах, ни в создаваемых файлах.
+2. Метрики объёма и стоимости — только в токенах (входные, выходные, всего), не в словах, символах, страницах или деньгах.
+3. Длинные и многосоставные ответы завершать разделом `## Итого` с краткой сводкой.
+
+Изменений не вносил: дублировать уже зафиксированные правила смысла нет.
+
+Принял к работе: дальше отвечаю без эмодзи, метрики считаю в токенах, длинные ответы закрываю разделом «Итого».
+· step 3: in 8.5k / out 305
+
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 24.5k (cache 23.8k) / out 624
+  requests: 3 (this turn: 3)
+  context: 8.5k / 1M (0.847%)
+
+
+# ===== stderr (диагностика dsh-term) =====

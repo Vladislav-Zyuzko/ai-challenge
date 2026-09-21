@@ -1,0 +1,40 @@
+```js
+const fs = require('node:fs/promises');
+
+async function readJson(path) {
+  let raw;
+  try {
+    raw = await fs.readFile(path, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') throw new Error(`Файл не найден: ${path}`);
+    if (err.code === 'EACCES') throw new Error(`Нет доступа: ${path}`);
+    throw err;                       // прочие I/O-ошибки наверх
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`Некорректный JSON в ${path}: ${err.message}`);
+  }
+}
+```
+
+Синхронный вариант: `JSON.parse(fs.readFileSync(path, 'utf8'))` в одном `try/catch`, но различать `err.code === 'ENOENT'` и `err instanceof SyntaxError`. `require('./data.json')` кэширует результат и падает процессом при ошибке — для динамического чтения не годится.
+
+# ===== stderr (метрики) =====
+node.exe : runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
+At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
++     $stdout = & node @nodeArgs 2> $errFile
++               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (runtime: deepse...epseek-v4-flash:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ui: in-tty=0 out-tty=0 colors=0 md=0
+compress: on (compact at 100k tokens, keep last 50k tokens)
+profile: «Кратко и по делу» (kratko) · ~197 токенов в system prompt · файл: C:\Users\user\.dsh-term\user-profiles\kratk
+o.md
+(queued dda34f6e-2e03-4f82-96ce-17e701683f6f)
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 8.2k (cache 7.9k) / out 304
+  requests: 1 (this turn: 1)
+  context: 8.2k / 1M (0.818%)
