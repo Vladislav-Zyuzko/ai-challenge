@@ -19,8 +19,8 @@ import { spawn, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { request as httpsRequest } from 'node:https'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { basename, join, resolve } from 'node:path'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 
 // ---------- ANSI ----------
 const C = process.stdout.isTTY && !process.env.NO_COLOR
@@ -34,7 +34,9 @@ const PROMPT = process.stdout.isTTY && !process.env.NO_COLOR
   : 'dsh> '
 
 // Состояние UI: oneShot = режим -p (ответ только в stdout, диагностика в stderr).
-const UI = { oneShot: false, lastChar: '' }
+// asking = на экране диалог клиента (вопрос/подтверждение): пока он открыт, живой
+// счётчик и подпись не перерисовываются, иначе они мигают поверх меню.
+const UI = { oneShot: false, lastChar: '', asking: false }
 function outWrite(s) {
   drainMd() // сначала напечатать накопленный текст ответа (порядок вывода)
   meterEraseTail() // новый контент — сначала убрать хвостовой счётчик токенов
@@ -144,8 +146,35 @@ function compressNotes(c) {
   return notes
 }
 
-/** YAML-патч для профиля: `on` — авто-компакция с нашими порогами, `off` — выключено. */
-function compressPatchYaml(compress) {
+/**
+ * YAML-оверлей профиля, включающий инструмент `ask_user_question`.
+ * В base-бандле смонтирован сервис вопросов (`user-questions`), но сам
+ * модельный инструмент — нет; строка добавляется через `insert` (оверлей умеет
+ * и менять строки по id, и добавлять новые списком).
+ */
+function toolsPatchYaml() {
+  return [
+    '# dsh-term: инструмент ask_user_question (вопросы к пользователю с вариантами).',
+    '# Отключить: DSH_TERM_NO_ASK_TOOL=1.',
+    '- insert:',
+    '    - id: tool-ask-user',
+    "      name: '@deepseek-ai/dsh-tool-ask-user'",
+    '',
+  ].join('\n')
+}
+
+/**
+ * Есть ли уже строка инструмента вопросов в пользовательском слое профиля.
+ * Оверлей с `insert` НЕ идемпотентен: повторная вставка того же id валит
+ * загрузку дерева плагинов («duplicate loader entry id»), поэтому проверяем.
+ */
+function profileHasAskToolRow(dshHome, profile) {
+  const p = join(dshHome, 'profiles', profile, 'cordis.patch.yml')
+  const md = readTextIfExists(p)
+  return md !== null && md.includes('dsh-tool-ask-user')
+}
+
+/** YAML-патч для профиля: `on` — авто-компакция с нашими порогами, `off` — выключено. */function compressPatchYaml(compress) {
   if (compress.mode === 'off') {
     // Плагин НЕ отключаем: его сервис `compaction` нужен command-compact, иначе
     // дерево плагинов не загрузится. Просто выключаем автоматическую компакцию.
@@ -279,6 +308,7 @@ function meterEraseTail() {
  * backspace-ами гарантированно остаётся внутри строки.
  */
 function meterDrawTail() {
+  if (UI.asking) return // на экране диалог клиента — не рисуем поверх него
   if (process.env.DSH_TERM_NO_METER) return // диагностика: выключить живой счётчик
   if (!meter.active || UI.oneShot) return
   if (!process.stdout.isTTY) return // хвостик — визуальный гаджет, только для терминала
@@ -1063,6 +1093,7 @@ function parseArgs(argv) {
     compressKeep: undefined, // сколько последних токенов держать как есть
     strategy: undefined,     // стратегия управления контекстом: harness | sliding | facts | branch
     window: undefined,       // N сообщений для стратегий
+    autoApprove: undefined,  // разрешать запросы доступа без вопросов (env DSH_TERM_AUTO_APPROVE)
     help: false,
   }
   for (let i = 0; i < argv.length; i++) {
@@ -1083,6 +1114,7 @@ function parseArgs(argv) {
       case '--compress-keep': opts.compressKeep = Number(next()); break
       case '--strategy': case '--mode': opts.strategy = next(); break
       case '--window': opts.window = Number(next()); break
+      case '--auto-approve': opts.autoApprove = true; break
       case '-p': case '--print': opts.prompt = next(); break
       case '--workspace': opts.workspace = next(); break
       case '--dsh-bin': opts.dshBin = next(); break
@@ -1100,6 +1132,9 @@ class RpcClient {
     this.nextId = 1
     this.pending = new Map()
     this.onNotification = () => {}
+    // Сервер может СПРАШИВАТЬ клиента (user/question, user/approval) — это
+    // двусторонний JSON-RPC: id + method = запрос к нам, отвечаем id + result.
+    this.onRequest = () => { throw new Error('client request handler is not installed') }
     this.buffer = ''
     child.stdout.setEncoding('utf8')
     child.stdout.on('data', (d) => this.#onData(d))
@@ -1116,7 +1151,7 @@ class RpcClient {
       if (!line.trim()) continue
       let msg
       try { msg = JSON.parse(line) } catch { continue } // malformed lines ignored (per protocol)
-      if (msg.id !== undefined && msg.method !== undefined) continue // server→client requests unused
+      if (msg.id !== undefined && msg.method !== undefined) { void this.#answer(msg); continue } // запрос сервера к клиенту
       if (msg.method !== undefined) { this.onNotification(msg); continue }
       if (msg.id !== undefined) {
         const p = this.pending.get(msg.id)
@@ -1137,6 +1172,20 @@ class RpcClient {
       this.pending.set(id, { resolve, reject })
       this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
     })
+  }
+
+  /** Ответить на запрос сервера: result или error (клиент не должен молчать). */
+  async #answer(msg) {
+    trace(`incoming ${msg.method} id=${msg.id}`)
+    let frame
+    try {
+      const result = await this.onRequest(msg.method, msg.params ?? {})
+      frame = { jsonrpc: '2.0', id: msg.id, result }
+    } catch (e) {
+      trace(`incoming handler failed: ${e?.message ?? e}`)
+      frame = { jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: String(e?.message ?? e) } }
+    }
+    try { this.child.stdin.write(JSON.stringify(frame) + '\n') } catch (e) { trace(`reply failed: ${e.message}`) }
   }
 
   #failAll(reason) {
@@ -1254,6 +1303,7 @@ const COMMANDS = [
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
   { name: 'publish-day', usage: '/publish-day', desc: 'git+gh: коммит → push → PR day→week (по SKILLS)' },
+  { name: 'create-project', usage: '/create-project [что строим] [--check <path>]', desc: 'сессия архитектора проекта: опросник → .project-harness → инструменты → ноды' },
   { name: 'exit', usage: '/exit', desc: 'завершить dsh-term (или Ctrl+C)' },
 ]
 
@@ -1368,7 +1418,15 @@ function editorRender(ed, force) {
   const key = row0 + '\u0000' + (ed.menu ? ed.menu.items.map((x) => x.name).join(',') + '#' + ed.menu.sel : '-')
   if (!force && ed._key === key) return
   ed._key = key
-  let out = '\r\x1b[J' + row0 // стереть строку ввода и всё ниже, нарисовать заново
+  const cols = meterCols()
+  const w = meterVis(row0)
+  // Ввод может занимать НЕСКОЛЬКО визуальных строк (перенос по ширине терминала).
+  // `\r\x1b[J` стирает только текущую строку и ниже, поэтому сначала поднимаемся
+  // на высоту прошлого рендера — иначе копии «dsh> …» остаются на строках выше и
+  // каждый введённый символ добавляет ещё одну (регресс: tests/editor-wrap.test.mjs).
+  const rows0 = Math.max(1, Math.ceil(w / cols))
+  const prev = ed.rows ?? 1
+  let out = (prev > 1 ? `\x1b[${prev - 1}A` : '') + '\r\x1b[J' + row0
   if (ed.menu) {
     const rows = [menuSeparator()]
     if (ed.menu.items.length) {
@@ -1385,8 +1443,12 @@ function editorRender(ed, force) {
       rows.push(menuClip(`${C.dim}  (нет команд по «/${ed.buf.slice(1)}»)${C.off}`))
     }
     rows.push(menuClip(`${DS.sky}${COMMAND_MENU_KEYS}${C.off}`))
-    out += '\n' + rows.join('\n') + `\x1b[${rows.length}A\x1b[${meterVis(row0) + 1}G`
+    out += '\n' + rows.join('\n') + `\x1b[${rows.length}A`
+    // Колонка курсора внутри ПЕРЕНЕСЁННОЙ строки: w % cols, а не w + 1.
+    const col = w > 0 && w % cols === 0 ? cols : (w % cols) + 1
+    out += `\x1b[${col}G`
   }
+  ed.rows = rows0
   process.stdout.write(out)
 }
 
@@ -1409,7 +1471,9 @@ function readLineTTY(promptText) {
     }
     const commit = (line) => {
       // Показать итоговую строку как «введённую» и перейти на следующую строку.
-      process.stdout.write('\r\x1b[J' + ed.prompt + line + '\n')
+      // Высоту прошлого рендера учитываем: длинный ввод занимал несколько строк.
+      const prev = ed.rows ?? 1
+      process.stdout.write((prev > 1 ? `\x1b[${prev - 1}A` : '') + '\r\x1b[J' + ed.prompt + line + '\n')
     }
     const finish = (line) => {
       if (done) return
@@ -1666,6 +1730,7 @@ function pickSessionTTY(list, titles) {
  */
 function pickListTTY(spec) {
   const items = spec.items
+  const multi = spec.multi === true // выбор нескольких: пробел — отметить, Enter — подтвердить
   const filter = (q) => {
     const s = String(q ?? '').trim().toLowerCase()
     if (!s) return items.slice()
@@ -1674,9 +1739,17 @@ function pickListTTY(spec) {
   }
   if (!process.stdin.isTTY) {
     items.forEach((it, i) => log.line(`  ${i + 1}. ${it.label}${it.note ? ` — ${it.note}` : ''}`))
-    return askLine('номер или id (Enter — отмена): ').then((pick) => {
+    return askLine(multi ? 'номера через запятую (Enter — отмена): ' : 'номер или id (Enter — отмена): ').then((pick) => {
       const p = String(pick ?? '').trim()
-      if (!p) return null
+      if (!p) return multi ? [] : null
+      if (multi) {
+        return p.split(/[,\s]+/).map((t) => {
+          const n = Number(t)
+          if (Number.isInteger(n) && n >= 1 && n <= items.length) return items[n - 1].id
+          const f = items.find((it) => it.id.toLowerCase() === t.toLowerCase())
+          return f ? f.id : null
+        }).filter((id) => id !== null)
+      }
       const byNum = Number(p)
       if (Number.isInteger(byNum) && byNum >= 1 && byNum <= items.length) return items[byNum - 1].id
       const found = items.find((it) => it.id.toLowerCase() === p.toLowerCase())
@@ -1693,14 +1766,15 @@ function pickListTTY(spec) {
       const sel = start + k === st.sel
       const mark = sel ? `${DS.blue}▸${C.off}` : ' '
       const dot = it.current ? `${DS.sky}•${C.off}` : ' '
+      const box = multi ? `${st.chosen.has(it.id) ? `${DS.sky}[x]${C.off}` : '[ ]'} ` : ''
       const label = sel ? `${C.bold}${DS.blue}${it.label}${C.off}` : it.label
       const note = it.note ? ` ${C.dim}${it.note}${C.reset}` : ''
-      rows.push(menuClip(`${mark} ${dot} ${label}${note}`))
+      rows.push(menuClip(`${mark} ${dot} ${box}${label}${note}`))
     }
     process.stdout.write(`\r\x1b[J${row0}\n${[menuSeparator(), ...rows, `${C.dim}${SESSION_PICK_KEYS}${C.off}`].join('\n')}\x1b[${rows.length + 2}A\x1b[${meterVis(row0) + 1}G`)
   }
   return new Promise((resolve) => {
-    const st = { prompt: spec.prompt, query: '', sel: 0, items: filter('') }
+    const st = { prompt: spec.prompt, query: '', sel: 0, items: filter(''), chosen: new Set() }
     let done = false
     let onResize = () => {}
     const recompute = () => {
@@ -1745,8 +1819,22 @@ function pickListTTY(spec) {
           continue
         }
         if (ch === '\u0003') { done = true; cleanup(); process.emit('SIGINT'); return }
-        if (ch === '\u0004') { finish(null); return }
-        if (ch === '\r' || ch === '\n') { finish(st.items[st.sel]?.id ?? null); return }
+        if (ch === '\u0004') { finish(multi ? [...st.chosen] : null); return }
+        if (ch === '\r' || ch === '\n') {
+          if (multi) { finish([...st.chosen]); return }
+          finish(st.items[st.sel]?.id ?? null)
+          return
+        }
+        if (multi && ch === ' ') {
+          // Пробел отмечает/снимает текущий пункт (множественный выбор).
+          const id = st.items[st.sel]?.id
+          if (id !== undefined) {
+            if (st.chosen.has(id)) st.chosen.delete(id)
+            else st.chosen.add(id)
+            render(st)
+          }
+          continue
+        }
         if (ch === '\u007f' || ch === '\b') {
           if (!st.query) continue
           st.query = st.query.slice(0, -1)
@@ -1808,6 +1896,248 @@ function buildPrBody({ dayBranch, weekBranch, subject, body, statOut, porcelainO
   if (body) lines.push('', body)
   lines.push('', `Ветки: \`${dayBranch}\` → \`${weekBranch}\``, '', '_Сгенерировано `dsh-term /publish-day` (см. .dsh/SKILLS)._')
   return lines.join('\n')
+}
+
+// ---------- скилл create-project: харнесс продукта ----------
+// Детерминированная часть скилла: найти/создать .project-harness, просканировать
+// отчёты и определить, где остановилась работа (восстановление по репортам).
+const NODE_STAGES = ['specification', 'planning', 'realization', 'verification', 'acceptance']
+const STAGE_RU = {
+  specification: 'спецификация',
+  planning: 'планирование',
+  realization: 'реализация',
+  verification: 'верификация',
+  acceptance: 'приёмка',
+}
+const STAGE_REPORT = {
+  specification: 'specification-report.md',
+  planning: 'planning-report.md',
+  realization: 'realization-report.md',
+  verification: 'verification-report.md',
+  acceptance: 'acceptance-report.md',
+}
+
+function readTextIfExists(p) {
+  try { return readFileSync(p, 'utf8') } catch { return null }
+}
+
+/** Версия правил харнесса из .dsh/.harness/README.md (для change propagation). */
+function readHarnessVersion(harnessRoot) {
+  const md = readTextIfExists(join(harnessRoot, 'README.md'))
+  const m = md === null ? null : /Текущая версия правил:\s*\*\*([\d.]+)\*\*/.exec(md)
+  return m ? m[1] : null
+}
+
+/** Разобрать шапку отчёта: Этап / Статус / Следующая роль / версии / Дата. */
+function parseReportHeader(text) {
+  const get = (re) => {
+    const m = re.exec(text)
+    return m ? m[1].trim() : null
+  }
+  return {
+    stage: get(/^\s*Этап:\s*(.+)$/m),
+    status: get(/^\s*Статус:\s*(.+)$/m),
+    next: get(/^\s*Следующая роль:\s*(.+)$/m),
+    contract: get(/^\s*contract_version:\s*(.+)$/m),
+    harness: get(/^\s*harness_version:\s*(.+)$/m),
+    date: get(/^\s*Дата:\s*(.+)$/m),
+  }
+}
+
+/**
+ * Скан харнесса продукта: узлы, их отчёты и точка возобновления.
+ * Состояние берётся ТОЛЬКО из шапок отчётов — это и есть восстановление по репортам.
+ * @param {string} harnessDir - путь к <project>/.project-harness.
+ * @returns {{exists: boolean, mode: 'new'|'resume', nodes: Array, focus: object|null, lines: string[], warnings: string[]}}
+ */
+function scanProjectHarness(harnessDir) {
+  const exists = existsSync(harnessDir)
+  const nodes = new Map()
+  const warnings = []
+  const ensure = (rel) => {
+    if (!nodes.has(rel)) nodes.set(rel, { rel, reports: {}, files: [] })
+    return nodes.get(rel)
+  }
+  const walk = (dir, rel) => {
+    let entries = []
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
+    const inReports = basename(dir) === 'node-reports'
+    const node = ensure(rel)
+    for (const e of entries) {
+      const abs = join(dir, e.name)
+      if (e.isDirectory()) {
+        // node-reports — служебная папка узла: её отчёты принадлежат самому узлу,
+        // а не отдельной сущности (иначе узел «теряет» свои отчёты).
+        walk(abs, inReports || e.name === 'node-reports' ? rel : (rel === '.' ? e.name : `${rel}/${e.name}`))
+        continue
+      }
+      if (!e.name.endsWith('.md')) continue
+      if (!inReports) node.files.push(e.name)
+      if (!inReports) continue
+      const stage = NODE_STAGES.find((s) => STAGE_REPORT[s] === e.name)
+      if (stage === undefined) continue
+      let mtime = 0
+      try { mtime = statSync(abs).mtimeMs } catch {}
+      node.reports[stage] = { ...parseReportHeader(readTextIfExists(abs) ?? ''), file: e.name, mtime }
+    }
+  }
+  if (exists) walk(harnessDir, '.')
+
+  const list = [...nodes.values()].map((n) => {
+    const present = NODE_STAGES.filter((s) => n.reports[s] !== undefined)
+    const last = present.length ? present[present.length - 1] : null
+    const rep = last === null ? null : n.reports[last]
+    const done = n.reports.acceptance !== undefined && /заверш|принят/i.test(n.reports.acceptance.status ?? '')
+    const depth = n.rel === '.' ? 0 : n.rel.split('/').length
+    return {
+      rel: n.rel,
+      depth,
+      files: n.files,
+      reports: n.reports,
+      present,
+      last,
+      status: rep?.status ?? null,
+      next: rep?.next ?? null,
+      contract: rep?.contract ?? null,
+      harness: rep?.harness ?? null,
+      date: rep?.date ?? null,
+      done,
+    }
+  }).sort((a, b) => a.depth - b.depth || a.rel.localeCompare(b.rel))
+
+  // Противоречия: неполная цепочка отчётов, провал/блокер, расхождение версий.
+  for (const n of list) {
+    const where = n.rel === '.' ? 'корень' : n.rel
+    if (n.reports.realization !== undefined && n.reports.planning === undefined) warnings.push(`${where}: есть realization-report без planning-report`)
+    if (n.reports.verification !== undefined && n.reports.realization === undefined) warnings.push(`${where}: есть verification-report без realization-report`)
+    if (n.reports.acceptance !== undefined && n.reports.verification === undefined) warnings.push(`${where}: есть acceptance-report без verification-report`)
+    const bad = n.present.filter((s) => /провал|блокер/i.test(n.reports[s].status ?? ''))
+    if (bad.length) warnings.push(`${where}: ${bad.map((s) => `${STAGE_RU[s]} — ${n.reports[s].status}`).join('; ')}`)
+    const versions = new Set(n.present.map((s) => n.reports[s].contract).filter(Boolean))
+    if (versions.size > 1) warnings.push(`${where}: расхождение contract_version (${[...versions].join(', ')}) — возможна незавершённая смена контракта`)
+  }
+
+  const withReports = list.filter((n) => n.present.length > 0)
+  const unfinished = withReports.filter((n) => !n.done)
+  // Точка возобновления — самый глубокий незавершённый узел (если он есть).
+  const focus = unfinished.length
+    ? unfinished.slice().sort((a, b) => b.depth - a.depth || NODE_STAGES.indexOf(b.last) - NODE_STAGES.indexOf(a.last))[0]
+    : (withReports.length ? null : null)
+
+  const lines = []
+  if (!exists) {
+    lines.push('харнесс продукта ещё не создан')
+  } else if (withReports.length === 0) {
+    lines.push('отчётов нет — работа по правилам харнесса ещё не начиналась')
+    if (list.some((n) => n.files.length)) lines.push(`файлы: ${[...new Set(list.flatMap((n) => n.files))].join(', ')}`)
+  } else {
+    for (const n of list) {
+      if (n.present.length === 0 && n.files.length === 0) continue
+      const label = n.rel === '.' ? 'корень' : n.rel
+      if (n.present.length === 0) {
+        lines.push(`${label}: файлы есть, отчётов нет (${n.files.join(', ')})`)
+        continue
+      }
+      const tail = [n.contract ? `contract ${n.contract}` : null, n.harness ? `harness ${n.harness}` : null, n.date].filter(Boolean).join(' · ')
+      lines.push(`${label}: ${n.done ? 'завершён' : STAGE_RU[n.last]} · ${n.status ?? '—'}${n.next ? ` → ${n.next}` : ''}${tail ? ` · ${tail}` : ''}`)
+    }
+  }
+  if (focus !== null && focus !== undefined) {
+    lines.push(`возобновление: ${focus.rel === '.' ? 'корень' : focus.rel} · этап ${STAGE_RU[focus.last]} · следующий шаг — ${focus.next ?? 'уточнить по отчёту'}`)
+  }
+  for (const w of warnings) lines.push(`⚠ ${w}`)
+
+  return {
+    exists,
+    mode: withReports.length === 0 ? 'new' : 'resume',
+    nodes: list,
+    focus: focus ?? null,
+    lines,
+    warnings,
+  }
+}
+
+/**
+ * /create-project — сессия архитектора проекта по SKILLS: опросник (что делаем →
+ * где делаем → требования) → .project-harness → гейт инструментов → тело проекта
+ * → ноды.
+ *
+ * CLI НИЧЕГО не трактует буквально: любой текст после команды — это слова
+ * пользователя, они уходят архитектору как его первое сообщение; путь, стек и
+ * названия определяет и подтверждает сам архитектор в диалоге (инструментами).
+ * Детерминированная часть здесь — только проверка процедурного харнесса и
+ * диагностический скан отчётов по явному флагу `--check <path>`.
+ */
+async function createProject(opts, parts, askLineFn, promptTurnFn, state) {
+  const args = parts.slice(1)
+  const checkOnly = args.includes('--check')
+  const brief = args.filter((p) => !p.startsWith('--')).join(' ').trim()
+
+  const harnessRoot = join(opts.workspace, '.dsh', '.harness')
+  if (!existsSync(join(harnessRoot, 'README.md'))) {
+    log.err(`не найден процедурный харнесс: ${harnessRoot}`)
+    log.dim('create-project работает внутри репозитория, где есть .dsh/.harness/')
+    return
+  }
+  const harnessVersion = readHarnessVersion(harnessRoot)
+
+  if (checkOnly) {
+    // Диагностика, не часть опросника: путь здесь задаётся явно и осознанно.
+    if (!brief) {
+      log.err('для --check укажи путь явно: /create-project --check <path>')
+      return
+    }
+    const ctxDir = join(resolve(opts.workspace, brief), '.project-harness')
+    const scan = scanProjectHarness(ctxDir)
+    log.line(`${C.bold}/create-project --check${C.off}: ${C.cyan}${ctxDir}${C.off}`)
+    log.dim(`  харнесс процесса: ${harnessRoot}${harnessVersion ? ` · версия правил ${harnessVersion}` : ''}`)
+    log.dim(`  режим: ${scan.mode === 'new' ? 'NEW' : 'RESUME'}`)
+    for (const l of scan.lines) log.dim(`  ${l}`)
+    return
+  }
+
+  const skill = readTextIfExists(join(opts.workspace, '.dsh', 'SKILLS', 'create-project.md'))
+  const role = readTextIfExists(join(harnessRoot, 'agents', 'project-architect.md'))
+  if (skill === null || role === null) {
+    log.err('не читаются .dsh/SKILLS/create-project.md или .dsh/.harness/agents/project-architect.md')
+    return
+  }
+  const strategyNote = state?.context && state.context.strategy !== 'harness'
+    ? `\nВНИМАНИЕ: активна стратегия контекста «${state.context.strategy}» — промпт архитектора уйдёт с собранным по ней контекстом. Для чистой сессии архитектора лучше /strategy harness.`
+    : ''
+  if (strategyNote) log.dim(`  note: активна стратегия контекста «${state.context.strategy}» — для чистой сессии архитектора переключись на /strategy harness`)
+  log.line(`${C.bold}/create-project${C.off}: сессия архитектора проекта (${C.cyan}${opts.workspace}${C.off})`)
+  log.dim('  путь, стек и названия выясняет архитектор в диалоге — CLI их не угадывает')
+  const prompt = [
+    '=== СКИЛЛ: create-project ===',
+    '(команда выполнила только детерминированную часть: проверила наличие .dsh/.harness',
+    'и прочитала версию правил. Путь проекта, стек и названия параметрами НЕ переданы —',
+    'их выясняешь сам в диалоге.)',
+    '',
+    skill,
+    '',
+    '=== РОЛЬ: архитектор проекта ===',
+    role,
+    '',
+    '=== КОНТЕКСТ СЕССИИ ===',
+    `Рабочая папка (репозиторий): ${opts.workspace}`,
+    `Процедурный харнесс: ${harnessRoot}${harnessVersion ? ` (версия правил ${harnessVersion})` : ''}`,
+    strategyNote,
+    brief
+      ? `Первое сообщение пользователя — сырой текст, интерпретируй сам:\n"""\n${brief}\n"""`
+      : 'Пользователь заранее ничего не сказал — начни опросник с нуля.',
+    '',
+    'Работай как опросник (шаг 0 скилла): коротко представься и веди диалог блоками —',
+    'что делаем, где делаем, что важно и какие требования; дай пользователю рассказать',
+    'самому (чем подробнее, тем лучше). Ничего не воспринимай буквально: любые слова —',
+    'это речь пользователя, а не команды и не параметры. Путь определи вместе с ним и',
+    'проверь инструментами до создания: если по пути уже есть .project-harness — предложи',
+    'продолжить по отчётам; если папка не пуста — предупреди и спроси.',
+    '',
+    'Правила харнесса прочитай сам по путям: .dsh/.harness/product-rules/project.md, node.md, state-machine.md, glossary.md.',
+  ].join('\n')
+  trace(`create-project prompt: ${prompt.length} chars, brief=${brief ? brief.slice(0, 60) : '(нет)'}`)
+  await promptTurnFn(prompt)
 }
 
 /**
@@ -1917,6 +2247,7 @@ async function main() {
     log.line('  --compress-keep <n> сколько последних токенов держать как есть (default 50000, ≈5% окна)')
     log.line('  --strategy <id>     стратегия контекста: harness (default) | sliding | facts | branch')
     log.line('  --window <n>        N сообщений для стратегии sliding/facts/branch (default 6)')
+    log.line('  --auto-approve      не спрашивать подтверждения доступа (env DSH_TERM_AUTO_APPROVE=1)')
     log.line('  --session <id>      продолжить конкретную сессию (синоним: --resume <id>)')
     log.line('  --workspace <path>  рабочая папка сессий (default: текущая)')
     log.line('  --dsh-bin <path>    путь к dsh (default: dsh из PATH)')
@@ -1932,6 +2263,9 @@ async function main() {
     log.line('  /new     начать новую сессию')
     log.line('  /token   сменить сохранённый API ключ')
     log.line('  /publish-day  git+gh: коммит → push → PR day→week (по .dsh/SKILLS)')
+    log.line('  /create-project [что строим]  сессия архитектора проекта: опросник → .project-harness')
+    log.line('                → гейт инструментов → ноды (по .dsh/SKILLS/create-project.md)')
+    log.line('                --check <path> — только диагностика: состояние отчётов по пути')
     log.line('  /exit    завершить (или Ctrl+C)')
     log.line('')
     log.line('Меню команд: начни вводить «/» — список с фильтром по подстроке,')
@@ -2050,6 +2384,20 @@ async function main() {
     log.err(`compress patch failed: ${e.message}`)
   }
 
+  // Оверлей с инструментом вопросов: без него модель не может спросить
+  // пользователя с вариантами (сервис есть в base-бандле, инструмент — нет).
+  // Если строка уже есть в патче профиля — не дублируем (insert не идемпотентен).
+  if (process.env.DSH_TERM_NO_ASK_TOOL !== '1' && !profileHasAskToolRow(opts.dshHome, opts.profile)) {
+    try {
+      const toolsPatchPath = join(opts.dshHome, 'dsh-term-tools.patch.yml')
+      mkdirSync(opts.dshHome, { recursive: true })
+      writeFileSync(toolsPatchPath, toolsPatchYaml(), 'utf8')
+      opts.patches = [...(opts.patches ?? []), toolsPatchPath]
+    } catch (e) {
+      log.err(`tools patch failed: ${e.message}`)
+    }
+  }
+
   const state = {
     sessionId,
     harnessSessionId: sessionId, // id сессии для ТЕКУЩЕГО хода (в режиме стратегии — свежий)
@@ -2061,6 +2409,7 @@ async function main() {
     streamedText: false,       // печатали ли текст за текущий ход
     streamAttempts: new Map(), // attemptId → { turn, step } для живого стрима (session.assistant-stream)
     liveStream: false,         // сервер присылал session.assistant-stream в этом процессе
+    autoApprove: opts.autoApprove === true || process.env.DSH_TERM_AUTO_APPROVE === '1', // запросы доступа без вопросов
     compressHint: false,       // подсказка об убыточной компакции уже показана
     lastEndKind: null,         // чем закончился последний ход ('completed'/'error'/…)
     metrics: emptyMetrics(), // расход сессии: prompts/outputs/cacheReads/calls
@@ -2193,6 +2542,100 @@ async function main() {
       }
       if (!mine || !state.turn) return
       renderEvent(event)
+    }
+  }
+
+  /**
+   * Вопрос от агента (ask_user_question, ревью плана): меню с вариантами или
+   * свободный текст. Ответ уходит обратно в рантайм как { answers: [...] }.
+   */
+  async function answerUserQuestion(params) {
+    const answers = []
+    for (const q of params.questions ?? []) {
+      if (q.header) log.line(`${C.bold}${q.header}${C.off}`)
+      log.line(`${C.bold}${q.question}${C.off}`)
+      if (q.detail) log.dim(String(q.detail).split('\n').map((l) => '  ' + l).join('\n'))
+      if (q.intent?.kind === 'plan-review' && q.intent.approve) {
+        log.dim(`  (одобрить — вариант «${q.intent.approve}»)`)
+      }
+      const opts = q.options ?? []
+      if (!opts.length) {
+        const text = String(await askLine('ответ> ') ?? '').trim()
+        answers.push(text ? { id: q.id, selected: [], custom: text } : { id: q.id, selected: [] })
+        continue
+      }
+      const items = opts.map((o) => ({ id: o.label, label: o.label, note: o.description ?? '' }))
+      items.push({ id: '__custom__', label: 'свой вариант…', note: 'ввести текст' })
+      if (q.multiSelect) {
+        const picked = await pickListTTY({ prompt: 'выбор> ', items, multi: true })
+        const chosen = picked ?? []
+        const selected = chosen.filter((id) => id !== '__custom__')
+        const custom = chosen.includes('__custom__')
+          ? (String(await askLine('свой вариант> ') ?? '').trim() || undefined)
+          : undefined
+        answers.push({ id: q.id, selected, ...(custom === undefined ? {} : { custom }) })
+        continue
+      }
+      const picked = await pickListTTY({ prompt: 'выбор> ', items })
+      if (picked === null) { answers.push({ id: q.id, selected: [] }); continue }
+      if (picked === '__custom__') {
+        const custom = String(await askLine('свой вариант> ') ?? '').trim()
+        answers.push({ id: q.id, selected: [], ...(custom ? { custom } : {}) })
+        continue
+      }
+      answers.push({ id: q.id, selected: [picked] })
+    }
+    return { answers }
+  }
+
+  /**
+   * Запрос доступа (approval/request от инструментов): разрешить или отклонить.
+   * Исходы протокола однократные; «разрешить всё в этой сессии» — клиентская
+   * настройка: дальше dsh-term отвечает allowed-once без вопросов.
+   */
+  async function answerApproval(params) {
+    const what = `Запрос доступа: ${params.toolName}${params.callId ? ` · ${params.callId}` : ''}`
+    if (state.autoApprove) {
+      log.dim(`· ${what} — разрешено автоматически (авто-режим сессии)`)
+      return { outcome: 'allowed-once' }
+    }
+    log.line(`${C.bold}${what}${C.off}`)
+    if (params.reason) log.dim(`  причина: ${params.reason}`)
+    const picked = await pickListTTY({
+      prompt: 'доступ> ',
+      items: [
+        { id: 'allow', label: 'Разрешить', note: 'однократно' },
+        { id: 'allow-session', label: 'Разрешить всё в этой сессии', note: 'без вопросов до конца сессии' },
+        { id: 'deny', label: 'Отклонить', note: 'агент получит отказ (fail closed)' },
+      ],
+    })
+    if (picked === 'allow') return { outcome: 'allowed-once' }
+    if (picked === 'allow-session') {
+      state.autoApprove = true
+      log.dim('  авто-разрешение включено для этой сессии')
+      return { outcome: 'allowed-once' }
+    }
+    if (picked === 'deny') return { outcome: 'rejected' }
+    log.dim('  запрос отменён (ответ не отправлен как разрешение)')
+    return { outcome: 'cancelled' }
+  }
+
+  // Рантайм СПРАШИВАЕТ клиента: ответить обязан клиент, иначе рантайм fail-closed
+  // (подтверждения → unavailable, вопросы → ошибка инструмента).
+  // На время диалога гасим подпись «Deep diving…» и живой счётчик: их тики пишут в
+  // текущую строку, то есть ровно поверх меню вопроса (мигание «выбор> ↔ Deep diving»).
+  rpc.onRequest = async (method, params) => {
+    trace(`client request ${method}`)
+    const wasAnimating = status.timer !== null
+    stopStatus()
+    UI.asking = true
+    try {
+      if (method === 'user/question') return await answerUserQuestion(params)
+      if (method === 'user/approval') return await answerApproval(params)
+      throw new Error(`unknown client request method: ${method}`)
+    } finally {
+      UI.asking = false
+      if (wasAnimating) startStatus() // модель продолжает ход — подпись возвращается
     }
   }
 
@@ -2799,6 +3242,10 @@ async function main() {
       }
       case 'publish-day': {
         await publishDay(opts.workspace)
+        break
+      }
+      case 'create-project': {
+        await createProject(opts, parts, askLine, promptTurn, state)
         break
       }
       case 'exit': {

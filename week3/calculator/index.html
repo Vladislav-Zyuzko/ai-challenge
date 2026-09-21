@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Калькулятор</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="calculator">
+    <h1 class="calculator__title">Калькулятор</h1>
+    <div id="display" class="display">0</div>
+    <div id="keypad" class="keypad">
+      <button type="button" class="key key--clear" data-key="C">C</button>
+      <button type="button" class="key" data-key="7">7</button>
+      <button type="button" class="key" data-key="8">8</button>
+      <button type="button" class="key" data-key="9">9</button>
+      <button type="button" class="key key--op" data-key="/">÷</button>
+      <button type="button" class="key" data-key="4">4</button>
+      <button type="button" class="key" data-key="5">5</button>
+      <button type="button" class="key" data-key="6">6</button>
+      <button type="button" class="key key--op" data-key="*">×</button>
+      <button type="button" class="key" data-key="1">1</button>
+      <button type="button" class="key" data-key="2">2</button>
+      <button type="button" class="key" data-key="3">3</button>
+      <button type="button" class="key key--op" data-key="-">−</button>
+      <button type="button" class="key" data-key="0">0</button>
+      <button type="button" class="key key--dot" data-key=".">.</button>
+      <button type="button" class="key key--equals" data-key="=">=</button>
+      <button type="button" class="key key--op" data-key="+">+</button>
+    </div>
+  </main>
+  <script type="module" src="./src/app.js"></script>
+</body>
+</html>
