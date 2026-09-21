@@ -68,9 +68,11 @@ function parseRun(name, text) {
     codeBlocks: blocks.length,
     codeLines,
     codeShare: answer.length ? Math.round((codeChars / answer.length) * 100) : 0,
-    headings: (answer.match(/^#{1,6} /gm) ?? []).length,
-    bullets: (answer.match(/^\s*[-*] /gm) ?? []).length,
-    summary: /(^|\n)\s*(#+\s*)?(итого|вывод|резюме|в итоге)/i.test(answer),
+    // Заголовки и списки считаем только ВНЕ блоков кода: строки-комментарии вида
+    // «# Short answer: …» внутри ``` — это не markdown-структура ответа.
+    headings: (prose.match(/^#{1,6} /gm) ?? []).length,
+    bullets: (prose.match(/^\s*[-*] /gm) ?? []).length,
+    summary: /(^|\n)\s*(#+\s*)?(итого|вывод|резюме|в итоге)/i.test(prose),
     emoji: (answer.match(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu) ?? []).length,
     intro: /^(отличн|конечно|разумеется|хорош|давай|давайте)/i.test(answer),
   }

@@ -1,6 +1,6 @@
 ﻿# Проверка автоматической персонализации: профиль дообучается по ходу диалога.
 #
-#   powershell -ExecutionPolicy Bypass -File week2/day12/run-learn.ps1
+#   powershell -ExecutionPolicy Bypass -File week3/day12/run-learn.ps1
 #
 # Сценарий: профиль с одним пунктом → одно сообщение, в котором пользователь явно
 # говорит о своих предпочтениях → /exit. dsh-term фоновым вызовом LLM разбирает
@@ -19,7 +19,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $dshTerm = Join-Path $root 'dsh-term\dsh-term.mjs'
-$here = Join-Path $root 'week2\day12'
+$here = Join-Path $root 'week3\day12'
 $runs = Join-Path $here 'runs'
 New-Item -ItemType Directory -Force -Path $runs | Out-Null
 

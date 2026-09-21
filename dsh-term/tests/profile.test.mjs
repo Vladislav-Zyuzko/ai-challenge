@@ -73,6 +73,7 @@ const checks = [
   ['/profile list видит оба профиля', /t-kratko/.test(text) && /t-podrobno/.test(text)],
   ['переключение профиля', /«Тест подробно» \(t-podrobno\)/.test(text)],
   ['оверлей содержит новый профиль', /Объясняй каждый шаг/.test(afterSwitch)],
+  ['оверлей объявляет приоритет профиля над историей', /Единственный источник правил стиля/.test(afterSwitch)],
   ['/profile off отключил персонализацию', /профиль отключён/.test(text)],
   ['exit code 0', code === 0],
 ]

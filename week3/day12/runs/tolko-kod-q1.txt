@@ -1,22 +1,29 @@
 ```js
+// read-json.mjs
 import { readFile } from 'node:fs/promises';
 
-async function readJson(path) {
-  let text;
+export async function readJson(file) {
+  let raw;
   try {
-    text = await readFile(path, 'utf8');
+    raw = await readFile(file, 'utf8');
   } catch (err) {
-    if (err.code === 'ENOENT') throw new Error(`File not found: ${path}`, { cause: err });
-    if (err.code === 'EACCES') throw new Error(`Permission denied: ${path}`, { cause: err });
+    if (err.code === 'ENOENT') throw new Error(`File not found: ${file}`);
+    if (err.code === 'EACCES') throw new Error(`Permission denied: ${file}`);
     throw err;
   }
 
   try {
-    return JSON.parse(text);
+    return JSON.parse(raw);
   } catch (err) {
-    throw new SyntaxError(`Invalid JSON in ${path}: ${err.message}`, { cause: err });
+    throw new Error(`Invalid JSON in ${file}: ${err.message}`);
   }
 }
+
+// sync variant: readFileSync from 'node:fs' inside the same try/catch layout
+```
+
+```js
+import { readJson } from './read-json.mjs';
 
 try {
   const data = await readJson('./config.json');
@@ -29,7 +36,7 @@ try {
 
 # ===== stderr (метрики) =====
 node.exe : runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
-At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
+At C:\Users\user\Projects\ai-challenge\week3\day12\run.ps1:52 char:15
 +     $stdout = & node @nodeArgs 2> $errFile
 +               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (runtime: deepse...epseek-v4-flash:String) [], RemoteException
@@ -37,11 +44,11 @@ At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
  
 ui: in-tty=0 out-tty=0 colors=0 md=0
 compress: on (compact at 100k tokens, keep last 50k tokens)
-profile: «Только код» (tolko-kod) · ~180 токенов в system prompt · файл: C:\Users\user\.dsh-term\user-profiles\tolko-ko
-d.md
-(queued 9f88714e-c587-4175-a12d-0fe56d19c8ed)
+profile: «Только код» (tolko-kod) · ~259 токенов в system prompt · файл: C:\Users\user\AppData\Local\Temp\dsh-temp-veri
+fy2-home\user-profiles\tolko-kod.md
+(queued cc721a39-eaf2-46ae-bb41-4b9c439853f8)
 ───────────────────────────────────────────────────────────────────────────────
 — turn 1 ended: completed
-  tokens: in 8.2k (cache 0) / out 247
+  tokens: in 8.3k (cache 0) / out 220
   requests: 1 (this turn: 1)
-  context: 8.2k / 1M (0.815%)
+  context: 8.3k / 1M (0.832%)

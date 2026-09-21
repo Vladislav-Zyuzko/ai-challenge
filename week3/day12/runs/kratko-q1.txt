@@ -1,28 +1,21 @@
 ```js
-const fs = require('node:fs/promises');
+import { readFile } from 'node:fs/promises';
 
-async function readJson(path) {
-  let raw;
-  try {
-    raw = await fs.readFile(path, 'utf8');
-  } catch (err) {
-    if (err.code === 'ENOENT') throw new Error(`Файл не найден: ${path}`);
-    if (err.code === 'EACCES') throw new Error(`Нет доступа: ${path}`);
-    throw err;                       // прочие I/O-ошибки наверх
-  }
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    throw new Error(`Некорректный JSON в ${path}: ${err.message}`);
-  }
+try {
+  const data = JSON.parse(await readFile('./config.json', 'utf8'));
+  console.log(data);
+} catch (err) {
+  if (err.code === 'ENOENT') console.error('файл не найден:', err.path);
+  else if (err instanceof SyntaxError) console.error('невалидный JSON:', err.message);
+  else throw err;
 }
 ```
 
-Синхронный вариант: `JSON.parse(fs.readFileSync(path, 'utf8'))` в одном `try/catch`, но различать `err.code === 'ENOENT'` и `err instanceof SyntaxError`. `require('./data.json')` кэширует результат и падает процессом при ошибке — для динамического чтения не годится.
+В CommonJS: `const { readFile } = require('node:fs/promises')` и обёртка в `async`-функции.
 
 # ===== stderr (метрики) =====
 node.exe : runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
-At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
+At C:\Users\user\Projects\ai-challenge\week3\day12\run.ps1:52 char:15
 +     $stdout = & node @nodeArgs 2> $errFile
 +               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (runtime: deepse...epseek-v4-flash:String) [], RemoteException
@@ -30,11 +23,11 @@ At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
  
 ui: in-tty=0 out-tty=0 colors=0 md=0
 compress: on (compact at 100k tokens, keep last 50k tokens)
-profile: «Кратко и по делу» (kratko) · ~197 токенов в system prompt · файл: C:\Users\user\.dsh-term\user-profiles\kratk
-o.md
-(queued dda34f6e-2e03-4f82-96ce-17e701683f6f)
+profile: «Кратко и по делу» (kratko) · ~276 токенов в system prompt · файл: C:\Users\user\AppData\Local\Temp\dsh-temp-v
+erify2-home\user-profiles\kratko.md
+(queued 4d2b26b4-bb2e-47ee-851f-e1ca747c293a)
 ───────────────────────────────────────────────────────────────────────────────
 — turn 1 ended: completed
-  tokens: in 8.2k (cache 7.9k) / out 304
+  tokens: in 8.3k (cache 0) / out 207
   requests: 1 (this turn: 1)
-  context: 8.2k / 1M (0.818%)
+  context: 8.3k / 1M (0.835%)

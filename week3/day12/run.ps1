@@ -1,12 +1,12 @@
 ﻿# Прогон сценария day12: один и тот же набор вопросов с разными профилями
 # пользователя (персонализация) и без него.
 #
-#   powershell -ExecutionPolicy Bypass -File week2/day12/run.ps1
-#   powershell -ExecutionPolicy Bypass -File week2/day12/run.ps1 -Only tolko-kod
+#   powershell -ExecutionPolicy Bypass -File week3/day12/run.ps1
+#   powershell -ExecutionPolicy Bypass -File week3/day12/run.ps1 -Only tolko-kod
 #
 # Каждый прогон — отдельный процесс в one-shot режиме (-p): своя сессия, чистый
 # контекст, никакой персонализации «на лету» (в one-shot профиль не дообучается),
-# поэтому плечи сравнимы. Профили копируются из week2/day12/profiles в
+# поэтому плечи сравнимы. Профили копируются из week3/day12/profiles в
 # <DshHome>\user-profiles — ровно так, как их видит интерактивная сессия.
 param(
   [string]$DshHome = "$env:USERPROFILE\.dsh-term",
@@ -18,7 +18,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $dshTerm = Join-Path $root 'dsh-term\dsh-term.mjs'
-$here = Join-Path $root 'week2\day12'
+$here = Join-Path $root 'week3\day12'
 $runs = Join-Path $here 'runs'
 New-Item -ItemType Directory -Force -Path $runs | Out-Null
 

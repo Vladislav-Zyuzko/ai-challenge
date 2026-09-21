@@ -1,8 +1,14 @@
-Да, если правка независима и пойдёт отдельным PR/ревью (плюс откат и CI изолированы); нет — если она часть текущей задачи, тогда коммит в текущей ветке.
+```bash
+# Short answer: usually no. A branch costs nothing, but review/CI overhead for one line is noise.
+# Do branch when: protected main, required PR review, hotfix/revert isolation, or audit trail needed.
+# Otherwise: commit on main (or current branch), message like "fix(scope): correct off-by-one in X".
+
+git commit -am "fix(scope): correct off-by-one in X"   # one-liner path
+```
 
 # ===== stderr (метрики) =====
 node.exe : runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
-At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
+At C:\Users\user\Projects\ai-challenge\week3\day12\run.ps1:52 char:15
 +     $stdout = & node @nodeArgs 2> $errFile
 +               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (runtime: deepse...epseek-v4-flash:String) [], RemoteException
@@ -10,11 +16,11 @@ At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
  
 ui: in-tty=0 out-tty=0 colors=0 md=0
 compress: on (compact at 100k tokens, keep last 50k tokens)
-profile: «Только код» (tolko-kod) · ~180 токенов в system prompt · файл: C:\Users\user\.dsh-term\user-profiles\tolko-ko
-d.md
-(queued 6ab2b886-bc95-42c0-8ad2-a1c46a74d671)
+profile: «Только код» (tolko-kod) · ~259 токенов в system prompt · файл: C:\Users\user\AppData\Local\Temp\dsh-temp-veri
+fy2-home\user-profiles\tolko-kod.md
+(queued e8bffe29-3ddf-4864-ad30-5c5e8c679a12)
 ───────────────────────────────────────────────────────────────────────────────
 — turn 1 ended: completed
-  tokens: in 8.2k (cache 7.7k) / out 285
+  tokens: in 8.3k (cache 7.9k) / out 254
   requests: 1 (this turn: 1)
-  context: 8.2k / 1M (0.816%)
+  context: 8.3k / 1M (0.832%)

@@ -1,15 +1,13 @@
-`forEach` не ждёт промисы: колбэк async, но результат отбрасывается, поэтому `await save(v)` внутри ничего не даёт. Функция выйдет сразу, не дождавшись `save`, ошибки станут unhandled rejection, порядок и параллелизм не контролируются.
-
-Нужно:
+`forEach` не ждёт промисы: он вызывает async-колбэк и выбрасывает возвращённый промис. В итоге `save` идут параллельно, код после `forEach` выполняется до их завершения, а ошибки становятся unhandled rejection.
 
 ```js
-for (const v of x) await save(v);            // последовательно
-await Promise.all(x.map(v => save(v)));      // параллельно
+for (const v of x) await save(v);          // последовательно
+await Promise.all(x.map(v => save(v)));    // параллельно
 ```
 
 # ===== stderr (метрики) =====
 node.exe : runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
-At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
+At C:\Users\user\Projects\ai-challenge\week3\day12\run.ps1:52 char:15
 +     $stdout = & node @nodeArgs 2> $errFile
 +               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (runtime: deepse...epseek-v4-flash:String) [], RemoteException
@@ -17,11 +15,11 @@ At C:\Users\user\Projects\ai-challenge\week2\day12\run.ps1:52 char:15
  
 ui: in-tty=0 out-tty=0 colors=0 md=0
 compress: on (compact at 100k tokens, keep last 50k tokens)
-profile: «Кратко и по делу» (kratko) · ~197 токенов в system prompt · файл: C:\Users\user\.dsh-term\user-profiles\kratk
-o.md
-(queued 8e2b8eaf-247e-448f-9236-d2bb16f22187)
+profile: «Кратко и по делу» (kratko) · ~276 токенов в system prompt · файл: C:\Users\user\AppData\Local\Temp\dsh-temp-v
+erify2-home\user-profiles\kratko.md
+(queued 7beda150-179b-4a1e-aaa6-5d3be1a5fff9)
 ───────────────────────────────────────────────────────────────────────────────
 — turn 1 ended: completed
-  tokens: in 8.2k (cache 7.8k) / out 186
+  tokens: in 8.4k (cache 7.9k) / out 216
   requests: 1 (this turn: 1)
-  context: 8.2k / 1M (0.819%)
+  context: 8.4k / 1M (0.836%)

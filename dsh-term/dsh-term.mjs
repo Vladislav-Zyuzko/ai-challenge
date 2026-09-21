@@ -1205,9 +1205,17 @@ class RpcClient {
     const guard = new Promise((r) => setTimeout(r, 1200))
     await Promise.race([shutdown, guard])
     try { this.child.stdin.end() } catch {}
+    // Ждём РЕАЛЬНОГО выхода процесса, а не таймаут: рантайм держит kernel-lease
+    // сессии (named semaphore на Windows, flock на POSIX), и пока процесс жив,
+    // следующий рантайм не сможет резюмировать ту же сессию («already owned by
+    // an active write handle»). Поэтому после SIGKILL ждём события exit.
     await new Promise((r) => {
-      const t = setTimeout(() => { try { this.child.kill('SIGKILL') } catch {} r() }, 1500)
-      this.child.once('exit', () => { clearTimeout(t); r() })
+      let done = false
+      const finish = () => { if (!done) { done = true; clearTimeout(t); clearTimeout(hard); r() } }
+      const t = setTimeout(() => { try { this.child.kill('SIGKILL') } catch {} }, 1500)
+      // Страховка: если события exit не будет вовсе, не висим дольше 4 секунд.
+      const hard = setTimeout(finish, 4000)
+      this.child.once('exit', finish)
     })
   }
 }
@@ -2000,14 +2008,51 @@ function writeUserProfile(dshHome, slug, { title, sections }) {
   }
 }
 
+/**
+ * Рамка приоритета: профиль — то, что пользователь выбрал сейчас, поэтому он
+ * старше более ранних договорённостей из переписки. Без неё модель видит два
+ * источника о стиле (профиль в system prompt и история диалога) и в конфликте
+ * выбирает историю как более свежую: наблюдали профиль «только эмодзи», поверх
+ * сессии, где раньше было сказано «эмодзи не нужны» — модель отвечала словами.
+ */
+const USER_PROFILE_PRECEDENCE = [
+  'Пользователь выбрал профиль ниже — это его текущие предпочтения, и они главнее',
+  'всего, что говорилось о стиле, формате, языке, длине ответа и эмодзи в истории',
+  'диалога: прежние такие договорённости, включая те, что ты сам ранее подтверждал,',
+  'отменены выбором профиля. Единственный источник правил стиля — этот профиль.',
+].join('\n')
+
 /** Сколько токенов занимает профиль в промпте (оценка по символам). */
 function userProfileTokens(profile) {
-  return Math.ceil(renderUserProfile(profile).length / 4)
+  return Math.ceil(userProfilePromptText(profile).length / 4)
 }
 
-/** YAML-оверлей: профиль как personaPrefix системного промпта. */
-function userProfileOverlayYaml(text) {
-  const indented = String(text).split('\n').map((l) => `      ${l}`).join('\n')
+/** Текст профиля ровно в том виде, в каком он уходит в system prompt. */
+function userProfilePromptText(profile) {
+  return `${USER_PROFILE_PRECEDENCE}\n\n${renderUserProfile(profile)}`
+}
+
+/**
+ * Объявление профиля для префикса к промпту. Рамки в system prompt недостаточно:
+ * если в переписке раньше звучала просьба о стиле (например «эмодзи не нужны»),
+ * модель держится за неё как за прямое указание пользователя и игнорирует профиль.
+ * Объявление в САМОМ СВЕЖЕМ сообщении (как и контролы --format) даёт профилю
+ * приоритет по свежести — проверено на сессии с противоречащей историей.
+ */
+function profileNoticeText(profile) {
+  return profile
+    ? `Пользователь выбрал профиль «${profile.title}»: его правила стиля, формата, языка и длины ответа действуют с этого сообщения и отменяют прежние договорённости об этом в переписке — даже если раньше звучала просьба наоборот.`
+    : 'Персонализация отключена: прежние правила профиля (стиль, формат, язык, длина ответа) больше не действуют.'
+}
+
+/**
+ * YAML-оверлей: профиль как personaPrefix системного промпта.
+ *
+ * Оверлей пишется из {@link userProfilePromptText} (профиль + рамка приоритета),
+ * а не из «сырого» текста профиля: рамка — часть того, что видит модель.
+ */
+function userProfileOverlayYaml(profile) {
+  const indented = userProfilePromptText(profile).split('\n').map((l) => `      ${l}`).join('\n')
   return [
     '# dsh-term: профиль пользователя в system prompt (personaPrefix).',
     '- id: system-prompt',
@@ -2669,6 +2714,7 @@ async function main() {
     isNew: false,              // сессия создана в этом запуске (для авто-заголовка)
     userProfile: null,         // профиль пользователя (day12) — ставится ниже, до спавна
     profileDirty: false,       // профиль обновился — нужен перезапуск рантайма перед ходом
+    profileNotice: null,       // объявление смены профиля — уходит префиксом к след. промпту
     profileLearning: false,    // фоновый разбор текущего сообщения на персонализацию
   }
   // В one-shot state не сохраняем: прогоны не должны затирать «последнюю сессию»
@@ -2743,16 +2789,22 @@ async function main() {
     if (profile !== null) {
       try {
         mkdirSync(opts.dshHome, { recursive: true })
-        writeFileSync(personaPatchPath, userProfileOverlayYaml(profile.text), 'utf8')
+        writeFileSync(personaPatchPath, userProfileOverlayYaml(profile), 'utf8')
         patches = [...patches, personaPatchPath]
       } catch (e) {
         log.err(`persona patch failed: ${e.message}`)
       }
     }
     opts.patches = patches
-    if (dirty) state.profileDirty = true
+    if (!dirty) return
+    state.profileDirty = true
+    state.profileNotice = profileNoticeText(profile)
   }
   applyUserProfile(userProfile, { dirty: false })
+  // Продолжаем существующую сессию: в её истории могли остаться прежние
+  // договорённости о стиле — объявляем профиль в первом же сообщении, иначе
+  // модель может держаться за историю (проверено на живом случае).
+  if (userProfile !== null && !state.isNew) state.profileNotice = profileNoticeText(userProfile)
 
   let rpc = spawnRuntime(opts, token)
   rpcRef = rpc
@@ -2988,25 +3040,56 @@ async function main() {
    * Перезапустить рантайм с текущими opts (в т.ч. с обновлённым оверлеем профиля)
    * и заново поздороваться. Сессия та же — харнесс её резюмирует, поэтому меняется
    * только системный промпт (personaPrefix) для следующих запросов.
-   * Нужно потому, что system prompt фиксируется при спавне, а профиль в сессии
-   * учится (обновляется после сообщений).
+   * Нужно потому, что system prompt собирается при спавне рантайма, а профиль
+   * обновляется уже в ходе сессии (руками или автообучением).
+   *
+   * Порядок важен: сначала ПОЛНОСТЬЮ гасим прежний рантайм и только потом стартуем
+   * новый. Сессию защищает kernel-lease (named semaphore на Windows, flock на POSIX),
+   * и живой прежний процесс не даст новому её резюмировать — промпт упал бы с
+   * «session … is already owned by an active write handle».
+   *
+   * @returns {Promise<boolean>} удалось ли поднять новый рантайм.
    */
   async function restartRuntime(reason) {
     log.dim(`  перезапуск рантайма: ${reason}`)
     const previous = rpc
+    try { await previous.close() } catch (e) { trace(`previous runtime close: ${e.message}`) }
     const next = spawnRuntime(opts, token)
     rpc = next
     rpcRef = next
     bindRuntime(next)
     try {
       await next.request('initialize', initParams)
+      return true
     } catch (e) {
       log.err(`перезапуск рантайма не удался: ${e.message}`)
+      log.err('  изменения (профиль) в этой сессии не применены — попробуйте /new или перезапустить dsh-term')
+      return false
     }
-    try { await previous.close() } catch {}
   }
 
   bindRuntime(rpc)
+
+  /**
+   * `session/prompt` с повтором на конфликт владения сессией: сразу после
+   * перезапуска рантайма прежний процесс мог ещё не отпустить kernel-lease, и
+   * харнесс отвечает «session … is already owned by an active write handle».
+   * Пауза и повтор проходят, если конфликт был именно из-за этого; если сессию
+   * держит другой живой процесс (второй dsh-term), ошибка уйдёт наружу.
+   */
+  async function requestPrompt(sessionId, text) {
+    const params = { sessionId, contentBlocks: [{ type: 'text', text }] }
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await rpc.request('session/prompt', params)
+      } catch (e) {
+        if (!/already owned by an active write handle/i.test(e.message) || attempt >= 3) throw e
+        const wait = 300 * (attempt + 1)
+        log.dim(`  сессия ещё числится за прежним рантаймом — повтор через ${wait} мс`)
+        await new Promise((r) => setTimeout(r, wait))
+      }
+    }
+  }
 
   function renderEvent(event) {
     switch (event.type) {
@@ -3266,11 +3349,15 @@ async function main() {
       // Профиль мог обновиться фоновым разбором уже ПОСЛЕ записи оверлея —
       // перезапуск с прежним файлом подхватил бы старую версию профиля.
       applyUserProfile(state.userProfile, { dirty: false })
+      let ok = false
       try {
-        await restartRuntime(state.userProfile ? 'профиль пользователя обновлён' : 'профиль пользователя отключён')
+        ok = await restartRuntime(state.userProfile ? 'профиль пользователя обновлён' : 'профиль пользователя отключён')
       } catch (e) {
-        trace(`profile restart failed: ${e.message}`)
+        log.err(`перезапуск рантайма не удался: ${e.message}`)
       }
+      // Без рабочего рантайма отправлять промпт некуда: честно останавливаемся,
+      // иначе модель ответила бы со старым system prompt (без профиля).
+      if (!ok) return false
     }
     const controls = pendingControls
     pendingControls = null // скоуп: применяется только к этому ответу
@@ -3291,6 +3378,8 @@ async function main() {
     try {
       // Мягкие инструкции (формат/длина/стоп-маркер) — префиксом к промпту.
       const instructions = []
+      // Смена профиля объявляется один раз — в первом сообщении после переключения.
+      if (state.profileNotice) { instructions.push(state.profileNotice); state.profileNotice = null }
       if (controls?.format) instructions.push(formatInstruction(controls.format))
       if (controls?.maxChars != null) instructions.push(`Не длиннее ${controls.maxChars} символов в основном ответе.`)
       // Стоп-маркер передаётся С ПРОМТОМ: модель знает, что закончить ответ им,
@@ -3362,10 +3451,7 @@ async function main() {
           log.dim(`· заголовок сессии: «${sum}»`)
         }).catch(() => {})
       }
-      const res = await rpc.request('session/prompt', {
-        sessionId: sendSession,
-        contentBlocks: [{ type: 'text', text: sendText }],
-      })
+      const res = await requestPrompt(sendSession, sendText)
       trace(`prompt queued: ${res.messageId}`)
       log.dim(`(queued ${res.messageId})`)
       startStatus() // модель думает — крутится «Deep diving…»
