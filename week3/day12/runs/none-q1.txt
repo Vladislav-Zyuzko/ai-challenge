@@ -1,0 +1,140 @@
+## Коротко: три способа
+
+```js
+// 1. require (CommonJS) — синхронно, с кэшированием
+const data = require('./config.json'); // SyntaxError при битом JSON
+
+// 2. Синхронно + ручной разбор (гибко по ошибкам)
+const fs = require('node:fs');
+const data = JSON.parse(fs.readFileSync('./config.json', 'utf8'));
+
+// 3. Асинхронно (рекомендуется для сервера)
+const fsp = require('node:fs/promises');
+const data = JSON.parse(await fsp.readFile('./config.json', 'utf8'));
+```
+
+## Правильная обработка ошибок
+
+Ошибки бывают **двух разных типов**, и обрабатывать их нужно раздельно:
+
+| Что произошло | Тип ошибки | Как отличить |
+|---|---|---|
+| Файла нет | `Error` | `err.code === 'ENOENT'` |
+| Нет прав | `Error` | `err.code === 'EACCES'` / `'EPERM'` |
+| Это каталог | `Error` | `err.code === 'EISDIR'` |
+| Битый JSON | `SyntaxError` | `err instanceof SyntaxError` |
+
+### Асинхронный вариант (fs.promises)
+
+```js
+const fs = require('node:fs/promises');
+
+async function readJson(file) {
+  let text;
+  try {
+    text = await fs.readFile(file, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') throw new Error(`Файл не найден: ${file}`);
+    if (err.code === 'EACCES') throw new Error(`Нет прав на чтение: ${file}`);
+    throw err; // неизвестная ошибка I/O — не глотаем
+  }
+
+  try {
+    return JSON.parse(text.replace(/^\uFEFF/, '')); // срезаем BOM
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw new Error(`Некорректный JSON в ${file}: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+// использование
+try {
+  const config = await readJson('./config.json');
+  console.log(config);
+} catch (err) {
+  console.error(err.message);
+  process.exitCode = 1;
+}
+```
+
+### Синхронный вариант (для скриптов, CLI, старта приложения)
+
+```js
+const fs = require('node:fs');
+
+function readJsonSync(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') throw new Error(`Файл не найден: ${file}`);
+    throw err;
+  }
+  try {
+    return JSON.parse(text.replace(/^\uFEFF/, ''));
+  } catch (err) {
+    throw new Error(`Некорректный JSON в ${file}: ${err.message}`);
+  }
+}
+```
+
+### Callback-стиль (старый API)
+
+```js
+const fs = require('node:fs');
+
+fs.readFile('./config.json', 'utf8', (err, text) => {
+  if (err) {
+    if (err.code === 'ENOENT') return console.error('Файла нет');
+    return console.error('Ошибка чтения:', err.message);
+  }
+  try {
+    const data = JSON.parse(text);
+    console.log(data);
+  } catch (e) {
+    console.error('Битый JSON:', e.message);
+  }
+});
+```
+
+## ESM: JSON через import
+
+```js
+// Node.js 22+ (стабильно), 20.10+ — с флагом/в новых версиях
+import config from './config.json' with { type: 'json' };
+
+// Или универсально — через fs
+import { readFile } from 'node:fs/promises';
+const config2 = JSON.parse(await readFile(new URL('./config.json', import.meta.url), 'utf8'));
+```
+
+> При `import ... with { type: 'json' }` битый JSON падает на этапе загрузки модуля — поймать и обработать красиво нельзя, поэтому для пользовательских данных предпочитайте `readFile` + `JSON.parse`.
+
+## Частые подводные камни
+
+- **Всегда указывайте `'utf8'`** — иначе получите `Buffer` (работает, но неявно) и рискуете спутать кодировку.
+- **BOM** (`EF BB BF` в начале файла) ломает `JSON.parse` → срезайте `\uFEFF`.
+- **Не «глотайте» ошибку** пустым `catch {}` — логируйте `err.message` или `err.code`.
+- **`require` кэширует** результат: повторный вызов вернёт тот же объект, изменения файла не подхватятся.
+- **Синхронное чтение блокирует event loop** — в HTTP-сервере используйте `fs.promises`.
+- `JSON.parse` не принимает комментарии и висячие запятые — при необходимости используйте `JSON5` или `jsonc-parser`.
+- Для больших файлов вместо `JSON.parse` всего текста можно взять потоковый парсер (`stream-json`).
+
+# ===== stderr (метрики) =====
+node.exe : runtime: deepseek-harness-sdk-runtime 0.0.1 · provider=deepseek-official model=deepseek-v4-flash
+At C:\Users\user\Projects\ai-challenge\week3\day12\run.ps1:52 char:15
++     $stdout = & node @nodeArgs 2> $errFile
++               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (runtime: deepse...epseek-v4-flash:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ui: in-tty=0 out-tty=0 colors=0 md=0
+compress: on (compact at 100k tokens, keep last 50k tokens)
+(queued 248f508b-70b6-4253-af8e-d83568f9f325)
+───────────────────────────────────────────────────────────────────────────────
+— turn 1 ended: completed
+  tokens: in 8k (cache 7.8k) / out 1.9k
+  requests: 1 (this turn: 1)
+  context: 8k / 1M (0.795%)
