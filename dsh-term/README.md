@@ -89,6 +89,10 @@ dsh-term --dsh-home C:\Users\<you>\.dsh
 | `--window <n>` | N сообщений для стратегий `sliding`/`facts`/`branch` (default 6; env `DSH_TERM_WINDOW`) |
 | `--with-profiles` | выбрать **профиль пользователя** из меню в начале сессии (или создать первый) |
 | `--user-profile <slug>` | включить конкретный профиль сразу, без меню (env `DSH_TERM_USER_PROFILE`) — для скриптов и прогонов |
+| `--mcp <preset>` | подключить MCP-сервер (сейчас `github`); инструменты появятся у модели как `mcp__<сервер>__<тул>` |
+| `--mcp-toolsets <list\|all>` | тулсеты MCP-сервера: список через запятую (default `context,repos,issues,pull_requests`) или `all` |
+| `--mcp-readwrite` | снять режим «только чтение» у MCP-пресета (по умолчанию `readonly`) |
+| `--mcp-check [preset]` | диагностика без сессии: соединение + список инструментов (`--offline` — только оверлей) |
 | `--session <id>` | продолжить конкретную сессию (синоним: `--resume <id>`) |
 | `--workspace <path>` | рабочая папка сессий (default: текущая) |
 | `--dsh-bin <path>` | путь к `dsh` (default: `dsh` из PATH) |
@@ -405,6 +409,42 @@ dsh> /branch b            # переключиться на ветку B
 
 Сравнение трёх профилей на одном наборе вопросов — `week3/day12`.
 
+## MCP: внешние серверы инструментов (day16)
+
+MCP-серверы подключаются **мостом самого харнесса** — `@deepseek-ai/dsh-mcp-client`
+(он уже есть в установке и резолвится из профиля `sdk`, но по умолчанию не смонтирован).
+`dsh-term` включает его оверлеем `insert`, тем же механизмом, что и `ask_user_question`:
+
+```yaml
+- insert:
+    - id: mcp-github
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: github
+        transport: streamable-http
+        url: https://api.githubcopilot.com/mcp/
+        headers:
+          Authorization: !!js '`Bearer ${process.env.GITHUB_MCP_TOKEN}`'
+          'X-MCP-Readonly': 'true'
+          'X-MCP-Toolsets': 'context,repos,issues,pull_requests'
+```
+
+- **Секретов в файле нет**: `Authorization` — выражение `!!js`, которое загрузчик
+  харнесса исполняет при активации строки; сам токен `dsh-term` берёт из `gh auth token`
+  и передаёт в окружение рантайма (`GITHUB_MCP_TOKEN`) только на время процесса.
+- **Инструменты модели** видны как `mcp__github__<tool>` — например `mcp__github__get_me`.
+  В UI вызов рисуется компактно: `⛭ github/get_me owner=…`.
+- **Режимы** режут цену: по умолчанию `readonly` + четыре тулсета (25 инструментов),
+  `--mcp-toolsets all --mcp-readwrite` включает всё (45). Описания и схемы инструментов
+  уходят в **каждый** запрос, поэтому цена растёт вместе с набором (замеры — `week4/day16.md`).
+- **Диагностика без сессии**: `dsh-term --mcp-check github` подключается к серверу,
+  вызывает `tools/list` и печатает инструменты с оценкой их цены; `--offline` собирает
+  оверлей и выходит, не трогая сеть.
+- **В сессии**: `/mcp` — что подключено, режим, цена, url; `/mcp tools` — полный список
+  инструментов; `/mcp refresh` — переподключиться и пересчитать.
+- Если строка MCP уже есть в пользовательском слое профиля (`profiles/<p>/cordis.patch.yml`),
+  оверлей не добавляется: `insert` не идемпотентен и дубликат id валит дерево плагинов.
+
 ## Команды REPL
 
 ```
@@ -416,6 +456,8 @@ dsh> /branch b            # переключиться на ветку B
 /context         контекст: стратегия, facts, метрики, последний summary
 /profile [show|list|use <slug>|new|off]
                  профиль пользователя (персонализация): показать, сменить, создать, выключить
+/mcp [show|tools|refresh]
+                 MCP-серверы: соединение, список инструментов и их цена в промпте
 /resume [id]     продолжить сессию: по id или выбором из списка
 /new             начать новую сессию
 /token           сменить сохранённый API ключ
@@ -468,6 +510,7 @@ dsh> /branch b            # переключиться на ветку B
 | `asking-flicker.test.mjs` | пока на экране вопрос/подтверждение, подпись «Deep diving…» и счётчик не перерисовываются поверх меню |
 | `editor-wrap.test.mjs` | ввод длиннее терминала не дублирует строку `dsh> ` при переносе (`DSH_TEST_FAKE_STDIN=1` включает TTY-редактор) |
 | `profile.test.mjs` | персонализация: профиль подхватывается на старте, `/profile list\|use\|off` работают, оверлей `personaPrefix` пишется с новым профилем (модель не вызывается) |
+| `mcp.test.mjs` | MCP-оверлей: insert-строка для `dsh-mcp-client`, `readonly`/тулсеты по умолчанию и их переключение, отсутствие секрета в файле, коды выхода `--mcp-check` (без сети) |
 
 ## Примечания
 
