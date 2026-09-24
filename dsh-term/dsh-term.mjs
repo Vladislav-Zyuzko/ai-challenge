@@ -2234,6 +2234,21 @@ const MCP_PRESETS = {
     readonly: true,
     toolsets: 'context,repos,issues,pull_requests',
   },
+  // Свой MCP-сервер вокруг личного трекера задач (проект `sl-tracker-mcp`).
+  // Адрес и токен берутся из окружения: развёртывание у каждого своё, а сам сервер
+  // работает по стандартному MCP и про dsh ничего не знает.
+  // Заголовков тулсетов/readonly у него нет — режим чтения/записи задан на его стороне.
+  sltracker: {
+    serverName: 'sltracker',
+    title: 'SL Tracker MCP (личный трекер задач)',
+    url: 'https://mcp.72-56-41-79.sslip.io:8443/mcp',
+    urlEnv: 'SL_MCP_URL',
+    tokenEnv: 'SL_MCP_TOKEN',
+    tokenFromEnv: 'SL_MCP_TOKEN',
+    readonly: false,
+    toolsets: '',
+    what: 'создание задачи, правка описания, комментарий, чтение, смена статуса, справочник очередей',
+  },
 }
 const MCP_DEFAULT_PRESET = 'github'
 const MCP_FULL_TOOLSETS = 'all'
@@ -2257,8 +2272,12 @@ function resolveMcpServers(opts) {
     if (!name) continue
     const preset = MCP_PRESETS[name]
     if (!preset) { unknown.push(name); continue }
+    // Адрес может подсказываться окружением: у своего MCP-сервера развёртывание
+    // у каждого своё, и дефолт в пресете — просто удобная точка входа.
+    const urlFromEnv = preset.urlEnv ? String(process.env[preset.urlEnv] ?? '').trim() : ''
     servers.push({
       ...preset,
+      url: urlFromEnv || preset.url,
       readonly: opts.mcpReadwrite === true ? false : preset.readonly,
       toolsets: opts.mcpToolsets === undefined
         ? preset.toolsets
@@ -2384,12 +2403,20 @@ async function mcpProbe(server, { timeoutMs = 20000 } = {}) {
 }
 
 /**
- * Добрать токены для пресетов, которые берут их из `gh` (в файл они не попадут:
- * уйдут в env рантайма, а оверлей прочитает их выражением `!!js`).
+ * Добрать токены для пресетов: из `gh auth token` (GitHub) или из окружения
+ * (свой MCP-сервер). В файл токены не попадут — уйдут в env рантайма, а оверлей
+ * прочитает их выражением `!!js`.
  */
 function mcpAttachTokens(servers) {
   for (const s of servers) {
-    if (!s.tokenFromGh || s.token) continue
+    if (s.token) continue
+    if (s.tokenFromEnv) {
+      const value = String(process.env[s.tokenFromEnv] ?? '').trim()
+      if (value) s.token = value
+      else s.tokenError = `не задана переменная ${s.tokenFromEnv} с токеном MCP-клиента`
+      continue
+    }
+    if (!s.tokenFromGh) continue
     const r = runGh(['auth', 'token'])
     if (r.ok && r.out) s.token = r.out
     else s.tokenError = r.err || 'gh auth token недоступен — нужен `gh auth login`'
@@ -3131,16 +3158,26 @@ async function main() {
       if (s.tokenError) log.err(`mcp ${s.serverName}: ${s.tokenError}`)
       if (s.tokenEnv && s.token) mcpEnv[s.tokenEnv] = s.token
     }
-    try {
-      mkdirSync(opts.dshHome, { recursive: true })
-      writeFileSync(mcpPatchPath, mcpPatchYaml(mcpServers), 'utf8')
-      if (profileHasMcpRow(opts.dshHome, opts.profile, mcpServers[0].serverName)) {
-        log.dim('mcp: строка уже есть в пользовательском слое профиля — оверлей не подключаю (insert не идемпотентен)')
-      } else {
-        opts.patches = [...(opts.patches ?? []), mcpPatchPath]
+    // Сервер без токена не подключаем вовсе: иначе в промпт уехал бы битый MCP-клиент,
+    // который на каждый вызов отвечает 401, а причина потерялась бы в логах.
+    const usable = mcpServers.filter((s) => !s.tokenError)
+    if (usable.length !== mcpServers.length) {
+      log.dim('mcp: серверы без токена пропущены — сессия продолжается без них')
+      mcpServers.length = 0
+      mcpServers.push(...usable)
+    }
+    if (mcpServers.length) {
+      try {
+        mkdirSync(opts.dshHome, { recursive: true })
+        writeFileSync(mcpPatchPath, mcpPatchYaml(mcpServers), 'utf8')
+        if (profileHasMcpRow(opts.dshHome, opts.profile, mcpServers[0].serverName)) {
+          log.dim('mcp: строка уже есть в пользовательском слое профиля — оверлей не подключаю (insert не идемпотентен)')
+        } else {
+          opts.patches = [...(opts.patches ?? []), mcpPatchPath]
+        }
+      } catch (e) {
+        log.err(`mcp patch failed: ${e.message}`)
       }
-    } catch (e) {
-      log.err(`mcp patch failed: ${e.message}`)
     }
   }
   opts.mcpEnv = mcpEnv
