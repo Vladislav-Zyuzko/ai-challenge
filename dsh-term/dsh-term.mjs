@@ -2260,6 +2260,25 @@ const MCP_PATCH_NAME = 'dsh-term-mcp.patch.yml'
 const MCP_REGISTERED_RATIO = 0.46
 
 /**
+ * Нормализовать адрес MCP-эндпоинта: `https://host:port` и `https://host:port/mcp`
+ * должны работать одинаково. Ошибка тут стоит дорого: при адресе без `/mcp` запрос уходит
+ * в catch-all Caddy, сервер отвечает 404, MCP-инструменты не подключаются — и агент,
+ * пытаясь выяснить причину, тратит токены на диагностику вместо работы.
+ */
+function mcpNormalizeUrl(raw) {
+  const url = String(raw ?? '').trim().replace(/\/+$/, '')
+  if (!url) return url
+  try {
+    const parsed = new URL(url)
+    const path = parsed.pathname.replace(/\/+$/, '')
+    if (path === '' || path === '/') parsed.pathname = '/mcp'
+    return parsed.toString().replace(/\/+$/, '')
+  } catch {
+    return url.endsWith('/mcp') ? url : `${url}/mcp`
+  }
+}
+
+/**
  * Разобрать флаги MCP в список серверов.
  * @param {{mcp?: string[], mcpToolsets?: string, mcpReadwrite?: boolean}} opts
  * @returns {{servers: Array<object>, unknown: string[]}}
@@ -2277,7 +2296,7 @@ function resolveMcpServers(opts) {
     const urlFromEnv = preset.urlEnv ? String(process.env[preset.urlEnv] ?? '').trim() : ''
     servers.push({
       ...preset,
-      url: urlFromEnv || preset.url,
+      url: mcpNormalizeUrl(urlFromEnv || preset.url),
       readonly: opts.mcpReadwrite === true ? false : preset.readonly,
       toolsets: opts.mcpToolsets === undefined
         ? preset.toolsets

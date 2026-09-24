@@ -16,12 +16,19 @@ const url = process.env.SL_MCP_URL ?? 'http://127.0.0.1:8080'
 const token = process.env.SL_MCP_TOKEN ?? ''
 const issueKey = process.argv[2]
 
+/** Принимаем и `https://host:port`, и `https://host:port/mcp` — приводим к эндпоинту. */
+const endpoint = (() => {
+  const trimmed = url.trim().replace(/\/+$/, '')
+  if (/\/mcp$/.test(trimmed)) return trimmed
+  return `${trimmed}/mcp`
+})()
+
 if (!token) {
   process.stderr.write('нужен SL_MCP_TOKEN — токен MCP-клиента (не токен трекера)\n')
   process.exit(1)
 }
 
-const transport = new StreamableHTTPClientTransport(new URL(`${url}/mcp`), {
+const transport = new StreamableHTTPClientTransport(new URL(endpoint), {
   requestInit: { headers: { Authorization: `Bearer ${token}` } },
 })
 const client = new Client({ name: 'sl-tracker-mcp-smoke', version: '0.1.0' })

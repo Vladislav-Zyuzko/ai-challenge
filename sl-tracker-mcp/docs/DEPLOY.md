@@ -68,15 +68,50 @@ curl -s -o /dev/null -w '%{http_code}\n' https://tracker.72-56-41-79.sslip.io:84
 
 ---
 
-## Шаг 3. Положить код MCP-сервера на сервер
+## Шаг 2б. Если браузера под рукой нет: выпустить PAT через API
+
+Штатный путь — экран (шаг 2). Если нужно выпустить токен без браузера (например, при
+первичном выкате с машины без доступа к UI), можно сделать это, оставаясь в рамках API и
+схемы БД: создать **временную** cookie-сессию владельца тем же способом, что и OAuth-колбэк
+(HMAC-SHA256 от верификатора с `SESSION_SECRET`), вызвать штатный `POST /api/tokens` и сразу
+удалить временную сессию. Сервер при этом не меняется, код токена не дублируется —
+токен выдаёт сам трекер.
+
+Порядок (выполняется на сервере, скрипт — `scripts/mint-pat.cjs` в этом каталоге):
 
 ```bash
-sudo mkdir -p /opt/sl-tracker-mcp && sudo chown "$USER" /opt/sl-tracker-mcp
-git clone https://github.com/Vladislav-Zyuzko/ai-challenge.git /opt/sl-tracker-mcp
-ls /opt/sl-tracker-mcp/sl-tracker-mcp      # здесь Dockerfile — это и есть build context
+API="$(docker ps -qf name=sl-tracker-api | head -1)"
+docker cp scripts/mint-pat.cjs "$API:/app/mint-pat.cjs"
+docker exec "$API" node /app/mint-pat.cjs > /root/pat.json   # в файле — сам токен
+chmod 600 /root/pat.json
+# токен → MCP_SL_API_TOKEN в .env, файл удалить
+rm /root/pat.json
+# временную cookie-сессию удалить по id из temporarySessionId (в pat.json)
 ```
 
-Обновление потом — `cd /opt/sl-tracker-mcp && git pull`.
+Оговорки: это владельческая операция (сессия создаётся владельцу инстанса), она оставляет
+в БД только PAT, а временную сессию надо удалить; всё, что делает скрипт, — то же, что делает
+кнопка «Создать» в интерфейсе.
+
+---
+
+## Шаг 3. Положить код MCP-сервера на сервер
+
+Проект лежит **прямо в `/opt/sl-tracker-mcp`** (это и есть build context — вложенного каталога нет).
+Репозиторий `ai-challenge` целиком на сервер тащить не нужно: копируется только `sl-tracker-mcp/`.
+
+```bash
+# вариант А: с локальной машины (так выкатывалось в первый раз)
+tar -czf sl-tracker-mcp.tgz -C sl-tracker-mcp --exclude=node_modules --exclude=dist .
+scp sl-tracker-mcp.tgz root@72.56.41.79:/root/
+ssh root@72.56.41.79 'mkdir -p /opt/sl-tracker-mcp && tar -xzf /root/sl-tracker-mcp.tgz -C /opt/sl-tracker-mcp && rm /root/sl-tracker-mcp.tgz'
+
+# вариант Б: держать на сервере клон ai-challenge и обновлять из него
+#   git clone https://github.com/Vladislav-Zyuzko/ai-challenge.git /opt/ai-challenge
+#   dann MCP_BUILD_CONTEXT=/opt/ai-challenge/sl-tracker-mcp
+```
+
+Проверка: `ls /opt/sl-tracker-mcp/Dockerfile` — файл на месте.
 
 ---
 
@@ -94,18 +129,18 @@ nano .env
 # --- MCP-сервер -------------------------------------------------------------
 COMPOSE_PROFILES=mcp
 SL_MCP_DOMAIN=mcp.72-56-41-79.sslip.io
-MCP_BUILD_CONTEXT=/opt/sl-tracker-mcp/sl-tracker-mcp
+MCP_BUILD_CONTEXT=/opt/sl-tracker-mcp
 
 # PAT из шага 2 (не клиентский токен!)
 MCP_SL_API_TOKEN=<токен из экрана «Токены доступа»>
 # токен, которым клиенты (dsh-term, Claude Code) представляются MCP-серверу:
 MCP_CLIENT_TOKEN=<вывод: openssl rand -hex 32>
 
-MCP_DEFAULT_QUEUE=SL
+# очередь по умолчанию и разрешённые очереди — по факту проекта sweet-limit:
+MCP_DEFAULT_QUEUE=INFRA
 # 1 — только чтение; для создания задач и комментариев нужно 0
 MCP_READONLY=0
-# очереди, куда вообще разрешена запись; пусто — все (безопаснее сузить)
-MCP_ALLOWED_QUEUES=
+MCP_ALLOWED_QUEUES=INFRA,MOBILE
 MCP_LOG_LEVEL=info
 ```
 
@@ -180,30 +215,42 @@ curl -sS -o /dev/null -w 'без токена: %{http_code}\n' -X POST https://m
 ```
 
 Полноценная проверка «клиент → MCP → трекер» (список инструментов, справочник очередей):
+запускается **с машины, где есть Node** — на сервере Node нет, а сам скрипт в образ не попадает
+(он диагностический, не часть рантайма).
 
 ```bash
-cd /opt/sl-tracker-mcp/sl-tracker-mcp
+# на своей машине, в каталоге sl-tracker-mcp репозитория ai-challenge:
+npm install
 SL_MCP_URL=https://mcp.72-56-41-79.sslip.io:8443 \
 SL_MCP_TOKEN=<MCP_CLIENT_TOKEN из .env> \
-node --import tsx scripts/smoke-live.ts
+node --import tsx scripts/smoke-live.ts            # + ключ задачи, если нужно прочитать: … INFRA-4
 ```
 
 Ожидаемое: `✔ соединение … установлено`, `✔ инструментов: 6 — create_task, update_task_description,
-add_comment, get_task, set_task_status, list_queues`, затем список очередей со статусами.
-Если передать ключ задачи (`… scripts/smoke-live.ts SL-1`), он ещё и прочитает задачу.
+add_comment, get_task, set_task_status, list_queues`, затем очереди со статусами.
 
-> Этот же скрипт удобно запускать **с локальной машины** — он ходит по публичному URL.
+Проверка без Node (прямо на сервере, curl-ом) — рукопожатие и список инструментов:
+
+```bash
+CLIENT="$(grep -E '^MCP_CLIENT_TOKEN=' /opt/sl-tracker/.env | cut -d= -f2-)"
+curl -sS -X POST https://mcp.72-56-41-79.sslip.io:8443/mcp \
+  -H "Authorization: Bearer $CLIENT" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
 
 ---
 
 ## Шаг 8. Подключить MCP к dsh-term
 
 dsh-term уже умеет это из коробки: пресет `sltracker`, адрес и токен — из окружения.
+Канонический адрес — `https://mcp.72-56-41-79.sslip.io:8443/mcp`; если указать без `/mcp`,
+dsh-term сам допишет (и наоборот — лишний слэш срежет).
 
 **Windows PowerShell (разово, текущая сессия):**
 
 ```powershell
-$env:SL_MCP_URL   = 'https://mcp.72-56-41-79.sslip.io:8443/mcp'
+$env:SL_MCP_URL   = 'https://mcp.72-56-41-79.sslip.io:8443'      # или …/mcp — равнозначно
 $env:SL_MCP_TOKEN = '<MCP_CLIENT_TOKEN>'
 node dsh-term\dsh-term.mjs --mcp sltracker
 ```
@@ -337,13 +384,24 @@ docker compose -f infra/compose/docker-compose.prod.yml --env-file .env exec cad
 
 ```
 [ ] 1. sl-tracker develop выкачен, /api/health 200, /api/tokens → 401
-[ ] 2. PAT выпущен в UI (365 дней), скопирован
-[ ] 3. ai-challenge склонирован в /opt/sl-tracker-mcp
-[ ] 4. .env: COMPOSE_PROFILES=mcp, SL_MCP_DOMAIN, MCP_BUILD_CONTEXT,
-       MCP_SL_API_TOKEN, MCP_CLIENT_TOKEN, MCP_DEFAULT_QUEUE, MCP_READONLY
+[ ] 2. PAT выпущен (экран «Токены доступа» или шаг 2б без браузера), 365 дней
+[ ] 3. код MCP лежит в /opt/sl-tracker-mcp (только проект, без ai-challenge)
+[ ] 4. .env: COMPOSE_PROFILES=mcp, SL_MCP_DOMAIN, MCP_BUILD_CONTEXT=/opt/sl-tracker-mcp,
+       MCP_SL_API_TOKEN, MCP_CLIENT_TOKEN, MCP_DEFAULT_QUEUE, MCP_READONLY, MCP_ALLOWED_QUEUES
 [ ] 5. caddy validate → Valid configuration
-[ ] 6. build mcp && up -d && ps (healthy) && logs без ошибок
-[ ] 7. /healthz 200, POST /mcp без токена → 401, smoke-live.ts → 6 инструментов и очереди
+[ ] 6. build mcp && up -d && ps (mcp healthy) && logs без ошибок
+[ ] 7. /healthz 200, POST /mcp без токена → 401, чужой Origin → 403,
+       smoke-live.ts → 6 инструментов и очереди трекера
 [ ] 8. dsh-term --mcp sltracker: на старте «6 tools», /mcp tools показывает список
 [ ] 9. Задача, созданная агентом, видна в трекере и подписана твоим именем
 ```
+
+## Что уже развёрнуто (24.09.2026)
+
+| | |
+|---|---|
+| MCP-сервер | `https://mcp.72-56-41-79.sslip.io:8443/mcp` (контейнер `sl-tracker-mcp`, профиль `mcp`, наружу не публикуется) |
+| Код на сервере | `/opt/sl-tracker-mcp` (только проект MCP) |
+| Права | PAT владельца `zyuzko2002`, срок 365 дней, `MCP_READONLY=0`, очереди `INFRA,MOBILE` |
+| Проверено | `/healthz` → 200, без токена → 401, чужой `Origin` → 403, `smoke-live` → 6 инструментов и очереди трекера |
+| Сквозная проверка | агент в dsh-term создал `INFRA-4` («Проверка MCP-сервера»), добавил комментарий и перевёл в `in_progress`; автор — владелец токена |

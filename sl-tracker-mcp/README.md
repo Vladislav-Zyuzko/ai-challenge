@@ -95,6 +95,10 @@ docker run --rm -p 8080:8080 -e SL_API_URL=http://api:3000 \
 
 ## Подключение клиентов
 
+**Канонический адрес эндпоинта — с путём `/mcp`**: `https://mcp.72-56-41-79.sslip.io:8443/mcp`.
+Адрес без пути тоже принимается (dsh-term и `scripts/smoke-live.ts` дописывают `/mcp` сами) —
+это защита от 404 из catch-all прокси, который стоит за этим доменом.
+
 **dsh-term** (в `ai-challenge`): `dsh-term --mcp sltracker` — пресет с URL и токеном;
 инструменты видны модели как `mcp__sltracker__<tool>`.
 
