@@ -1,11 +1,15 @@
 /**
- * Живая проверка MCP-сервера: соединение, список инструментов, справочник очередей
- * и (если задан ключ) чтение задачи. Нужна на выкате — «агент вызвал инструмент
- * и получил результат», но без агента.
+ * Живая проверка MCP-сервера: соединение, список инструментов, справочник очередей,
+ * список активных задач очереди и (если задан ключ) чтение задачи с комментариями.
+ * Нужна на выкате — «агент вызвал инструмент и получил результат», но без агента.
  *
  * Запуск (сервер уже поднят, локально или на сервере):
  *   SL_MCP_URL=http://127.0.0.1:8080 SL_MCP_TOKEN=<токен клиента> \
  *   node --import tsx scripts/smoke-live.ts [КЛЮЧ-ЗАДАЧИ]
+ *
+ * Что смотреть: SL_SMOKE_QUEUE (по умолчанию INFRA) и SL_SMOKE_STATUSES
+ * (по умолчанию in_progress,review,testing) — это тот же путь, которым ходит
+ * сервис дайджеста из sl-claude-box.
  *
  * Код возврата: 0 — всё хорошо, 1 — что-то не сработало (можно вставлять в чек-лист выката).
  */
@@ -52,12 +56,25 @@ try {
   const queues = await client.callTool({ name: 'list_queues', arguments: {} })
   process.stdout.write('\n--- list_queues ---\n' + textOf(queues) + '\n')
 
-  let bad = failed(queues)
+  // Тот же путь, которым ходит сервис дайджеста: очередь → активные задачи.
+  const queueKey = process.env.SL_SMOKE_QUEUE ?? 'INFRA'
+  const statuses = process.env.SL_SMOKE_STATUSES ?? 'in_progress,review,testing'
+  const issues = await client.callTool({
+    name: 'list_issues',
+    arguments: { queue: queueKey, status: statuses },
+  })
+  process.stdout.write(`\n--- list_issues ${queueKey} (${statuses}) ---\n` + textOf(issues) + '\n')
+
+  let bad = failed(queues) || failed(issues)
 
   if (issueKey !== undefined) {
     const issue = await client.callTool({ name: 'get_task', arguments: { key: issueKey, includeComments: true } })
     process.stdout.write(`\n--- get_task ${issueKey} ---\n` + textOf(issue) + '\n')
-    bad = bad || failed(issue)
+
+    const comments = await client.callTool({ name: 'list_comments', arguments: { key: issueKey, limit: 5 } })
+    process.stdout.write(`\n--- list_comments ${issueKey} ---\n` + textOf(comments) + '\n')
+
+    bad = bad || failed(issue) || failed(comments)
   }
 
   await client.close()

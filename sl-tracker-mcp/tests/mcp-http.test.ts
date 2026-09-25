@@ -43,6 +43,49 @@ async function startServer(overrides: Record<string, string> = {}): Promise<Runn
   return { url: `http://127.0.0.1:${port}`, handle, config, tracker }
 }
 
+/**
+ * Данные для проверки списков: одна задача в работе с исполнителем и один комментарий,
+ * одна закрытая. Кладём прямо в стенд, чтобы порядок тестов не влиял на ключи.
+ */
+function seedQueue(tracker: FakeTracker): void {
+  const now = new Date().toISOString()
+  const base = {
+    description: null,
+    storyPoints: null,
+    author: { id: 'u-1', displayName: 'Борис Участников', avatarUrl: null },
+    project: { slug: 'sladkiy-limit', name: 'Сладкий Лимит' },
+    createdAt: now,
+    updatedAt: now,
+  }
+  tracker.issues.set('OPS-1', {
+    ...base,
+    key: 'OPS-1',
+    title: 'Почистить диск на проде',
+    statusId: 'st-progress',
+    priority: 70,
+    assignee: { id: 'u-2', displayName: 'Вячеслав Зюзько', avatarUrl: null },
+    queue: { key: 'OPS', name: 'Эксплуатация' },
+  })
+  tracker.issues.set('OPS-2', {
+    ...base,
+    key: 'OPS-2',
+    title: 'Обновить сертификаты',
+    statusId: 'st-done',
+    priority: 30,
+    assignee: null,
+    queue: { key: 'OPS', name: 'Эксплуатация' },
+  })
+  tracker.comments.set('OPS-1', [
+    {
+      id: 'c-1',
+      body: 'уже смотрю, диск переполнен логами',
+      author: { id: 'u-1', displayName: 'Борис Участников', avatarUrl: null },
+      createdAt: now,
+      editedAt: null,
+    },
+  ])
+}
+
 describe('MCP поверх Streamable HTTP', () => {
   let running: Running & { tracker: FakeTracker }
 
@@ -95,19 +138,28 @@ describe('MCP поверх Streamable HTTP', () => {
     const { client, close } = await connectHttpClient(running.url, CLIENT_TOKEN)
     try {
       const tools = await client.listTools()
-      assert.equal(tools.tools.length, 6)
+      assert.equal(tools.tools.length, 8)
     } finally {
       await close()
     }
   })
 
-  it('tools/list возвращает шесть инструментов с описаниями и схемами', async () => {
+  it('tools/list возвращает восемь инструментов с описаниями и схемами', async () => {
     const { client, close } = await connectHttpClient(running.url, CLIENT_TOKEN)
     try {
       const { tools } = await client.listTools()
       assert.deepEqual(
         tools.map((tool) => tool.name).sort(),
-        ['add_comment', 'create_task', 'get_task', 'list_queues', 'set_task_status', 'update_task_description'],
+        [
+          'add_comment',
+          'create_task',
+          'get_task',
+          'list_comments',
+          'list_issues',
+          'list_queues',
+          'set_task_status',
+          'update_task_description',
+        ],
       )
       for (const tool of tools) {
         assert.ok((tool.description ?? '').length > 20, `${tool.name}: нет описания`)
@@ -116,19 +168,93 @@ describe('MCP поверх Streamable HTTP', () => {
       // Читающие инструменты помечены readOnly, изменяющие — destructive.
       const byName = new Map(tools.map((tool) => [tool.name, tool]))
       assert.equal(byName.get('get_task')?.annotations?.readOnlyHint, true)
+      assert.equal(byName.get('list_issues')?.annotations?.readOnlyHint, true)
+      assert.equal(byName.get('list_comments')?.annotations?.readOnlyHint, true)
       assert.equal(byName.get('create_task')?.annotations?.destructiveHint, true)
     } finally {
       await close()
     }
   })
 
-  it('справочник отдаёт очереди и статусы (ключ=«имя»)', async () => {
+  it('справочник отдаёт очереди и статусы (ключ=«имя») и плоский список для машин', async () => {
     const { client, close } = await connectHttpClient(running.url, CLIENT_TOKEN)
     try {
       const result = toolText(await client.callTool({ name: 'list_queues', arguments: {} }))
       assert.equal(result.isError, false)
       assert.match(result.text, /DEV/)
       assert.match(result.text, /in_progress=«В работе»/)
+      // Плоский `items` нужен потребителям вроде сервиса дайджеста: ключи очередей
+      // берутся из структуры, а не выковыриваются из текста.
+      const items = result.structured?.items as { project: string; key: string; name: string }[]
+      assert.equal(items[0]?.key, 'DEV')
+      assert.equal(items[0]?.project, 'sladkiy-limit')
+
+      const oneProject = toolText(await client.callTool({
+        name: 'list_queues',
+        arguments: { project: 'sladkiy-limit' },
+      }))
+      assert.equal(oneProject.isError, false)
+      assert.match(oneProject.text, /DEV/)
+    } finally {
+      await close()
+    }
+  })
+
+  it('list_issues фильтрует по статусу и отдаёт исполнителя', async () => {
+    seedQueue(running.tracker)
+    const { client, close } = await connectHttpClient(running.url, CLIENT_TOKEN)
+    try {
+      const active = toolText(await client.callTool({
+        name: 'list_issues',
+        arguments: { queue: 'OPS', status: 'in_progress', limit: 10 },
+      }))
+      assert.equal(active.isError, false)
+      assert.match(active.text, /OPS-1/)
+      assert.doesNotMatch(active.text, /OPS-2/) // закрытая задача в фильтр не попала
+      const items = active.structured?.items as { key: string; assignee: { displayName: string } | null }[]
+      assert.deepEqual(items.map((item) => item.key), ['OPS-1'])
+      assert.equal(items[0]?.assignee?.displayName, 'Вячеслав Зюзько')
+
+      // Статус можно назвать словом — как в set_task_status.
+      const byName = toolText(await client.callTool({
+        name: 'list_issues',
+        arguments: { queue: 'OPS', status: 'В работе' },
+      }))
+      assert.equal(byName.isError, false)
+      assert.match(byName.text, /OPS-1/)
+
+      const all = toolText(await client.callTool({ name: 'list_issues', arguments: { queue: 'OPS' } }))
+      assert.equal(all.structured?.total, 2)
+
+      // Неизвестный статус — ошибка со списком доступных, а не молча пустой список.
+      const wrong = toolText(await client.callTool({
+        name: 'list_issues',
+        arguments: { queue: 'OPS', status: 'летит' },
+      }))
+      assert.equal(wrong.isError, true)
+      assert.match(wrong.text, /Доступные: open/)
+    } finally {
+      await close()
+    }
+  })
+
+  it('list_comments отдаёт total и последний комментарий (признак обсуждения)', async () => {
+    seedQueue(running.tracker)
+    const { client, close } = await connectHttpClient(running.url, CLIENT_TOKEN)
+    try {
+      const result = toolText(await client.callTool({
+        name: 'list_comments',
+        arguments: { key: 'OPS-1', limit: 5 },
+      }))
+      assert.equal(result.isError, false)
+      assert.equal(result.structured?.total, 1)
+      assert.match(result.text, /уже смотрю/)
+      const items = result.structured?.items as { author: { displayName: string } }[]
+      assert.equal(items[0]?.author.displayName, 'Борис Участников')
+
+      const empty = toolText(await client.callTool({ name: 'list_comments', arguments: { key: 'OPS-2' } }))
+      assert.equal(empty.isError, false)
+      assert.equal(empty.structured?.total, 0)
     } finally {
       await close()
     }

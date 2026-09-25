@@ -226,8 +226,9 @@ SL_MCP_TOKEN=<MCP_CLIENT_TOKEN из .env> \
 node --import tsx scripts/smoke-live.ts            # + ключ задачи, если нужно прочитать: … INFRA-4
 ```
 
-Ожидаемое: `✔ соединение … установлено`, `✔ инструментов: 6 — create_task, update_task_description,
-add_comment, get_task, set_task_status, list_queues`, затем очереди со статусами.
+Ожидаемое: `✔ соединение … установлено`, `✔ инструментов: 8 — add_comment, create_task, get_task,
+list_comments, list_issues, list_queues, set_task_status, update_task_description`, затем очереди
+со статусами, список активных задач очереди и (если передан ключ) задача с комментариями.
 
 Проверка без Node (прямо на сервере, curl-ом) — рукопожатие и список инструментов:
 
@@ -391,17 +392,18 @@ docker compose -f infra/compose/docker-compose.prod.yml --env-file .env exec cad
 [ ] 5. caddy validate → Valid configuration
 [ ] 6. build mcp && up -d && ps (mcp healthy) && logs без ошибок
 [ ] 7. /healthz 200, POST /mcp без токена → 401, чужой Origin → 403,
-       smoke-live.ts → 6 инструментов и очереди трекера
-[ ] 8. dsh-term --mcp sltracker: на старте «6 tools», /mcp tools показывает список
+       smoke-live.ts → 8 инструментов, очереди трекера и активные задачи очереди
+[ ] 8. dsh-term --mcp sltracker: на старте «8 tools», /mcp tools показывает список
 [ ] 9. Задача, созданная агентом, видна в трекере и подписана твоим именем
 ```
 
-## Что уже развёрнуто (24.09.2026)
+## Что уже развёрнуто (24.09.2026, дополнено 25.09.2026)
 
 | | |
 |---|---|
 | MCP-сервер | `https://mcp.72-56-41-79.sslip.io:8443/mcp` (контейнер `sl-tracker-mcp`, профиль `mcp`, наружу не публикуется) |
 | Код на сервере | `/opt/sl-tracker-mcp` (только проект MCP) |
 | Права | PAT владельца `zyuzko2002`, срок 365 дней, `MCP_READONLY=0`, очереди `INFRA,MOBILE` |
-| Проверено | `/healthz` → 200, без токена → 401, чужой `Origin` → 403, `smoke-live` → 6 инструментов и очереди трекера |
+| Проверено | `/healthz` → 200, без токена → 401, чужой `Origin` → 403, `smoke-live` → 8 инструментов, очереди трекера и активные задачи |
+| Потребитель | сервис `nexus-digest` из `sl-claude-box` ходит сюда за активными задачами (`list_queues` → `list_issues` → `get_task`/`list_comments`) |
 | Сквозная проверка | агент в dsh-term создал `INFRA-4` («Проверка MCP-сервера»), добавил комментарий и перевёл в `in_progress`; автор — владелец токена |

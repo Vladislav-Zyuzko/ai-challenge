@@ -41,6 +41,20 @@ export interface CommentDto {
   readonly editedAt: string | null
 }
 
+/**
+ * Строка списка задач (`GET /api/queues/{key}/issues`). Отличается от `IssueDto`:
+ * в списке **нет** описания, автора и проекта — только то, что помещается в таблицу.
+ * Описание добирается `get_task` по ключу.
+ */
+export interface IssueRowDto {
+  readonly key: string
+  readonly title: string
+  readonly status: IssueStatus
+  readonly priority: number
+  readonly storyPoints: number | null
+  readonly assignee: IssueUser | null
+}
+
 export interface QueueStatusDto {
   readonly id: string
   readonly key: string
@@ -95,6 +109,39 @@ export async function getIssue(client: SlTrackerClient, key: string): Promise<Is
   return client.get<IssueDto>(`/issues/${encodeURIComponent(key)}`)
 }
 
+/**
+ * Фильтр по статусам для списка задач: принимает ключи (`in_progress,review`) и имена
+ * («В работе») и возвращает ключи, которые понимает API.
+ *
+ * API фильтрует по ключам (`query.status.split(',')`), а агент может назвать статус
+ * словом — ровно как в `set_task_status`. Неизвестное значение — ошибка со списком
+ * доступных: молча отдать пустой список хуже, чем сказать, что статус назван неверно.
+ */
+export async function resolveStatusKeys(
+  client: SlTrackerClient,
+  queueKey: string,
+  requested: string,
+): Promise<string[]> {
+  const tokens = requested.split(',').map((token) => token.trim()).filter((token) => token.length > 0)
+  if (tokens.length === 0) return []
+
+  const statuses = await listQueueStatuses(client, queueKey)
+  const keys: string[] = []
+  for (const token of tokens) {
+    const wanted = norm(token)
+    const found = statuses.find((status) => norm(status.key) === wanted || norm(status.name) === wanted)
+    if (found === undefined) {
+      const available = statuses.map((status) => `${status.key} («${status.name}»)`).join(', ')
+      throw new SlTrackerError(
+        'invalid_request',
+        `в очереди ${queueKey} нет статуса «${token}». Доступные: ${available || 'нет ни одного'}`,
+      )
+    }
+    if (!keys.includes(found.key)) keys.push(found.key)
+  }
+  return keys
+}
+
 export async function listQueueStatuses(
   client: SlTrackerClient,
   queueKey: string,
@@ -134,4 +181,16 @@ export function issueCard(issue: IssueDto, comments: CommentDto[], webUrl?: stri
     }
   }
   return lines.join('\n')
+}
+
+/** Одна строка списка задач для модели: ключ, заголовок, статус, исполнитель, приоритет. */
+export function issueRowLine(row: IssueRowDto, webUrl?: string): string {
+  const parts = [
+    `${row.key}: «${row.title}»`,
+    `статус ${row.status.key} («${row.status.name}»)`,
+    `исполнитель ${row.assignee?.displayName ?? 'не назначен'}`,
+    `приоритет ${row.priority}`,
+  ]
+  const link = webUrl ? ` · ${webUrl}/issues/${row.key}` : ''
+  return parts.join(' · ') + link
 }
