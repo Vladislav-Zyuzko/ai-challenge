@@ -15,8 +15,11 @@ const here = dirname(fileURLToPath(import.meta.url))
 const dshTerm = join(here, '..', 'dsh-term.mjs')
 
 /** Запустить dsh-term и вернуть stdout+stderr и код выхода. */
-function run(args) {
-  const r = spawnSync(process.execPath, [dshTerm, ...args], { encoding: 'utf8' })
+function run(args, env = {}) {
+  const r = spawnSync(process.execPath, [dshTerm, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
+  })
   return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, code: r.status }
 }
 
@@ -29,7 +32,8 @@ check('exit code 0 для пресета github', gh.code === 0, `code=${gh.code
 check('insert-строка с id mcp-github', /- id: mcp-github/.test(gh.out))
 check('имя моста dsh-mcp-client', /name: '@deepseek-ai\/dsh-mcp-client'/.test(gh.out))
 check('транспорт streamable-http', /transport: streamable-http/.test(gh.out))
-check('url официального сервера', /url: https:\/\/api\.githubcopilot\.com\/mcp\//.test(gh.out))
+// Хвостовой слэш убирается: канонический вид адреса — `…/mcp`.
+check('url официального сервера', /url: https:\/\/api\.githubcopilot\.com\/mcp$/m.test(gh.out))
 check('токен только выражением !!js', /Authorization: !!js '`Bearer \$\{process\.env\.GITHUB_MCP_TOKEN\}`'/.test(gh.out))
 check('секрета в оверлее нет', !/ghp_|github_pat_/.test(gh.out))
 check('readonly включён по умолчанию', /'X-MCP-Readonly': 'true'/.test(gh.out))
@@ -40,7 +44,17 @@ const full = run(['--mcp-check', 'github', '--offline', '--mcp-toolsets', 'all',
 check('--mcp-toolsets all убирает строку тулсетов', !/'X-MCP-Toolsets'/.test(full.out))
 check('--mcp-readwrite убирает readonly', !/'X-MCP-Readonly'/.test(full.out))
 
-// 3. Неизвестный пресет: внятная ошибка, ненулевой код.
+// 3. Пресет sltracker: адрес берётся из окружения и нормализуется до `…/mcp`.
+// Без нормализации адрес без пути уходит в catch-all Caddy и возвращает 404 вместо MCP —
+// ровно этот дефект поймал живой прогон на боевом сервере.
+const sltBase = run(['--mcp-check', 'sltracker', '--offline'], { SL_MCP_URL: 'https://mcp.example.com:8443' })
+check('sltracker: адрес из SL_MCP_URL + /mcp', /url: https:\/\/mcp\.example\.com:8443\/mcp$/m.test(sltBase.out))
+check('sltracker: без тулсетов и readonly-заголовков', !/'X-MCP-Toolsets'/.test(sltBase.out) && !/'X-MCP-Readonly'/.test(sltBase.out))
+check('sltracker: токен только через !!js', /Authorization: !!js '`Bearer \$\{process\.env\.SL_MCP_TOKEN\}`'/.test(sltBase.out))
+const sltFull = run(['--mcp-check', 'sltracker', '--offline'], { SL_MCP_URL: 'https://mcp.example.com:8443/mcp/' })
+check('sltracker: уже готовый /mcp не удваивается', /url: https:\/\/mcp\.example\.com:8443\/mcp$/m.test(sltFull.out))
+
+// 4. Неизвестный пресет: внятная ошибка, ненулевой код.
 const bad = run(['--mcp-check', 'nope', '--offline'])
 check('неизвестный пресет → код 1', bad.code === 1, `code=${bad.code}`)
 check('неизвестный пресет → сообщение и список', /неизвестный MCP-пресет: nope/.test(bad.out) && /github/.test(bad.out))
