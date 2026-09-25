@@ -7,6 +7,12 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 
+export interface FakeUser {
+  id: string
+  displayName: string
+  avatarUrl: string | null
+}
+
 export interface FakeIssue {
   key: string
   title: string
@@ -14,8 +20,8 @@ export interface FakeIssue {
   statusId: string
   priority: number
   storyPoints: number | null
-  author: { id: string; displayName: string; avatarUrl: string | null }
-  assignee: null
+  author: FakeUser
+  assignee: FakeUser | null
   queue: { key: string; name: string }
   project: { slug: string; name: string }
   createdAt: string
@@ -143,6 +149,25 @@ export async function startFakeTracker(options: { apiToken?: string; port?: numb
         send(response, 201, toDto(issue))
         return
       }
+      // GET /api/queues/:key/issues?status=...&limit=... — список задач очереди.
+      // Форма строки отличается от карточки задачи: нет описания, автора и проекта,
+      // зато есть статус объектом и исполнитель.
+      if (method === 'GET' && create) {
+        const queueKey = create[1]!
+        const statuses = (url.searchParams.get('status') ?? '').split(',').filter((s) => s.length > 0)
+        const limit = Number(url.searchParams.get('limit') ?? '50')
+        const all = [...issues.values()].filter((issue) => issue.queue.key === queueKey)
+        const filtered = statuses.length === 0
+          ? all
+          : all.filter((issue) => {
+              const status = STATUSES.find((s) => s.id === issue.statusId)
+              return status !== undefined && statuses.includes(status.key)
+            })
+        const items = (Number.isFinite(limit) && limit > 0 ? filtered.slice(0, limit) : filtered)
+          .map((issue) => toRow(issue))
+        send(response, 200, { items, total: filtered.length, nextCursor: null, role: 'member' })
+        return
+      }
       // /api/issues/:key (+ /comments)
       const issuePath = /^\/api\/issues\/([^/]+)$/.exec(path)
       const commentPath = /^\/api\/issues\/([^/]+)\/comments$/.exec(path)
@@ -154,7 +179,8 @@ export async function startFakeTracker(options: { apiToken?: string; port?: numb
           return
         }
         if (commentPath && method === 'GET') {
-          send(response, 200, { items: comments.get(key) ?? [], total: (comments.get(key) ?? []).length })
+          const list = comments.get(key) ?? []
+          send(response, 200, { items: list, total: list.length, nextCursor: null, canComment: true })
           return
         }
         if (commentPath && method === 'POST') {
@@ -207,8 +233,7 @@ export async function startFakeTracker(options: { apiToken?: string; port?: numb
 }
 
 /** Форма ответа задачи, как в `IssueDto` SL Tracker. */
-function toDto(issue: FakeIssue): Record<string, unknown> {
-  const status = STATUSES.find((s) => s.id === issue.statusId) ?? STATUSES[0]!
+function toDto(issue: FakeIssue): Record<string, unknown> {  const status = STATUSES.find((s) => s.id === issue.statusId) ?? STATUSES[0]!
   return {
     key: issue.key,
     title: issue.title,
@@ -225,5 +250,18 @@ function toDto(issue: FakeIssue): Record<string, unknown> {
     permissions: {},
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
+  }
+}
+
+/** Форма строки списка задач, как в `GET /api/queues/{key}/issues`. */
+function toRow(issue: FakeIssue): Record<string, unknown> {
+  const status = STATUSES.find((s) => s.id === issue.statusId) ?? STATUSES[0]!
+  return {
+    key: issue.key,
+    title: issue.title,
+    status: { key: status.key, name: status.name, category: status.category },
+    priority: issue.priority,
+    storyPoints: issue.storyPoints,
+    assignee: issue.assignee,
   }
 }

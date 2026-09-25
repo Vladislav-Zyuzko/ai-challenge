@@ -1,5 +1,6 @@
 /**
- * Шесть инструментов MCP: пять операций над задачами из задания и один справочник.
+ * Восемь инструментов MCP: пять операций над задачами из задания, два чтения списков
+ * (задачи очереди и комментарии) и один справочник.
  *
  * Описания инструментов попадают в контекст модели **на каждом запросе**, поэтому они
  * короткие и по делу: что делает, какой ключ принимает, что вернёт.
@@ -15,10 +16,13 @@ import {
   getIssue,
   issueCard,
   issueLine,
+  issueRowLine,
   listQueueStatuses,
   resolveStatusId,
+  resolveStatusKeys,
   type CommentDto,
   type IssueDto,
+  type IssueRowDto,
   type ProjectDto,
   type QueueDto,
 } from './domain.js'
@@ -85,6 +89,9 @@ function resolveQueue(config: Config, requested: string | undefined): string {
   return queue
 }
 
+/** Читающие инструменты: им разрешено работать в режиме «только чтение». */
+const READ_ONLY_TOOLS = new Set(['get_task', 'list_queues', 'list_issues', 'list_comments'])
+
 export function registerTools(server: McpServer, ctx: ToolContext): void {
   const { client, config, logger } = ctx
 
@@ -95,7 +102,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     inputSchema: Record<string, z.ZodType>,
     handler: (args: A) => Promise<TextResult>,
   ): void => {
-    const readOnly = name === 'get_task' || name === 'list_queues'
+    const readOnly = READ_ONLY_TOOLS.has(name)
     server.registerTool(
       name,
       {
@@ -292,34 +299,156 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   // 6. Справочник очередей и статусов ---------------------------------------
   // Без него агент угадывал бы ключи очередей и имена статусов: у остальных инструментов
   // нет способа узнать, что вообще существует в трекере.
-  register(
+  interface ListQueuesArgs {
+    project?: string
+  }
+  register<ListQueuesArgs>(
     'list_queues',
     'Очереди и статусы',
     'Показывает проекты, их очереди и статусы каждой очереди (ключ, имя, категория). '
-      + 'Вызывайте перед созданием задачи или сменой статуса, чтобы не угадывать ключи.',
-    {},
-    async () => {
-      const projects = await client.get<{ items: ProjectDto[] }>('/projects')
+      + 'Можно ограничить одним проектом. Вызывайте перед созданием задачи или сменой '
+      + 'статуса, чтобы не угадывать ключи.',
+    {
+      project: z.string().min(1).max(64).optional()
+        .describe('Слаг проекта, например sweet-limit. По умолчанию — все проекты'),
+    },
+    async ({ project }) => {
+      const projects = project === undefined
+        ? (await client.get<{ items: ProjectDto[] }>('/projects')).items
+        : [{ slug: project, name: project }]
       const blocks: string[] = []
-      const structured: Record<string, unknown> = {}
-      for (const project of projects.items) {
+      const byProject: Record<string, unknown> = {}
+      const items: { project: string; key: string; name: string }[] = []
+      for (const entry of projects) {
         const queues = await client.get<{ items: QueueDto[] }>(
-          `/projects/${encodeURIComponent(project.slug)}/queues`,
+          `/projects/${encodeURIComponent(entry.slug)}/queues`,
         )
-        const lines = [`${project.slug}: ${project.name}`]
+        const lines = [`${entry.slug}: ${entry.name}`]
         for (const queue of queues.items) {
           const statuses = await listQueueStatuses(client, queue.key)
           lines.push(
             `  ${queue.key} («${queue.name}»): ${statuses.map((s) => `${s.key}=«${s.name}»`).join(', ')}`,
           )
+          items.push({ project: entry.slug, key: queue.key, name: queue.name })
         }
         blocks.push(lines.join('\n'))
-        structured[project.slug] = queues.items.map((q) => ({ key: q.key, name: q.name }))
+        byProject[entry.slug] = queues.items.map((q) => ({ key: q.key, name: q.name }))
       }
       const text = blocks.length > 0
         ? `Очереди трекера (в скобках — статусы в виде ключ=«имя»):\n${blocks.join('\n')}`
         : 'В трекере нет доступных проектов.'
-      return ok(text, structured)
+      // `items` — плоский список для машин: по нему потребитель (например сервис дайджеста)
+      // строит справочник очередей, не разбирая текст. `projects` оставлен для совместимости.
+      return ok(text, { items, projects: byProject })
+    },
+  )
+
+  // 7. Задачи очереди -------------------------------------------------------
+  // Появился под сервис дайджеста: чтобы собрать активные задачи, нужен список с фильтром
+  // по статусам, а не чтение по одному ключу — ключи заранее неизвестны.
+  interface ListIssuesArgs {
+    queue: string
+    status?: string
+    limit?: number
+  }
+  register<ListIssuesArgs>(
+    'list_issues',
+    'Задачи очереди',
+    'Список задач очереди с фильтром по статусам (ключи или имена через запятую: '
+      + 'in_progress,review или «В работе»). Отдаёт ключи, заголовки, статусы, исполнителей '
+      + 'и приоритеты. Описания в списке нет — за ним get_task.',
+    {
+      queue: z.string().min(1).max(16).describe('Ключ очереди, например INFRA'),
+      status: z.string().min(1).max(200).optional()
+        .describe('Статусы через запятую: in_progress,review,testing или «В работе»'),
+      limit: z.number().int().min(1).max(100).optional().describe('Сколько задач вернуть (по умолчанию 50)'),
+    },
+    async ({ queue, status, limit }) => {
+      const statusKeys = status === undefined ? [] : await resolveStatusKeys(client, queue, status)
+      const query = new URLSearchParams({ limit: String(limit ?? 50) })
+      if (statusKeys.length > 0) query.set('status', statusKeys.join(','))
+
+      const page = await client.get<{
+        items: IssueRowDto[]
+        total?: number
+        nextCursor?: string | null
+      }>(`/queues/${encodeURIComponent(queue)}/issues?${query.toString()}`)
+
+      const filterNote = statusKeys.length > 0 ? `, статусы ${statusKeys.join(', ')}` : ''
+      const text = page.items.length === 0
+        ? `В очереди ${queue} нет задач${filterNote || ' с указанным фильтром'}.`
+        : `Задачи очереди ${queue}${filterNote} (${page.items.length} из ${page.total ?? page.items.length}):\n`
+          + page.items.map((row) => `- ${issueRowLine(row, config.webUrl)}`).join('\n')
+
+      return ok(text, {
+        queue,
+        statuses: statusKeys,
+        total: page.total ?? page.items.length,
+        items: page.items.map((row) => ({
+          key: row.key,
+          title: row.title,
+          // queue объектом: потребителю нужен ключ, а в строке списка очередь не приходит
+          queue: { key: queue },
+          status: { key: row.status.key, name: row.status.name, category: row.status.category },
+          priority: row.priority,
+          storyPoints: row.storyPoints,
+          assignee: row.assignee === null
+            ? null
+            : {
+                id: row.assignee.id,
+                displayName: row.assignee.displayName,
+                avatarUrl: row.assignee.avatarUrl,
+              },
+        })),
+        ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+      })
+    },
+  )
+
+  // 8. Комментарии задачи ---------------------------------------------------
+  interface ListCommentsArgs {
+    key: string
+    limit?: number
+  }
+  register<ListCommentsArgs>(
+    'list_comments',
+    'Комментарии задачи',
+    'Комментарии задачи: автор, дата, текст. Поле total — сколько всего комментариев, '
+      + 'по нему видно, идёт ли обсуждение.',
+    {
+      key: z.string().min(1).max(32).describe('Ключ задачи, например INFRA-1'),
+      limit: z.number().int().min(1).max(100).optional().describe('Сколько вернуть (по умолчанию 20)'),
+    },
+    async ({ key, limit }) => {
+      const page = await client.get<{
+        items: CommentDto[]
+        total?: number
+        canComment?: boolean
+      }>(`/issues/${encodeURIComponent(key)}/comments?limit=${limit ?? 20}`)
+      const total = page.total ?? page.items.length
+      const text = page.items.length === 0
+        ? `У задачи ${key} комментариев нет.`
+        : `Комментарии ${key} (${page.items.length} из ${total}):\n`
+          + page.items
+            .map((comment) => `- ${comment.author.displayName} (${comment.createdAt}): ${comment.body}`)
+            .join('\n')
+
+      return ok(text, {
+        key,
+        total,
+        items: page.items.map((comment) => ({
+          id: comment.id,
+          body: comment.body,
+          author: {
+            id: comment.author.id,
+            displayName: comment.author.displayName,
+            avatarUrl: comment.author.avatarUrl,
+          },
+          createdAt: comment.createdAt,
+          editedAt: comment.editedAt,
+        })),
+        ...(page.canComment === undefined ? {} : { canComment: page.canComment }),
+      })
     },
   )
 }
