@@ -1138,6 +1138,7 @@ function parseArgs(argv) {
         break
       }
       case '--offline': opts.offline = true; break
+      case '--figma-node': opts.figmaNode = next(); break
       case '-p': case '--print': opts.prompt = next(); break
       case '--workspace': opts.workspace = next(); break
       case '--dsh-bin': opts.dshBin = next(); break
@@ -1339,6 +1340,7 @@ const COMMANDS = [
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
   { name: 'publish-day', usage: '/publish-day', desc: 'git+gh: коммит → push → PR day→week (по SKILLS)' },
   { name: 'create-project', usage: '/create-project [что строим] [--check <path>]', desc: 'сессия архитектора проекта: опросник → .project-harness → инструменты → ноды' },
+  { name: 'task-from-figma', usage: '/task-from-figma <ОЧЕРЕДЬ> <ссылка|текст>', desc: 'скилл: задача в указанной очереди по кадру Figma (нужны --mcp figma --mcp sltracker)' },
   { name: 'exit', usage: '/exit', desc: 'завершить dsh-term (или Ctrl+C)' },
 ]
 
@@ -2249,9 +2251,25 @@ const MCP_PRESETS = {
     toolsets: '',
     what: 'создание задачи, правка описания, комментарий, чтение, смена статуса, справочник очередей',
   },
+  // Локальный Figma-мост (проект `sl-figma-plugin`): MCP-сервер на stdio, который
+  // держит связь с открытой панелью плагина в Figma Desktop через localhost:3055.
+  // Транспорт другой, потому что и сервер другой природы: HTTP-сервер живёт на
+  // сервере и доступен всем, а этот обязан быть локальным — Figma есть только на
+  // машине пользователя. Токенов у него нет, режим задаётся самим сервером.
+  figma: {
+    serverName: 'figma',
+    title: 'Figma MCP Bridge (локальный, stdio)',
+    transport: 'stdio',
+    command: 'node',
+    // Путь к mcp-server.js: раскладка у каждого своя, поэтому переопределяется.
+    scriptEnv: 'SL_FIGMA_MCP_SCRIPT',
+    script: 'C:\\Users\\user\\FlutterProjects\\sl-figma-plugin\\mcp-server.js',
+    what: 'выделение, цвета, шрифты, CSS, стили и переменные файла, экспорт PNG/SVG',
+  },
 }
 const MCP_DEFAULT_PRESET = 'github'
 const MCP_FULL_TOOLSETS = 'all'
+const MCP_ALL_PRESETS = 'all'
 const MCP_PATCH_NAME = 'dsh-term-mcp.patch.yml'
 // Харнесс регистрирует MCP-инструменты в своей канонической форме (без title,
 // annotations, $schema и т.п.), поэтому в промпт уходит примерно вдвое меньше, чем
@@ -2291,11 +2309,19 @@ function resolveMcpServers(opts) {
     if (!name) continue
     const preset = MCP_PRESETS[name]
     if (!preset) { unknown.push(name); continue }
+    // Локальный stdio-сервер: адреса нет, есть команда. Путь к скрипту можно
+    // переопределить окружением (у каждого своя раскладка репозитория).
+    if (preset.transport === 'stdio') {
+      const fromEnv = preset.scriptEnv ? String(process.env[preset.scriptEnv] ?? '').trim() : ''
+      servers.push({ ...preset, script: fromEnv || preset.script, args: preset.args ?? [] })
+      continue
+    }
     // Адрес может подсказываться окружением: у своего MCP-сервера развёртывание
     // у каждого своё, и дефолт в пресете — просто удобная точка входа.
     const urlFromEnv = preset.urlEnv ? String(process.env[preset.urlEnv] ?? '').trim() : ''
     servers.push({
       ...preset,
+      transport: 'streamable-http',
       url: mcpNormalizeUrl(urlFromEnv || preset.url),
       readonly: opts.mcpReadwrite === true ? false : preset.readonly,
       toolsets: opts.mcpToolsets === undefined
@@ -2306,8 +2332,46 @@ function resolveMcpServers(opts) {
   return { servers, unknown }
 }
 
+/**
+ * Куда подключаемся — для логов и проверок: у stdio-сервера адреса нет, поэтому
+ * показываем команду с путём к скрипту.
+ */
+function mcpTarget(server) {
+  if (server.transport === 'stdio') return `${server.command} ${server.script ?? (server.args ?? []).join(' ')}`
+  return server.url
+}
+
+/** Проверка, что файл stdio-сервера на месте: без него зонд упадёт невнятно. */
+function mcpStdioMissing(server) {
+  if (server.transport !== 'stdio') return null
+  const script = server.script ?? ''
+  if (script && !existsSync(script)) {
+    return `не найден ${script} — укажи путь к mcp-server.js в ${server.scriptEnv ?? 'конфиге'}`
+  }
+  return null
+}
+
+// ---------- ссылка Figma → node-id (для скилла task-from-figma, day20) ----------
+const FIGMA_LINK_RE = /https?:\/\/(?:www\.)?figma\.com\/[^\s)"']+/i
+const FIGMA_NODE_RE = /node[-_]id=([0-9]+(?:%3A|%3a|:|-)[0-9]+)/i
+
+/**
+ * `node-id` из текста: `1:23`, `1-23` и `%3A` приводятся к виду имени файла слепка
+ * (`1-23`). Разбор тот же, что в боте SLNexus: ссылку копируют и из адресной строки,
+ * и через «Copy link to selection», и двоеточие бывает закодировано.
+ */
+function figmaNodeFromText(text) {
+  const raw = String(text ?? '')
+  const link = FIGMA_LINK_RE.exec(raw)
+  const m = FIGMA_NODE_RE.exec(link ? link[0] : raw)
+  if (!m) return null
+  return m[1].replace(/%3A|%3a|:/g, '-')
+}
+
 /** Заголовки запроса к MCP-серверу (для зонда; в оверлее они же, но через !!js). */
 function mcpHeaders(server, { withSecret = true } = {}) {
+  // У stdio-сервера заголовков нет: транспорт — труба в дочерний процесс.
+  if (server.transport === 'stdio') return {}
   const headers = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }
   if (withSecret && server.token) headers.Authorization = `Bearer ${server.token}`
   if (server.readonly) headers['X-MCP-Readonly'] = 'true'
@@ -2319,10 +2383,15 @@ function mcpHeaders(server, { withSecret = true } = {}) {
  * YAML-оверлей с insert-строками MCP-серверов. Секретов в файле нет: токен
  * подставляется выражением `!!js`, которое загрузчик харнесса исполняет при
  * активации строки (переменную окружения даёт spawnRuntime).
+ *
+ * Два транспорта: `streamable-http` (адрес + заголовки) и `stdio` (команда с
+ * аргументами, которую харнесс запускает сам). Пути в Windows содержат обратные
+ * слэши, поэтому скаляры с путями берём в одинарные кавычки — YAML в них
+ * ничего не экранирует.
  */
 function mcpPatchYaml(servers) {
   const lines = [
-    '# dsh-term: MCP-серверы через мост @deepseek-ai/dsh-mcp-client (day16).',
+    '# dsh-term: MCP-серверы через мост @deepseek-ai/dsh-mcp-client (day16, day20).',
     '# Токены не хранятся в файле: значение читается из env рантайма (!!js).',
     '- insert:',
   ]
@@ -2331,6 +2400,19 @@ function mcpPatchYaml(servers) {
     lines.push("      name: '@deepseek-ai/dsh-mcp-client'")
     lines.push('      config:')
     lines.push(`        serverName: ${s.serverName}`)
+    if (s.transport === 'stdio') {
+      lines.push('        transport: stdio')
+      lines.push(`        command: ${s.command}`)
+      // Скрипт — последний аргумент команды: харнесс запускает `command args…`.
+      const stdioArgs = [...(s.args ?? []), ...(s.script ? [s.script] : [])]
+      lines.push('        args:')
+      for (const arg of stdioArgs) lines.push(`          - '${String(arg).replace(/'/g, "''")}'`)
+      for (const [key, value] of Object.entries(s.env ?? {})) {
+        if (!lines.includes('        env:')) lines.push('        env:')
+        lines.push(`          ${key}: '${String(value).replace(/'/g, "''")}'`)
+      }
+      continue
+    }
     lines.push('        transport: streamable-http')
     lines.push(`        url: ${s.url}`)
     lines.push('        headers:')
@@ -2356,6 +2438,101 @@ function profileHasMcpRow(dshHome, profile, serverName) {
 }
 
 /**
+ * Зонд локального MCP-сервера по stdio: спавним команду пресета и говорим с ней
+ * построчным JSON-RPC (так же, как это делает StdioClientTransport в харнессе).
+ * Нужен для `--mcp-check` и для строки состояния: без него stdio-пресет вообще
+ * нечем проверить, кроме запуска полной сессии.
+ */
+async function mcpProbeStdio(server, { timeoutMs = 20000 } = {}) {
+  const started = Date.now()
+  const fail = (error) => ({ ok: false, toolCount: 0, tools: [], tokens: 0, ms: Date.now() - started, error })
+  return await new Promise((resolve) => {
+    let child
+    try {
+      child = spawn(server.command, [...(server.args ?? []), server.script], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+    } catch (e) {
+      resolve(fail(e.message))
+      return
+    }
+    let buffer = ''
+    let stderr = ''
+    let seq = 0
+    let settled = false
+    const pending = new Map()
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { child.kill() } catch {}
+      resolve(result)
+    }
+    const timer = setTimeout(() => finish(fail(`таймаут ${timeoutMs} мс`)), timeoutMs)
+    const rpc = (method, params, notify = false) => new Promise((res, rej) => {
+      const body = { jsonrpc: '2.0', method, params }
+      if (notify) {
+        child.stdin.write(JSON.stringify(body) + '\n')
+        res(null)
+        return
+      }
+      const id = ++seq
+      body.id = id
+      pending.set(id, { res, rej })
+      child.stdin.write(JSON.stringify(body) + '\n')
+    })
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk.toString('utf8')
+      let idx
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).trim()
+        buffer = buffer.slice(idx + 1)
+        if (!line) continue
+        let msg
+        try { msg = JSON.parse(line) } catch { continue }
+        const waiter = msg.id === undefined ? undefined : pending.get(msg.id)
+        if (!waiter) continue
+        pending.delete(msg.id)
+        if (msg.error) waiter.rej(new Error(msg.error.message ?? JSON.stringify(msg.error)))
+        else waiter.res(msg.result)
+      }
+    })
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8') })
+    child.on('error', (e) => finish(fail(e.message)))
+    child.on('exit', (code) => {
+      if (code !== 0 && code !== null) {
+        finish(fail(`процесс завершился с кодом ${code}${stderr ? `: ${stderr.trim().slice(0, 200)}` : ''}`))
+      } else {
+        finish(fail(`процесс завершился до ответа${stderr ? `: ${stderr.trim().slice(0, 200)}` : ''}`))
+      }
+    })
+    ;(async () => {
+      try {
+        const init = await rpc('initialize', {
+          protocolVersion: '2025-06-18',
+          capabilities: {},
+          clientInfo: { name: 'dsh-term', version: '0.1' },
+        })
+        await rpc('notifications/initialized', {}, true)
+        const list = await rpc('tools/list', {})
+        const tools = list?.tools ?? []
+        finish({
+          ok: true,
+          toolCount: tools.length,
+          tools,
+          schemaChars: JSON.stringify(tools).length,
+          tokens: Math.ceil(JSON.stringify(tools).length / 4),
+          serverInfo: init?.serverInfo,
+          ms: Date.now() - started,
+        })
+      } catch (e) {
+        finish(fail(e?.message ?? String(e)))
+      }
+    })()
+  })
+}
+
+/**
  * Зонд MCP по Streamable HTTP: `initialize` → `notifications/initialized` →
  * `tools/list`. Это и есть «минимальный клиент», который устанавливает
  * соединение и получает список инструментов; тем же зондом UI показывает
@@ -2363,7 +2540,7 @@ function profileHasMcpRow(dshHome, profile, serverName) {
  *
  * @returns {Promise<{ok: boolean, toolCount: number, tools: Array<object>, tokens: number, ms: number, error?: string}>}
  */
-async function mcpProbe(server, { timeoutMs = 20000 } = {}) {
+async function mcpProbeHttp(server, { timeoutMs = 20000 } = {}) {
   const started = Date.now()
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeoutMs)
@@ -2421,6 +2598,13 @@ async function mcpProbe(server, { timeoutMs = 20000 } = {}) {
   }
 }
 
+/** Зонд MCP: транспорт выбирается по пресету (stdio — локальный, http — удалённый). */
+async function mcpProbe(server, opts) {
+  const missing = mcpStdioMissing(server)
+  if (missing) return { ok: false, toolCount: 0, tools: [], tokens: 0, ms: 0, error: missing }
+  return server.transport === 'stdio' ? mcpProbeStdio(server, opts) : mcpProbeHttp(server, opts)
+}
+
 /**
  * Добрать токены для пресетов: из `gh auth token` (GitHub) или из окружения
  * (свой MCP-сервер). В файл токены не попадут — уйдут в env рантайма, а оверлей
@@ -2445,6 +2629,7 @@ function mcpAttachTokens(servers) {
 
 /** Короткая подпись режима сервера: readonly/toolsets — то, что реально режет цену. */
 function mcpModeLabel(server) {
+  if (server.transport === 'stdio') return 'stdio · локальный'
   const bits = [server.readonly ? 'readonly' : 'read-write']
   bits.push(server.toolsets ? `toolsets=${server.toolsets}` : 'toolsets=all')
   return bits.join(', ')
@@ -2470,8 +2655,14 @@ function mcpRegisteredTokens(probe) {
  * (проверка формы YAML и того, что секрет в файл не попал).
  */
 async function runMcpCheck(opts) {
+  // День 20: серверов несколько, и проверять их вместе полезнее, чем по одному —
+  // поэтому принимаем и список `figma,sltracker`, и `all`.
+  const requested = String(opts.mcpCheck ?? '').trim()
+  const names = requested === MCP_ALL_PRESETS
+    ? Object.keys(MCP_PRESETS)
+    : requested.split(',').map((x) => x.trim()).filter(Boolean)
   const { servers, unknown } = resolveMcpServers({
-    mcp: [opts.mcpCheck],
+    mcp: names,
     mcpToolsets: opts.mcpToolsets,
     mcpReadwrite: opts.mcpReadwrite,
   })
@@ -2499,7 +2690,7 @@ async function runMcpCheck(opts) {
   let ok = 0
   for (const s of servers) {
     log.line('')
-    log.dim(`  подключаюсь к ${s.url} …`)
+    log.dim(`  подключаюсь к ${mcpTarget(s)} …`)
     const probe = await mcpProbe(s)
     if (!probe.ok) {
       log.err(`  соединение не установлено: ${probe.error}`)
@@ -2770,6 +2961,92 @@ async function createProject(opts, parts, askLineFn, promptTurnFn, state) {
 }
 
 /**
+ * /task-from-figma <ОЧЕРЕДЬ> <ссылка или текст> — скилл-роль дня 20: завести задачу
+ * в указанной очереди по кадру Figma, работая сразу с двумя MCP-серверами.
+ *
+ * Детерминированная часть: разбор очереди и node-id, проверка, что подключены оба
+ * сервера, чтение спецификации и сборка промпта с закреплённым порядком вызовов.
+ * Сами вызовы делает агент — в этом и смысл дня: маршрутизация между серверами
+ * должна быть его работой, а не зашитым скриптом.
+ */
+async function taskFromFigma(opts, parts, promptTurnFn, state) {
+  const args = parts.slice(1)
+  const usage = 'использование: /task-from-figma <ОЧЕРЕДЬ> <ссылка на кадр Figma или текст задачи>'
+  const queueArg = (args[0] ?? '').trim()
+  const rest = args.slice(1).join(' ').trim()
+
+  if (!queueArg || !/^[A-Za-z][A-Za-z0-9]{1,15}$/.test(queueArg)) {
+    log.err(`не понял очередь: «${queueArg || '(пусто)'}» — нужен ключ очереди, например MOBILE`)
+    log.dim(`  ${usage}`)
+    return
+  }
+  if (!rest) {
+    log.err('нет ни ссылки на кадр, ни описания задачи')
+    log.dim(`  ${usage}`)
+    return
+  }
+  const queue = queueArg.toUpperCase()
+
+  // Без обоих серверов скилл бессмысленен: одним нечего читать, другим некуда писать.
+  const enabled = new Set((state?.mcp?.servers ?? []).map((s) => s.serverName))
+  const missing = ['figma', 'sltracker'].filter((name) => !enabled.has(name))
+  if (missing.length) {
+    log.err(`не подключены MCP-серверы: ${missing.join(', ')}`)
+    log.dim('  запусти сессию так: dsh-term --mcp figma --mcp sltracker')
+    return
+  }
+
+  const skill = readTextIfExists(join(opts.workspace, '.dsh', 'SKILLS', 'task-from-figma.md'))
+  if (skill === null) {
+    log.err('не читается .dsh/SKILLS/task-from-figma.md — без спецификации скилл не запускаю')
+    return
+  }
+
+  const node = figmaNodeFromText(rest)
+  log.line(`${C.bold}/task-from-figma${C.off}: очередь ${C.cyan}${queue}${C.off}${node ? ` · кадр ${C.cyan}${node}${C.off}` : ''}`)
+  log.dim('  порядок закреплён скиллом: figma → list_queues → create_task → add_comment → get_task')
+  if (!node) log.dim('  ссылки с node-id в тексте нет — кадр берётся из выделения в Figma')
+
+  const prompt = [
+    '=== СКИЛЛ: task-from-figma ===',
+    '(команда выполнила только детерминированную часть: разобрала очередь и node-id,',
+    'проверила, что подключены оба MCP-сервера, и прочитала спецификацию. Сами вызовы',
+    'инструментов делаешь ты — порядок обязателен, он описан в спецификации.)',
+    '',
+    skill,
+    '',
+    '=== ЗАДАНИЕ ЭТОЙ КОМАНДЫ ===',
+    `Очередь (взята из команды, менять её нельзя): ${queue}`,
+    node
+      ? `Кадр Figma из ссылки: node-id=${node} (файлы оффлайн-слепка называют его так же)`
+      : 'Ссылки с node-id нет: кадр берётся из текущего выделения в Figma.',
+    'Текст пользователя (сырой, интерпретируй сам):',
+    '"""',
+    rest,
+    '"""',
+    '',
+    'Порядок вызовов (обязательный):',
+    '1) figma: get_document_info → get_selection → get_colors → get_typography',
+    '   (если кадр не выделен — get_css(node_id) и export_image(node_id) по ссылке)',
+    `2) sltracker: list_queues — убедиться, что очередь ${queue} существует, и взять имена статусов`,
+    `3) sltracker: create_task(queue="${queue}") — заголовок и описание по-человечески:`,
+    '   title = что за экран или компонент и что с ним делать, своими словами (НЕ имя слоя из Figma);',
+    '   description = 3-5 строк: что за экран, две-три главные вещи, что сделать, и ССЫЛКА на кадр;',
+    '   спеку (размеры, hex, шрифты, auto-layout) в описание не переписывать — она достаётся по ссылке',
+    '4) sltracker: add_comment(key из ответа create_task) — по необходимости: ссылку не дублировать,',
+    '   писать только если есть что добавить отдельно (вопрос к дизайну, расхождение с токенами)',
+    '5) sltracker: get_task(key из create_task) — проверить, что заголовок, описание и ссылка на месте',
+    '',
+    'Если Figma-мост не отвечает (панель плагина закрыта) или кадра нет ни в выделении,',
+    'ни в ссылке — скажи об этом прямо и ничего не выдумывай. Одна команда — одна задача.',
+    'В ответе дай ключ задачи, ссылку на неё в трекере и статус.',
+  ].join('\n')
+
+  trace(`task-from-figma prompt: ${prompt.length} chars, queue=${queue}, node=${node ?? '(нет)'}`)
+  await promptTurnFn(prompt)
+}
+
+/**
  * /publish-day — публикация дня по SKILLS: коммит на ветке дня → push → PR в
  * ветку недели с описанием. Детерминированный клиентский макрос (git/gh).
  */
@@ -2879,11 +3156,13 @@ async function main() {
     log.line('  --auto-approve      не спрашивать подтверждения доступа (env DSH_TERM_AUTO_APPROVE=1)')
     log.line('  --with-profiles     выбрать профиль пользователя в начале сессии (меню)')
     log.line('  --user-profile <id> включить конкретный профиль пользователя (env DSH_TERM_USER_PROFILE)')
-    log.line('  --mcp <preset>      подключить MCP-сервер (сейчас: github) — инструменты появятся как mcp__<сервер>__<тул>')
+    log.line(`  --mcp <preset>      подключить MCP-сервер; флаг повторяемый (${Object.keys(MCP_PRESETS).join(' | ')})`)
+    log.line('                      инструменты появятся как mcp__<сервер>__<тул>')
     log.line('  --mcp-toolsets <l>  тулсеты MCP-сервера: список через запятую или all (полный набор дороже по токенам)')
     log.line('  --mcp-readwrite     снять режим «только чтение» у MCP-пресета (по умолчанию readonly)')
-    log.line('  --mcp-check [preset] диагностика: подключиться к MCP и напечатать список инструментов, без сессии')
-    log.line('                      (--mcp-check --offline — только собрать оверлей, без сети)')
+    log.line('  --mcp-check [пресет] диагностика: подключиться к MCP и напечатать список инструментов, без сессии')
+    log.line('                      список через запятую или all; --mcp-check --offline — только собрать оверлей')
+    log.line('  --figma-node <текст> разобрать ссылку Figma в node-id (проверка скилла /task-from-figma)')
     log.line('  --session <id>      продолжить конкретную сессию (синоним: --resume <id>)')
     log.line('  --workspace <path>  рабочая папка сессий (default: текущая)')
     log.line('  --dsh-bin <path>    путь к dsh (default: dsh из PATH)')
@@ -2902,6 +3181,9 @@ async function main() {
     log.line('  /create-project [что строим]  сессия архитектора проекта: опросник → .project-harness')
     log.line('                → гейт инструментов → ноды (по .dsh/SKILLS/create-project.md)')
     log.line('                --check <path> — только диагностика: состояние отчётов по пути')
+    log.line('  /task-from-figma <ОЧЕРЕДЬ> <ссылка|текст>  задача в указанной очереди по кадру Figma')
+    log.line('                через два MCP-сервера сразу: --mcp figma --mcp sltracker')
+    log.line('                порядок вызовов закреплён: .dsh/SKILLS/task-from-figma.md')
     log.line('  /exit    завершить (или Ctrl+C)')
     log.line('')
     log.line('Меню команд: начни вводить «/» — список с фильтром по подстроке,')
@@ -2923,6 +3205,17 @@ async function main() {
     // Код возврата становится кодом выхода: --mcp-check пригоден для скриптов и тестов.
     const code = await runMcpCheck(opts)
     process.exitCode = code
+    return
+  }
+
+  // ---- --figma-node: разбор ссылки Figma без сессии ---------------------------
+  // Тот же разбор, что делает скилл /task-from-figma. Отдельным флагом, потому что
+  // проверить его иначе можно только запуском сессии с моделью.
+  if (opts.figmaNode !== undefined) {
+    const node = figmaNodeFromText(opts.figmaNode)
+    if (node) log.line(`node-id: ${node}`)
+    else log.err('node-id не найден: нужна ссылка Figma с параметром node-id=…')
+    process.exitCode = node ? 0 : 1
     return
   }
 
@@ -3203,6 +3496,23 @@ async function main() {
   state.mcp = mcpServers.length
     ? { servers: mcpServers, probes: new Map(), tokens: 0, patchPath: mcpPatchPath }
     : null
+
+  // Локальные stdio-серверы зондируем ДО спавна рантайма. Порядок принципиален:
+  // такой сервер поднимает сам харнесс, а у figma-моста порт фиксированный (3055),
+  // поэтому второй инстанс из зонда упал бы с EADDRINUSE — и именно его ошибку
+  // увидел бы пользователь, хотя настоящий сервер работает. Зонд занимает порт
+  // на доли секунды и отпускает его до старта рантайма.
+  if (state.mcp) {
+    for (const s of state.mcp.servers) {
+      if (s.transport !== 'stdio') continue
+      const probe = await mcpProbe(s)
+      state.mcp.probes.set(s.serverName, probe)
+      if (!probe.ok) log.err(`mcp ${s.serverName}: ${mcpProbeLine(s, probe)}`)
+    }
+    const probed = [...state.mcp.probes.values()].filter((p) => p.ok)
+    state.mcp.tokens = probed.reduce((n, p) => n + mcpRegisteredTokens(p), 0)
+    state.mcp.rawTokens = probed.reduce((n, p) => n + p.tokens, 0)
+  }
 
   let rpc = spawnRuntime(opts, token)
   rpcRef = rpc
@@ -4195,6 +4505,15 @@ async function main() {
         if (sub === 'refresh' || sub === 'reload') {
           log.dim('mcp: переподключаюсь…')
           for (const s of m.servers) {
+            // Локальный stdio-сервер держит рантайм: свой инстанс занял бы его порт.
+            // Показываем прошлый результат и честно говорим, что не перезапускаем.
+            if (s.transport === 'stdio') {
+              const known = m.probes.get(s.serverName)
+              if (known?.ok) log.dim(`  ${mcpProbeLine(s, known)} · не перезапускаю: сервер держит рантайм`)
+              else if (known) log.err(`  ${mcpProbeLine(s, known)}`)
+              else log.dim(`  ${s.serverName} · ${mcpModeLabel(s)} · зонд не запускался`)
+              continue
+            }
             const probe = await mcpProbe(s)
             m.probes.set(s.serverName, probe)
             if (probe.ok) log.ok(`  ${mcpProbeLine(s, probe)}`)
@@ -4235,7 +4554,7 @@ async function main() {
           if (probe?.ok) log.dim(`  ${mcpProbeLine(s, probe)}`)
           else if (probe) log.err(`  ${mcpProbeLine(s, probe)}`)
           else log.dim(`  ${s.serverName} · ${mcpModeLabel(s)} · зонд в процессе`)
-          log.dim(`    url: ${s.url}`)
+          log.dim(`    ${s.transport === 'stdio' ? 'запуск' : 'url'}: ${mcpTarget(s)}`)
           log.dim(`    инструменты для модели: mcp__${s.serverName}__<tool> — их описания уходят в каждый запрос`)
         }
         if (m.tokens) {
@@ -4266,6 +4585,10 @@ async function main() {
       }
       case 'create-project': {
         await createProject(opts, parts, askLine, promptTurn, state)
+        break
+      }
+      case 'task-from-figma': {
+        await taskFromFigma(opts, parts, promptTurn, state)
         break
       }
       case 'exit': {
@@ -4353,6 +4676,12 @@ async function main() {
       log.dim(`mcp: включён ${state.mcp.servers.map((s) => s.serverName).join(', ')} · ${state.mcp.servers.map(mcpModeLabel).join(' | ')} · запрашиваю список инструментов…`)
       state.mcp.pending = new Map()
       for (const s of state.mcp.servers) {
+        // stdio уже проверен до старта рантайма — второй инстанс занял бы его порт.
+        const known = state.mcp.probes.get(s.serverName)
+        if (known) {
+          if (known.ok) log.dim(`  mcp: ${mcpProbeLine(s, known)} · инструменты видны как mcp__${s.serverName}__*`)
+          continue
+        }
         const pending = mcpProbe(s).then((probe) => {
           if (!state.mcp) return probe
           state.mcp.probes.set(s.serverName, probe)
