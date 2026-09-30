@@ -120,6 +120,40 @@ class Searcher:
         cur = self.conn.execute(f"SELECT * FROM chunks WHERE chunk_id IN ({marks})", ids)
         return {row["chunk_id"]: row for row in cur}
 
+    def neighbours(self, hits: list[dict], span: int = 1) -> list[dict]:
+        """Соседние чанки тех же заметок — «достать соседей» для контекста.
+
+        Зачем: заметки-списки (например, матрица умений) режутся на несколько частей,
+        и в топ поиска попадает лишь одна из них — вводная строка без самого перечня.
+        Соседи возвращают в контекст то, что поиск по вектору не выбрал, но что
+        относится к тому же разделу заметки.
+        """
+        if span <= 0 or not hits:
+            return []
+        chosen = {hit["chunk_id"] for hit in hits}
+        extra: dict[str, dict] = {}
+        for hit in hits:
+            rows = self.conn.execute(
+                """SELECT * FROM chunks WHERE strategy = ? AND source = ?
+                   ORDER BY start_line, chunk_id""",
+                (self.strategy, hit["source"]),
+            ).fetchall()
+            order = [row["chunk_id"] for row in rows]
+            if hit["chunk_id"] not in order:
+                continue
+            position = order.index(hit["chunk_id"])
+            for index in range(max(position - span, 0), min(position + span + 1, len(rows))):
+                row = dict(rows[index])
+                if row["chunk_id"] in chosen or row["chunk_id"] in extra:
+                    continue
+                row["rank"] = 0
+                row["score"] = 0.0
+                row["dense_rank"] = None
+                row["lexical_rank"] = None
+                row["neighbour_of"] = hit["chunk_id"]
+                extra[row["chunk_id"]] = row
+        return list(extra.values())
+
 
 def snippet(text: str, query: str, width: int = 200) -> str:
     """Короткий фрагмент вокруг первого совпадения — для вывода в консоль."""

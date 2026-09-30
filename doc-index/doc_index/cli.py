@@ -12,13 +12,17 @@ import json
 import textwrap
 from pathlib import Path
 
+from .agent import HarnessAgent
+from .compare import load_control, run_control, summarize, write_report
+from .llm import LlmClient
 from . import store
 from .chunk import build_chunks, chunk_stats
 from .collect import collect
 from .config import DEFAULT_OUT, DEFAULT_VAULT, Config
 from .embed import OllamaEmbedder
-from .evaluate import evaluate, load_questions, source_skew, write_report
+from .evaluate import evaluate, load_questions, source_skew, write_report as write_eval_report
 from .indexer import build_index
+from .rag import answer_question
 from .search import Searcher, snippet
 
 DEFAULT_STRATEGIES = "fixed,structural"
@@ -113,8 +117,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         "pages": round(sum(len(n.text) for n in notes) / 1800),
         "folders": folders,
     }
-    path = write_report(evaluation, cfg.out, chunk_stats_by_strategy=stats, corpus=corpus,
-                        skew=source_skew(evaluation, "99_Приложения"))
+    path = write_eval_report(evaluation, cfg.out, chunk_stats_by_strategy=stats, corpus=corpus,
+                             skew=source_skew(evaluation, "99_Приложения"))
     print(f"\nотчёт: {path}")
     for res in sorted(evaluation["results"].values(), key=lambda r: -r["mrr"]):
         print(f"  {res['strategy']:<18} {res['mode']:<8} recall@1 {res['recall@1']:.2f} · "
@@ -145,6 +149,71 @@ def cmd_stats(args: argparse.Namespace) -> int:
         print("индекс:", json.dumps(store.index_stats(conn), ensure_ascii=False))
     else:
         print(f"индекса ещё нет: {cfg.db_path()}")
+    return 0
+
+
+def _answerer(args: argparse.Namespace):
+    """Кто отвечает: чистый клиент модели или агент харнесса.
+
+    По умолчанию чистый клиент. Агент харнесса умеет читать файлы, поэтому для
+    сравнения режимов он опасен: в первом прогоне он прочитал файл с эталонами
+    и пересказал его в ответе «без RAG». Оставлен для интерактивных вопросов.
+    """
+    if args.backend == "harness":
+        return HarnessAgent(model=args.llm_model, cwd=Path(args.out).expanduser())
+    return LlmClient(model=args.llm_model)
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Один вопрос в двух режимах: с найденным контекстом и без него."""
+    cfg = _config(args)
+    conn = store.connect(cfg.db_path())
+    hits: list[dict] = []
+    if args.mode in ("rag", "both"):
+        searcher = Searcher(conn, cfg, OllamaEmbedder(cfg), args.strategy)
+        hits = searcher.search(args.question, k=args.k, mode=args.search_mode)
+        if not hits:
+            print("поиск ничего не нашёл — RAG-режим пойдёт без контекста")
+        elif args.expand:
+            hits = hits + searcher.neighbours(hits, args.expand)
+    modes = ["rag", "no-rag"] if args.mode == "both" else [args.mode]
+    with _answerer(args) as agent:
+        for mode in modes:
+            answer = answer_question(agent, args.question, question_id="ask", mode=mode,
+                                     hits=hits if mode == "rag" else None, max_chars=args.max_chars)
+            title = "С RAG" if mode == "rag" else "БЕЗ RAG"
+            print(f"\n=== {title} · {answer.seconds:.1f} с · промпт {len(answer.prompt)} символов ===")
+            print(answer.answer or "(пустой ответ)")
+            if mode == "rag" and hits:
+                print("\nисточники:")
+                for hit in hits:
+                    print(f"  [{hit['rank']}] {hit['source']} · {hit['breadcrumb'] or hit['section']} "
+                          f"(строки {hit['start_line']}–{hit['end_line']})")
+    return 0
+
+
+def cmd_control(args: argparse.Namespace) -> int:
+    """Прогон контрольного набора в обоих режимах со сравнением качества."""
+    cfg = _config(args)
+    cfg.ensure_out()
+    conn = store.connect(cfg.db_path())
+    questions = load_control(Path(args.questions))
+    searcher = Searcher(conn, cfg, OllamaEmbedder(cfg), args.strategy)
+    judge = not args.no_judge
+    print(f"контрольный набор: {len(questions)} вопросов × 2 режима"
+          + (" + слепое судейство" if judge else " (без судейства)"))
+    with _answerer(args) as agent:
+        result = run_control(questions, searcher, agent, k=args.k, max_chars=args.max_chars,
+                             judge=judge, search_mode=args.search_mode, expand=args.expand)
+        path = write_report(result, cfg.out, model=agent.model)
+    summary = summarize(result)
+    print(f"\nотчёт: {path}")
+    for mode, title in (("rag", "с RAG"), ("no-rag", "без RAG")):
+        part = summary[mode]
+        print(f"  {title:<8} факты {part['facts_covered']}/{part['facts_total']} "
+              f"({part['facts_share']:.2f}) · средняя оценка {part['judge_mean']} · "
+              f"ответ {part['chars_avg']} символов за {part['seconds_avg']} с")
+    print(f"  источник найден в топ-{args.k}: {summary['retrieval_hits']} из {summary['retrieval_total']}")
     return 0
 
 
@@ -182,6 +251,34 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_stats)
     p_stats.add_argument("--strategies", default=ALL_STRATEGIES)
     p_stats.set_defaults(func=cmd_stats)
+
+    def add_rag_flags(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--strategy", default="structural", help="стратегия чанкинга для поиска")
+        parser.add_argument("--search-mode", default="dense", choices=["dense", "hybrid", "lexical"],
+                            help="канал поиска: по дню 21 векторный точнее гибрида")
+        parser.add_argument("--k", type=int, default=5, help="сколько фрагментов подать в контекст")
+        parser.add_argument("--max-chars", type=int, default=6000, help="бюджет контекста в символах")
+        parser.add_argument("--llm-model", default="deepseek-v4-flash", help="модель агента")
+        parser.add_argument("--expand", type=int, default=0,
+                            help="добавить в контекст N соседних чанков каждой найденной заметки")
+        parser.add_argument("--backend", default="api", choices=["api", "harness"],
+                            help="api — чистый вызов модели (по умолчанию); harness — агент с инструментами, "
+                                 "он умеет читать файлы и может подглядеть в корпус или в эталоны")
+
+    p_ask = sub.add_parser("ask", help="спросить базу: с RAG и без RAG")
+    _add_common(p_ask)
+    add_rag_flags(p_ask)
+    p_ask.add_argument("question")
+    p_ask.add_argument("--mode", default="both", choices=["both", "rag", "no-rag"])
+    p_ask.set_defaults(func=cmd_ask)
+
+    p_control = sub.add_parser("control", help="контрольный набор: сравнение качества с RAG и без")
+    _add_common(p_control)
+    add_rag_flags(p_control)
+    p_control.add_argument("--questions",
+                           default=str(Path(__file__).resolve().parent.parent / "data" / "control-questions.yaml"))
+    p_control.add_argument("--no-judge", action="store_true", help="без слепого судейства моделью")
+    p_control.set_defaults(func=cmd_control)
     return parser
 
 
