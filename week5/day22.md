@@ -89,7 +89,7 @@
 Обе меры считаются по 47 фактам на 12 вопросов.
 
 ```powershell
-python -m doc_index.cli control --k 5 --expand 1
+python -m doc_index control --k 5 --expand 1
 ```
 
 Оба режима идут на одних и тех же вопросах, поиск для режима с RAG — один и тот же.
@@ -198,9 +198,9 @@ doc-index/
 
 ```powershell
 cd doc-index
-python -m doc_index.cli control --k 5 --expand 1                          # оба режима + отчёт
-python -m doc_index.cli ask "что такое агентный харнесс" --mode rag --show-sources
-python -m doc_index.cli ask "что такое MCP" --mode no-rag
+python -m doc_index control --k 5 --expand 1                          # оба режима + отчёт
+python -m doc_index ask "что такое агентный харнесс" --mode both      # оба режима, с источниками
+python -m doc_index ask "что такое MCP" --mode rag --backend harness  # тот же вопрос через агента
 ```
 
 Тесты (`pytest doc-index/tests`, 39 тестов) сети и модели не требуют: поиск, чанкинг, сборка
