@@ -99,6 +99,11 @@ class Searcher:
 
         dense_rank = {cid: r for r, (cid, _) in enumerate(dense_hits, 1)}
         lex_rank = {cid: r for r, (cid, _) in enumerate(lexical_hits, 1)}
+        # Сырые оценки каналов сохраняются отдельно от итоговой. В hybrid-режиме
+        # `score` — это RRF (≈1/(60+ранг)), и порог по нему смысла не имеет, а для
+        # фильтрации нужен именно косинус dense-канала. День 23.
+        dense_score = {cid: sc for cid, sc in dense_hits}
+        lex_score = {cid: sc for cid, sc in lexical_hits}
         rows = self._rows([cid for cid, _ in fused])
         out: list[dict] = []
         for rank, (chunk_id, score) in enumerate(fused, start=1):
@@ -108,6 +113,8 @@ class Searcher:
             row = dict(row)
             row["rank"] = rank
             row["score"] = round(score, 5)
+            row["dense_score"] = round(dense_score[chunk_id], 5) if chunk_id in dense_score else None
+            row["lexical_score"] = round(lex_score[chunk_id], 5) if chunk_id in lex_score else None
             row["dense_rank"] = dense_rank.get(chunk_id)
             row["lexical_rank"] = lex_rank.get(chunk_id)
             out.append(row)
@@ -148,6 +155,8 @@ class Searcher:
                     continue
                 row["rank"] = 0
                 row["score"] = 0.0
+                row["dense_score"] = 0.0
+                row["lexical_score"] = None
                 row["dense_rank"] = None
                 row["lexical_rank"] = None
                 row["neighbour_of"] = hit["chunk_id"]
