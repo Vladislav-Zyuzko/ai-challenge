@@ -26,3 +26,7 @@ doc-index/out/
 # Python: байткод и кэши (day21)
 __pycache__/
 *.py[cod]
+
+# дампы поиска по arXiv/EuropePMC (исследование day19) — рабочий мусор в корне
+/_arxiv*.txt
+/_epmc*.txt
