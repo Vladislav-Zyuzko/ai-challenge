@@ -64,6 +64,14 @@ def build_context(hits: list[dict], max_chars: int = 6000) -> str:
     return "\n\n".join(blocks)
 
 
+def usage(agent: object) -> tuple[int, int]:
+    """Израсходованные токены (промпт, ответ). У агента харнесса счётчиков нет."""
+    stats = getattr(agent, "usage", None)
+    if stats is None:
+        return (0, 0)
+    return (stats.prompt_tokens, stats.completion_tokens)
+
+
 def build_prompt(question: str, hits: list[dict] | None = None, *, max_chars: int = 6000) -> str:
     """Промпт для обоих режимов: отличается только блоком контекста."""
     lines = [RULES]

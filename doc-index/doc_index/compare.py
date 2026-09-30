@@ -22,7 +22,7 @@ import yaml
 
 from .agent import AgentReply
 from .config import Config
-from .rag import Answerer, MODES, RagAnswer, answer_question
+from .rag import Answerer, MODES, RagAnswer, answer_question, usage
 from .search import Searcher
 
 JUDGE_TEMPLATE = """Оцени ответ на вопрос по эталону.
@@ -99,10 +99,7 @@ def judge_answer(agent: Answerer, item: dict, answer: RagAnswer) -> tuple[int | 
 
 def _usage(agent: object) -> tuple[int, int]:
     """Токены у клиента модели; у агента харнесса счётчиков нет."""
-    usage = getattr(agent, "usage", None)
-    if usage is None:
-        return (0, 0)
-    return (usage.prompt_tokens, usage.completion_tokens)
+    return usage(agent)
 
 
 def run_control(questions: list[dict], searcher: Searcher, agent: Answerer, *,
