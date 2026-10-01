@@ -1104,6 +1104,7 @@ function parseArgs(argv) {
     mcpReadwrite: undefined, // --mcp-readwrite: снять режим «только чтение» у MCP-пресета
     mcpCheck: undefined,     // --mcp-check [preset]: только соединение + список инструментов, без сессии
     offline: undefined,      // --mcp-check --offline: показать оверлей и выйти (без сети)
+    rag: undefined,          // --rag <имя>: подключить базу знаний из .dsh/rag.json (повторяемый)
     autoApprove: undefined,  // разрешать запросы доступа без вопросов (env DSH_TERM_AUTO_APPROVE)
     help: false,
   }
@@ -1128,6 +1129,7 @@ function parseArgs(argv) {
       case '--auto-approve': opts.autoApprove = true; break
       case '--with-profiles': opts.withProfiles = true; break
       case '--user-profile': opts.userProfile = next(); break
+      case '--rag': opts.rag = [...(opts.rag ?? []), next()]; break
       case '--mcp': opts.mcp = [...(opts.mcp ?? []), next()]; break
       case '--mcp-toolsets': opts.mcpToolsets = next(); break
       case '--mcp-readwrite': opts.mcpReadwrite = true; break
@@ -1335,6 +1337,7 @@ const COMMANDS = [
   { name: 'context', usage: '/context', desc: 'контекст: стратегия, факты, метрики, последний summary' },
   { name: 'profile', usage: '/profile [show|list|use <slug>|new|off]', desc: 'профиль пользователя (персонализация): показать, сменить, создать, выключить' },
   { name: 'mcp', usage: '/mcp [show|tools|refresh]', desc: 'MCP-серверы: соединение, список инструментов и их цена в промпте' },
+  { name: 'rag', usage: '/rag [list]', desc: 'базы знаний сессии (--rag): что подключено и какие есть в реестре' },
   { name: 'resume', usage: '/resume [id]', desc: 'продолжить сессию: по id или выбором из списка' },
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
@@ -2070,21 +2073,34 @@ function profileNoticeText(profile) {
 }
 
 /**
- * YAML-оверлей: профиль как personaPrefix системного промпта.
+ * YAML-оверлей: фрагмент системного промпта (personaPrefix).
  *
- * Оверлей пишется из {@link userProfilePromptText} (профиль + рамка приоритета),
- * а не из «сырого» текста профиля: рамка — часть того, что видит модель.
+ * Несёт всё, что dsh-term добавляет к системному промпту: профиль пользователя и
+ * инструкции сессии (например, про подключённую базу знаний из `--rag`). Части
+ * склеиваются в один оверлей намеренно: `personaPrefix` в конфиге один, и два
+ * оверлея `- id: system-prompt` перетёрли бы друг друга.
  */
-function userProfileOverlayYaml(profile) {
-  const indented = userProfilePromptText(profile).split('\n').map((l) => `      ${l}`).join('\n')
+function systemPromptOverlayYaml(parts) {
+  const text = parts.filter(Boolean).join('\n\n')
+  const indented = text.split('\n').map((l) => `      ${l}`).join('\n')
   return [
-    '# dsh-term: профиль пользователя в system prompt (personaPrefix).',
+    '# dsh-term: профиль пользователя и инструкции сессии в system prompt.',
     '- id: system-prompt',
     '  config:',
     '    personaPrefix: |-',
     indented,
     '',
   ].join('\n')
+}
+
+/**
+ * Оверлей профиля пользователя.
+ *
+ * Пишется из {@link userProfilePromptText} (профиль + рамка приоритета), а не из
+ * «сырого» текста профиля: рамка — часть того, что видит модель.
+ */
+function userProfileOverlayYaml(profile) {
+  return systemPromptOverlayYaml([userProfilePromptText(profile)])
 }
 
 /** Слить новые пункты в секции: без дублей, с лимитом пунктов на секцию. */
@@ -2426,6 +2442,155 @@ function mcpPatchYaml(servers) {
   return lines.join('\n') + '\n'
 }
 
+// ---- RAG (day23): локальные базы знаний как возможность сессии ---------------
+// `--rag <имя>` подключает к сессии проиндексированный набор документов. Механика
+// та же, что у MCP-пресетов: харнесс поднимает stdio-сервер `doc_index.mcp_server`
+// через мост `@deepseek-ai/dsh-mcp-client`, а инструменты появляются у агента.
+// Сверх этого в системный промпт уходит инструкция опираться на базу — иначе
+// инструмент есть, а привычки им пользоваться нет.
+//
+// Реестр баз — файл `.dsh/rag.json` в рабочей папке: базы добавляются без правки
+// этого файла. Формат: { "имя": { title, index, what, strategy, margin, minDense } },
+// где `index` — каталог проекта doc-index (внутри ожидается out/index.db).
+const RAG_REGISTRY_NAME = 'rag.json'
+const RAG_SERVER_NAME = 'rag'
+const RAG_DEFAULT_STRATEGY = 'structural'
+const RAG_DEFAULT_MARGIN = 0.04
+const RAG_DEFAULT_MIN_DENSE = 0.5
+
+function ragRegistryPath(cwd = process.cwd()) {
+  return process.env.DSH_TERM_RAG_FILE || join(cwd, '.dsh', RAG_REGISTRY_NAME)
+}
+
+/** Прочитать реестр баз. Ошибка разбора не роняет сессию: её видно в диагностике. */
+function readRagRegistry(cwd = process.cwd()) {
+  const path = ragRegistryPath(cwd)
+  if (!existsSync(path)) return { path, bases: {}, error: null, missing: true }
+  try {
+    const data = JSON.parse(readFileSync(path, 'utf8'))
+    const bases = data && typeof data.bases === 'object' ? data.bases : data
+    if (!bases || typeof bases !== 'object') throw new Error('ожидается объект «имя → база»')
+    return { path, bases, error: null, missing: false }
+  } catch (e) {
+    return { path, bases: {}, error: e.message, missing: false }
+  }
+}
+
+/** Имена баз из `--rag`: повторяемый флаг и списки через запятую. */
+function ragRequestedNames(opts) {
+  const raw = opts.rag ?? []
+  const names = []
+  for (const value of raw) {
+    for (const part of String(value).split(',')) {
+      const name = part.trim()
+      if (name && !names.includes(name)) names.push(name)
+    }
+  }
+  return names
+}
+
+/**
+ * Описание баз для системного промпта.
+ *
+ * Инструкция намеренно короткая: она едет в каждый запрос, а её задача — задать
+ * привычку («сначала спроси базу») и правило ссылок, а не пересказать корпус.
+ */
+function ragInstructionText(names, bases) {
+  const lines = [
+    'В этой сессии подключена база знаний — инструмент `rag_search`.',
+    '',
+    'Что в базе:',
+  ]
+  for (const name of names) {
+    const entry = bases[name] ?? {}
+    const title = entry.title ? ` — ${entry.title}` : ''
+    const what = entry.what ? `: ${entry.what}` : ''
+    lines.push(`- \`${name}\`${title}${what}`)
+  }
+  lines.push(
+    '',
+    'Правила работы с базой:',
+    '- вопросы по темам базы — сначала `rag_search`, потом ответ; опирайся на найденные фрагменты;',
+    '- в ответе ссылайся на заметку и строки из выдачи (source, «строки N–M»);',
+    '- если инструмент ответил, что ответа нет, — скажи об этом прямо, не достраивай по памяти;',
+    '- база не заменяет твои знания: вопросы вне её тем разбирай как обычно, без выдуманных ссылок.',
+  )
+  return lines.join('\n')
+}
+
+/**
+ * Синтезировать MCP-сервер RAG из выбранных баз: один stdio-процесс на все базы.
+ *
+ * `python` берётся из PATH; сам пакет лежит в каталоге doc-index, поэтому путь к
+ * нему уходит в PYTHONPATH — иначе `-m doc_index.mcp_server` не найдётся.
+ */
+function ragServerFor(names, bases, { cwd = process.cwd() } = {}) {
+  const first = bases[names[0]] ?? {}
+  const indexDirs = names.map((name) => resolve(cwd, String(bases[name]?.index ?? '')))
+  const root = indexDirs[0]
+  const args = ['-m', 'doc_index.mcp_server']
+  for (const [i, name] of names.entries()) {
+    const entry = bases[name] ?? {}
+    args.push('--base', `${name}=${indexDirs[i]}`)
+    if (entry.title) args.push('--title', `${name}=${entry.title}`)
+    if (entry.what) args.push('--what', `${name}=${entry.what}`)
+  }
+  args.push('--strategy', String(first.strategy || RAG_DEFAULT_STRATEGY))
+  args.push('--margin', String(first.margin ?? RAG_DEFAULT_MARGIN))
+  args.push('--min-dense', String(first.minDense ?? RAG_DEFAULT_MIN_DENSE))
+  const what = names
+    .map((name) => `${name}${bases[name]?.what ? ` (${bases[name].what})` : ''}`)
+    .join(', ')
+  return {
+    serverName: RAG_SERVER_NAME,
+    title: 'RAG: локальные базы знаний (stdio)',
+    transport: 'stdio',
+    command: process.env.DSH_TERM_RAG_PYTHON || 'python',
+    args,
+    env: { PYTHONPATH: root, PYTHONIOENCODING: 'utf-8' },
+    what: `поиск по базе знаний с источниками и строками — ${what}`,
+  }
+}
+
+/**
+ * Разобрать `--rag`: что подключено, чем и с какой инструкцией.
+ *
+ * Ошибки возвращаются, а не печатаются: вызывающая сторона решает, падать или
+ * продолжать без базы знаний.
+ */
+function resolveRag(opts) {
+  const names = ragRequestedNames(opts)
+  if (!names.length) return { names: [], servers: [], instruction: null, registry: null, error: null }
+  const registry = readRagRegistry()
+  if (registry.error) {
+    return { names, servers: [], instruction: null, registry,
+             error: `реестр баз ${registry.path} не читается: ${registry.error}` }
+  }
+  if (registry.missing) {
+    return { names, servers: [], instruction: null, registry,
+             error: `нет файла реестра баз ${registry.path}` }
+  }
+  const unknown = names.filter((name) => !registry.bases[name])
+  if (unknown.length) {
+    return { names, servers: [], instruction: null, registry,
+             error: `неизвестная база знаний: ${unknown.join(', ')}` }
+  }
+  // Каталог проверяем до старта: иначе ошибка всплывёт уже в рантайме, где её
+  // причина теряется среди вывода MCP-моста.
+  const missing = names.filter((name) => !existsSync(resolve(process.cwd(), String(registry.bases[name].index ?? ''))))
+  if (missing.length) {
+    return { names, servers: [], instruction: null, registry,
+             error: `каталог базы не найден: ${missing.map((n) => `${n} → ${registry.bases[n].index}`).join(', ')}` }
+  }
+  return {
+    names,
+    servers: [ragServerFor(names, registry.bases)],
+    instruction: ragInstructionText(names, registry.bases),
+    registry,
+    error: null,
+  }
+}
+
 /**
  * Есть ли уже MCP-строка в пользовательском слое профиля: `insert` не
  * идемпотентен, повторная вставка того же id валит дерево плагинов
@@ -2449,8 +2614,13 @@ async function mcpProbeStdio(server, { timeoutMs = 20000 } = {}) {
   return await new Promise((resolve) => {
     let child
     try {
-      child = spawn(server.command, [...(server.args ?? []), server.script], {
+      // `script` — это последний аргумент stdio-сервера (так записан figma-мост).
+      // У серверов, которые запускаются пакетом (`python -m …`), скрипта нет:
+      // добавлять `undefined` в argv нельзя, спавн падает на типе аргумента.
+      // env нужен тем же серверам: путь к пакету у них едет через PYTHONPATH.
+      child = spawn(server.command, [...(server.args ?? []), ...(server.script ? [server.script] : [])], {
         stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, ...(server.env ?? {}) },
       })
     } catch (e) {
       resolve(fail(e.message))
@@ -2657,32 +2827,58 @@ function mcpRegisteredTokens(probe) {
 async function runMcpCheck(opts) {
   // День 20: серверов несколько, и проверять их вместе полезнее, чем по одному —
   // поэтому принимаем и список `figma,sltracker`, и `all`.
+  // День 23: имя `rag` здесь означает не пресет, а синтезированный из `--rag`
+  // сервер базы знаний — его тоже нужно уметь проверить до старта сессии.
   const requested = String(opts.mcpCheck ?? '').trim()
-  const names = requested === MCP_ALL_PRESETS
-    ? Object.keys(MCP_PRESETS)
+  const rag = resolveRag(opts)
+  if (rag.error) {
+    log.err(rag.error)
+    const known = rag.registry ? Object.keys(rag.registry.bases) : []
+    if (known.length) log.dim(`доступно: ${known.join(' | ')}`)
+    else if (rag.registry?.missing) {
+      log.dim('реестр баз: .dsh/rag.json — { "имя": { "title": "…", "index": "doc-index", "what": "…" } }')
+    }
+    return 1
+  }
+  const wantsAll = requested === MCP_ALL_PRESETS
+  const names = wantsAll
+    ? [...Object.keys(MCP_PRESETS), ...(rag.names.length ? [RAG_SERVER_NAME] : [])]
     : requested.split(',').map((x) => x.trim()).filter(Boolean)
+  const wantsRag = names.includes(RAG_SERVER_NAME)
   const { servers, unknown } = resolveMcpServers({
-    mcp: names,
+    mcp: names.filter((n) => n !== RAG_SERVER_NAME),
     mcpToolsets: opts.mcpToolsets,
     mcpReadwrite: opts.mcpReadwrite,
   })
   if (unknown.length) {
     log.err(`неизвестный MCP-пресет: ${unknown.join(', ')}`)
-    log.dim(`доступно: ${Object.keys(MCP_PRESETS).join(' | ')}`)
+    log.dim(`доступно: ${Object.keys(MCP_PRESETS).join(' | ')}${rag.names.length ? ' | rag' : ''}`)
     return 1
+  }
+  if (wantsRag) {
+    if (!rag.servers.length) {
+      log.err('mcp-check rag: база знаний не выбрана — нужен --rag <имя>')
+      log.dim(`доступные базы: ${Object.keys(readRagRegistry().bases).join(' | ') || 'реестр пуст'}`)
+      return 1
+    }
+    servers.push(...rag.servers)
   }
   if (!servers.length) {
     log.err('нечего проверять: не задан MCP-пресет')
     return 1
   }
-  mcpAttachTokens(servers)
+  mcpAttachTokens(servers.filter((s) => s.serverName !== RAG_SERVER_NAME))
   for (const s of servers) {
     if (s.tokenError) log.err(`${s.serverName}: ${s.tokenError}`)
   }
   log.line(`${C.bold}mcp-check${C.off} ${servers.map((s) => s.serverName).join(', ')}`)
-  log.dim(`  режим: ${servers.map(mcpModeLabel).join(' | ')}`)
+  log.dim(`  режим: ${servers.map((s) => (s.serverName === RAG_SERVER_NAME ? 'rag' : mcpModeLabel(s))).join(' | ')}`)
   log.dim(`  оверлей (уходит в рантайм через --patch, секретов в файле нет):`)
   for (const l of mcpPatchYaml(servers).trimEnd().split('\n')) log.dim(`    ${l}`)
+  if (rag.instruction) {
+    log.dim('  оверлей системного промпта (инструкция опираться на базу):')
+    for (const l of systemPromptOverlayYaml([rag.instruction]).trimEnd().split('\n')) log.dim(`    ${l}`)
+  }
   if (opts.offline) {
     log.dim('  --offline: сеть не трогаем, соединение не проверялось')
     return 0
@@ -3158,6 +3354,8 @@ async function main() {
     log.line('  --user-profile <id> включить конкретный профиль пользователя (env DSH_TERM_USER_PROFILE)')
     log.line(`  --mcp <preset>      подключить MCP-сервер; флаг повторяемый (${Object.keys(MCP_PRESETS).join(' | ')})`)
     log.line('                      инструменты появятся как mcp__<сервер>__<тул>')
+    log.line('  --rag <имя>         подключить базу знаний из .dsh/rag.json; флаг повторяемый')
+    log.line('                      агент получает инструмент rag_search и инструкцию опираться на базу')
     log.line('  --mcp-toolsets <l>  тулсеты MCP-сервера: список через запятую или all (полный набор дороже по токенам)')
     log.line('  --mcp-readwrite     снять режим «только чтение» у MCP-пресета (по умолчанию readonly)')
     log.line('  --mcp-check [пресет] диагностика: подключиться к MCP и напечатать список инструментов, без сессии')
@@ -3177,6 +3375,7 @@ async function main() {
     log.line('  /resume [id]  продолжить сессию: по id или выбором из списка')
     log.line('  /new     начать новую сессию')
     log.line('  /token   сменить сохранённый API ключ')
+    log.line('  /rag [list]  базы знаний сессии (--rag): что подключено и что есть в .dsh/rag.json')
     log.line('  /publish-day  git+gh: коммит → push → PR day→week (по .dsh/SKILLS)')
     log.line('  /create-project [что строим]  сессия архитектора проекта: опросник → .project-harness')
     log.line('                → гейт инструментов → ноды (по .dsh/SKILLS/create-project.md)')
@@ -3408,6 +3607,28 @@ async function main() {
     return readUserProfile(opts.dshHome, slug)
   }
 
+  // ---- RAG (day23): базы знаний сессии ---------------------------------------
+  // Разрешается ДО применения профиля: инструкция про базу едет в тот же оверлей
+  // системного промпта, что и профиль, — personaPrefix в конфиге один.
+  const rag = resolveRag(opts)
+  if (rag.error) {
+    log.err(rag.error)
+    if (rag.registry && !rag.registry.missing) {
+      const known = Object.keys(rag.registry.bases)
+      if (known.length) log.dim(`доступно: ${known.join(' | ')}`)
+    } else {
+      log.dim('реестр баз: .dsh/rag.json — { "имя": { "title": "…", "index": "doc-index", "what": "…" } }')
+    }
+    process.exit(1)
+  }
+  state.ragInstruction = rag.instruction
+  state.rag = rag.names.length
+    ? { names: rag.names, servers: rag.servers, registry: rag.registry?.path ?? null }
+    : null
+  if (rag.names.length) {
+    log.dim(`rag: ${rag.names.join(', ')} · инструмент rag_search (детали: /rag)`)
+  }
+
   const personaPatchPath = join(opts.dshHome, 'dsh-term-persona.patch.yml')
   const profileSlug = opts.userProfile ?? process.env.DSH_TERM_USER_PROFILE ?? null
   let userProfile = null
@@ -3428,17 +3649,23 @@ async function main() {
    * едет в system prompt оверлеем `- id: system-prompt` + personaPrefix, а
    * system prompt фиксируется при спавне — поэтому смена профиля помечается
    * флагом profileDirty, и перед следующим ходом рантайм перезапускается.
+   *
+   * В тот же оверлей попадает инструкция сессии про базу знаний (`--rag`):
+   * personaPrefix один, поэтому текст собирается из частей, а не двумя оверлеями.
    */
   function applyUserProfile(profile, { dirty = true } = {}) {
     state.userProfile = profile
     let patches = (opts.patches ?? []).filter((p) => p !== personaPatchPath)
-    if (profile !== null) {
+    const parts = []
+    if (profile !== null) parts.push(userProfilePromptText(profile))
+    if (state.ragInstruction) parts.push(state.ragInstruction)
+    if (parts.length) {
       try {
         mkdirSync(opts.dshHome, { recursive: true })
-        writeFileSync(personaPatchPath, userProfileOverlayYaml(profile), 'utf8')
+        writeFileSync(personaPatchPath, systemPromptOverlayYaml(parts), 'utf8')
         patches = [...patches, personaPatchPath]
       } catch (e) {
-        log.err(`persona patch failed: ${e.message}`)
+        log.err(`prompt patch failed: ${e.message}`)
       }
     }
     opts.patches = patches
@@ -3458,6 +3685,10 @@ async function main() {
   // Секрет (токен GitHub) едет через env рантайма: в файле-оверлее только `!!js`.
   const mcpEnv = {}
   const { servers: mcpServers, unknown: mcpUnknown } = resolveMcpServers(opts)
+  // Базы знаний едут тем же мостом, что MCP-пресеты: для рантайма это просто ещё
+  // один stdio-сервер инструментов, поэтому и диагностика (`/mcp`, зонд, цена в
+  // промпте) у него общая с пресетами.
+  if (rag.servers.length) mcpServers.push(...rag.servers)
   if (mcpUnknown.length) {
     log.err(`неизвестный MCP-пресет: ${mcpUnknown.join(', ')}`)
     log.dim(`доступно: ${Object.keys(MCP_PRESETS).join(' | ')}`)
@@ -4492,6 +4723,53 @@ async function main() {
           log.line(`${C.dim}resuming session:${C.reset} ${fmtSession(chosen, state.titles[chosen])}`)
           if (state.context) log.dim(`  стратегия сессии: ${strategyLabel(state.context)}`)
         }
+        break
+      }
+      case 'rag': {
+        // Базы выбираются при старте, как MCP-серверы: соединение поднимается
+        // вместе с рантаймом, поэтому «подключить на лету» нельзя — команда
+        // показывает состояние и подсказывает строку следующего запуска.
+        const sub = (parts[1] ?? '').toLowerCase()
+        const registry = readRagRegistry()
+        if (sub === 'list' || sub === 'ls') {
+          if (registry.error) {
+            log.err(`реестр баз ${registry.path} не читается: ${registry.error}`)
+            break
+          }
+          if (registry.missing) {
+            log.err(`нет файла реестра баз: ${registry.path}`)
+            log.dim('формат: { "имя": { "title": "…", "index": "doc-index", "what": "…" } }')
+            break
+          }
+          const names = Object.keys(registry.bases)
+          if (!names.length) {
+            log.dim(`реестр ${registry.path} пуст`)
+            break
+          }
+          log.line(`базы знаний (${registry.path}):`)
+          for (const name of names) {
+            const entry = registry.bases[name] ?? {}
+            const active = state.rag?.names?.includes(name) ? '●' : '○'
+            log.line(`  ${active} ${name}${entry.title ? ` — ${entry.title}` : ''}`)
+            if (entry.what) log.dim(`      ${entry.what}`)
+            log.dim(`      каталог: ${entry.index ?? '—'}`
+              + (entry.strategy ? ` · стратегия ${entry.strategy}` : '')
+              + (entry.margin !== undefined ? ` · маржа ${entry.margin}` : ''))
+          }
+          log.dim('подключение: dsh-term --rag <имя>')
+          break
+        }
+        if (!state.rag?.names?.length) {
+          log.dim('база знаний в этой сессии не подключена')
+          log.dim('запуск: dsh-term --rag <имя> · список баз: /rag list')
+          break
+        }
+        log.line(`база знаний: ${state.rag.names.join(', ')} · инструмент rag_search`)
+        if (state.rag.registry) log.dim(`  реестр: ${state.rag.registry}`)
+        for (const server of state.rag.servers) {
+          log.dim(`  сервер: ${server.serverName} · ${mcpTarget(server)}`)
+        }
+        log.dim('  смена баз — при следующем запуске: соединение поднимается вместе с рантаймом')
         break
       }
       case 'mcp': {
