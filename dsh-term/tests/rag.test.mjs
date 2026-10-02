@@ -116,6 +116,34 @@ const help = run(['--help'])
 check('--rag описан в справке', /--rag <имя>/.test(help.out))
 check('команда /rag в списке команд', /\/rag \[list\]/.test(help.out))
 
+// 9. Переключатель фильтра: сравнение режимов без правки реестра.
+const filtered = run(['--rag', 'test-base', '--mcp-check', 'rag', '--offline'],
+  { DSH_TERM_RAG_FILE: goodRegistry })
+check('по умолчанию: пороги из реестра', /- '--margin'/.test(filtered.out) && /- '0\.04'/.test(filtered.out)
+  && /- '--min-dense'/.test(filtered.out) && /- '0\.5'/.test(filtered.out))
+check('по умолчанию: min-keep не теряется', /- '--min-keep'/.test(filtered.out) && /- '2'/.test(filtered.out))
+check('по умолчанию: --no-filter не добавляется', !/--no-filter/.test(filtered.out))
+
+const noFilter = run(['--rag', 'test-base', '--rag-no-filter', '--mcp-check', 'rag', '--offline'],
+  { DSH_TERM_RAG_FILE: goodRegistry })
+check('--rag-no-filter: серверу уходит --no-filter', /- '--no-filter'/.test(noFilter.out))
+check('--rag-no-filter: пороги не передаются', !/--margin/.test(noFilter.out) && !/--min-dense/.test(noFilter.out))
+check('--rag-no-filter: инструкция на месте', /инструмент `rag_search`/.test(noFilter.out))
+
+const overridden = run(['--rag', 'test-base', '--rag-margin', '0.12', '--rag-min-dense', '0.3',
+  '--rag-min-keep', '4', '--mcp-check', 'rag', '--offline'],
+{ DSH_TERM_RAG_FILE: goodRegistry })
+check('--rag-margin переопределяет реестр', /- '0\.12'/.test(overridden.out) && !/- '0\.04'/.test(overridden.out))
+check('--rag-min-dense переопределяет реестр', /- '0\.3'/.test(overridden.out))
+check('--rag-min-keep переопределяет умолчание', /- '4'/.test(overridden.out))
+
+// 10. Нечисловой флаг: понятная ошибка вместо «--margin NaN» в аргументах сервера.
+const badNumber = run(['--rag', 'test-base', '--rag-margin', 'абв', '--mcp-check', 'rag', '--offline'],
+  { DSH_TERM_RAG_FILE: goodRegistry })
+check('нечисловая маржа → код 1 и подсказка', badNumber.code === 1 && /--rag-margin: нужно число/.test(badNumber.out),
+  `code=${badNumber.code}`)
+check('нечисловая маржа: NaN в оверлей не попал', !/NaN/.test(badNumber.out))
+
 let failed = 0
 for (const c of checks) {
   console.log(`${c.ok ? '✔' : '✖'} ${c.name}${c.ok ? '' : ` (${c.extra})`}`)

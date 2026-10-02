@@ -1105,6 +1105,10 @@ function parseArgs(argv) {
     mcpCheck: undefined,     // --mcp-check [preset]: только соединение + список инструментов, без сессии
     offline: undefined,      // --mcp-check --offline: показать оверлей и выйти (без сети)
     rag: undefined,          // --rag <имя>: подключить базу знаний из .dsh/rag.json (повторяемый)
+    ragMargin: undefined,    // --rag-margin <0..1>: переопределить маржу от лучшего результата
+    ragMinDense: undefined,  // --rag-min-dense <0..1>: переопределить пол применимости базы
+    ragMinKeep: undefined,   // --rag-min-keep <n>: сколько фрагментов оставить даже ниже порога
+    ragNoFilter: undefined,  // --rag-no-filter: отдавать топ-K без порогов (для сравнения)
     autoApprove: undefined,  // разрешать запросы доступа без вопросов (env DSH_TERM_AUTO_APPROVE)
     help: false,
   }
@@ -1130,6 +1134,10 @@ function parseArgs(argv) {
       case '--with-profiles': opts.withProfiles = true; break
       case '--user-profile': opts.userProfile = next(); break
       case '--rag': opts.rag = [...(opts.rag ?? []), next()]; break
+      case '--rag-margin': opts.ragMargin = Number(next()); break
+      case '--rag-min-dense': opts.ragMinDense = Number(next()); break
+      case '--rag-min-keep': opts.ragMinKeep = Number(next()); break
+      case '--rag-no-filter': opts.ragNoFilter = true; break
       case '--mcp': opts.mcp = [...(opts.mcp ?? []), next()]; break
       case '--mcp-toolsets': opts.mcpToolsets = next(); break
       case '--mcp-readwrite': opts.mcpReadwrite = true; break
@@ -2457,6 +2465,7 @@ const RAG_SERVER_NAME = 'rag'
 const RAG_DEFAULT_STRATEGY = 'structural'
 const RAG_DEFAULT_MARGIN = 0.04
 const RAG_DEFAULT_MIN_DENSE = 0.5
+const RAG_DEFAULT_MIN_KEEP = 2
 
 function ragRegistryPath(cwd = process.cwd()) {
   return process.env.DSH_TERM_RAG_FILE || join(cwd, '.dsh', RAG_REGISTRY_NAME)
@@ -2487,6 +2496,36 @@ function ragRequestedNames(opts) {
     }
   }
   return names
+}
+
+/**
+ * Настройки фильтра для сессии: флаг → реестр → умолчание.
+ *
+ * Флаги нужны, чтобы сравнивать режимы, не правя реестр и не перезапуская всё
+ * дважды с разными файлами: `--rag-no-filter` выключает пороги, `--rag-margin`
+ * и `--rag-min-dense` ставят свои значения.
+ */
+function ragFilterSettings(opts, base = {}) {
+  if (opts.ragNoFilter) return { margin: null, minDense: null, minKeep: 1, label: 'без фильтра' }
+  const margin = opts.ragMargin ?? base.margin ?? RAG_DEFAULT_MARGIN
+  const minDense = opts.ragMinDense ?? base.minDense ?? RAG_DEFAULT_MIN_DENSE
+  const minKeep = opts.ragMinKeep ?? base.minKeep ?? RAG_DEFAULT_MIN_KEEP
+  return {
+    margin: Number(margin),
+    minDense: Number(minDense),
+    minKeep: Number(minKeep),
+    label: `маржа ${margin} · пол ${minDense} · мин.фрагментов ${minKeep}`,
+  }
+}
+
+/** Проверить числовые флаги фильтра: NaN уехал бы в аргументы сервера молча. */
+function ragFilterError(opts) {
+  const numeric = [['--rag-margin', opts.ragMargin], ['--rag-min-dense', opts.ragMinDense],
+    ['--rag-min-keep', opts.ragMinKeep]]
+  for (const [flag, value] of numeric) {
+    if (value !== undefined && !Number.isFinite(value)) return `${flag}: нужно число`
+  }
+  return null
 }
 
 /**
@@ -2524,7 +2563,7 @@ function ragInstructionText(names, bases) {
  * `python` берётся из PATH; сам пакет лежит в каталоге doc-index, поэтому путь к
  * нему уходит в PYTHONPATH — иначе `-m doc_index.mcp_server` не найдётся.
  */
-function ragServerFor(names, bases, { cwd = process.cwd() } = {}) {
+function ragServerFor(names, bases, { cwd = process.cwd(), opts = {} } = {}) {
   const first = bases[names[0]] ?? {}
   const indexDirs = names.map((name) => resolve(cwd, String(bases[name]?.index ?? '')))
   const root = indexDirs[0]
@@ -2535,9 +2574,17 @@ function ragServerFor(names, bases, { cwd = process.cwd() } = {}) {
     if (entry.title) args.push('--title', `${name}=${entry.title}`)
     if (entry.what) args.push('--what', `${name}=${entry.what}`)
   }
+  // Настройки фильтра: флаги сессии главнее реестра. При `--no-filter` пороги
+  // выключаются совсем — иначе «нулевая маржа» оставила бы один лучший фрагмент.
+  const filter = ragFilterSettings(opts, first)
   args.push('--strategy', String(first.strategy || RAG_DEFAULT_STRATEGY))
-  args.push('--margin', String(first.margin ?? RAG_DEFAULT_MARGIN))
-  args.push('--min-dense', String(first.minDense ?? RAG_DEFAULT_MIN_DENSE))
+  args.push('--min-keep', String(filter.minKeep))
+  if (filter.margin === null && filter.minDense === null) {
+    args.push('--no-filter')
+  } else {
+    if (filter.margin !== null) args.push('--margin', String(filter.margin))
+    if (filter.minDense !== null) args.push('--min-dense', String(filter.minDense))
+  }
   const what = names
     .map((name) => `${name}${bases[name]?.what ? ` (${bases[name].what})` : ''}`)
     .join(', ')
@@ -2548,6 +2595,7 @@ function ragServerFor(names, bases, { cwd = process.cwd() } = {}) {
     command: process.env.DSH_TERM_RAG_PYTHON || 'python',
     args,
     env: { PYTHONPATH: root, PYTHONIOENCODING: 'utf-8' },
+    filter,
     what: `поиск по базе знаний с источниками и строками — ${what}`,
   }
 }
@@ -2561,6 +2609,10 @@ function ragServerFor(names, bases, { cwd = process.cwd() } = {}) {
 function resolveRag(opts) {
   const names = ragRequestedNames(opts)
   if (!names.length) return { names: [], servers: [], instruction: null, registry: null, error: null }
+  const badNumber = ragFilterError(opts)
+  if (badNumber) {
+    return { names, servers: [], instruction: null, registry: null, error: badNumber }
+  }
   const registry = readRagRegistry()
   if (registry.error) {
     return { names, servers: [], instruction: null, registry,
@@ -2584,7 +2636,7 @@ function resolveRag(opts) {
   }
   return {
     names,
-    servers: [ragServerFor(names, registry.bases)],
+    servers: [ragServerFor(names, registry.bases, { opts })],
     instruction: ragInstructionText(names, registry.bases),
     registry,
     error: null,
@@ -3356,6 +3408,10 @@ async function main() {
     log.line('                      инструменты появятся как mcp__<сервер>__<тул>')
     log.line('  --rag <имя>         подключить базу знаний из .dsh/rag.json; флаг повторяемый')
     log.line('                      агент получает инструмент rag_search и инструкцию опираться на базу')
+    log.line('  --rag-no-filter     отдавать топ-K без порогов — сравнить работу фильтра')
+    log.line('  --rag-margin <0..1> переопределить маржу от лучшего результата (флаг сессии главнее реестра)')
+    log.line('  --rag-min-dense <0..1>  переопределить пол применимости базы')
+    log.line('  --rag-min-keep <n>  сколько фрагментов оставить даже ниже порога (default 2)')
     log.line('  --mcp-toolsets <l>  тулсеты MCP-сервера: список через запятую или all (полный набор дороже по токенам)')
     log.line('  --mcp-readwrite     снять режим «только чтение» у MCP-пресета (по умолчанию readonly)')
     log.line('  --mcp-check [пресет] диагностика: подключиться к MCP и напечатать список инструментов, без сессии')
@@ -3623,10 +3679,13 @@ async function main() {
   }
   state.ragInstruction = rag.instruction
   state.rag = rag.names.length
-    ? { names: rag.names, servers: rag.servers, registry: rag.registry?.path ?? null }
+    ? { names: rag.names, servers: rag.servers, registry: rag.registry?.path ?? null,
+        filter: rag.servers[0]?.filter ?? null }
     : null
   if (rag.names.length) {
-    log.dim(`rag: ${rag.names.join(', ')} · инструмент rag_search (детали: /rag)`)
+    const filter = rag.servers[0]?.filter
+    log.dim(`rag: ${rag.names.join(', ')}${filter ? ` · ${filter.label}` : ''}`
+      + ' · инструмент rag_search (детали: /rag)')
   }
 
   const personaPatchPath = join(opts.dshHome, 'dsh-term-persona.patch.yml')
@@ -4746,6 +4805,7 @@ async function main() {
             log.dim(`реестр ${registry.path} пуст`)
             break
           }
+          if (state.rag?.names?.length) log.dim(`в этой сессии фильтр: ${state.rag.filter?.label ?? '—'}`)
           log.line(`базы знаний (${registry.path}):`)
           for (const name of names) {
             const entry = registry.bases[name] ?? {}
@@ -4765,11 +4825,13 @@ async function main() {
           break
         }
         log.line(`база знаний: ${state.rag.names.join(', ')} · инструмент rag_search`)
+        if (state.rag.filter) log.dim(`  фильтр: ${state.rag.filter.label}`)
         if (state.rag.registry) log.dim(`  реестр: ${state.rag.registry}`)
         for (const server of state.rag.servers) {
           log.dim(`  сервер: ${server.serverName} · ${mcpTarget(server)}`)
         }
         log.dim('  смена баз — при следующем запуске: соединение поднимается вместе с рантаймом')
+        log.dim('  сравнить режимы: --rag-no-filter (без порогов) или --rag-margin <0..1>')
         break
       }
       case 'mcp': {
