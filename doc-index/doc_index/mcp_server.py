@@ -234,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="маржа от лучшего результата (0 — без фильтра)")
     parser.add_argument("--min-dense", type=float, default=DEFAULT_MIN_DENSE,
                         help="пол применимости: ниже него база считается не отвечающей")
+    parser.add_argument("--no-filter", action="store_true",
+                        help="выключить оба порога: отдавать топ-k как есть (для сравнения)")
     parser.add_argument("--min-keep", type=int, default=DEFAULT_MIN_KEEP,
                         help="сколько фрагментов оставить даже ниже порога")
     parser.add_argument("--no-expand", action="store_true",
@@ -251,18 +253,27 @@ def main(argv: list[str] | None = None) -> int:
         return out
 
     titles, whats = pairs(args.title), pairs(args.what)
+    # `--no-filter` и «0» дают одно и то же — фильтра нет. Ноль здесь не «порог ноль»
+    # (маржа 0 оставила бы только лучший фрагмент), а именно выключенный порог:
+    # так удобнее сравнивать режимы одной командой.
+    if args.no_filter:
+        margin, min_dense, min_keep = None, None, 1
+    else:
+        margin = args.margin or None
+        min_dense = args.min_dense or None
+        min_keep = args.min_keep
     bases = [
         KnowledgeBase(name=name, root=root, title=titles.get(name, ""), what=whats.get(name, ""),
-                      strategy=args.strategy, margin=args.margin or None,
-                      min_dense=args.min_dense or None, expand=not args.no_expand,
-                      min_keep=args.min_keep, candidates=args.candidates)
+                      strategy=args.strategy, margin=margin,
+                      min_dense=min_dense, expand=not args.no_expand,
+                      min_keep=min_keep, candidates=args.candidates)
         for name, root in args.base
     ]
     if not bases:
         print("не задано ни одной базы: нужен хотя бы один --base имя=путь", file=sys.stderr)
         return 2
     print(f"rag: базы {', '.join(b.name for b in bases)} · стратегия {args.strategy} · "
-          f"маржа {args.margin} · пол {args.min_dense} · "
+          f"маржа {margin} · пол {min_dense} · мин.фрагментов {min_keep} · "
           f"раскрытие {'выкл' if args.no_expand else 'вкл'}", file=sys.stderr, flush=True)
     build_server(bases).run("stdio")
     return 0
