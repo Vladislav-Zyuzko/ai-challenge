@@ -1346,6 +1346,7 @@ const COMMANDS = [
   { name: 'profile', usage: '/profile [show|list|use <slug>|new|off]', desc: 'профиль пользователя (персонализация): показать, сменить, создать, выключить' },
   { name: 'mcp', usage: '/mcp [show|tools|refresh]', desc: 'MCP-серверы: соединение, список инструментов и их цена в промпте' },
   { name: 'rag', usage: '/rag [list]', desc: 'базы знаний сессии (--rag): что подключено и какие есть в реестре' },
+  { name: 'rag-brief', usage: '/rag-brief <вопрос>', desc: 'справка по базе по шаблону: ответ + источники + цитаты (мимо агента)' },
   { name: 'resume', usage: '/resume [id]', desc: 'продолжить сессию: по id или выбором из списка' },
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
@@ -2598,6 +2599,18 @@ function ragServerFor(names, bases, { cwd = process.cwd(), opts = {} } = {}) {
     args,
     env: { PYTHONPATH: root, PYTHONIOENCODING: 'utf-8' },
     filter,
+    // Параметры для командной справки (/rag-brief): она идёт мимо агента, тем же
+    // строгим путём, что проверка дня 24, поэтому ей нужны база и настройки фильтра.
+    ragCli: {
+      root,
+      python: process.env.DSH_TERM_RAG_PYTHON || 'python',
+      base: names[0],
+      strategy: String(first.strategy || RAG_DEFAULT_STRATEGY),
+      k: 5,
+      expand: 1,
+      candidates: 20,
+      filter,
+    },
     what: `поиск по базе знаний с источниками и строками — ${what}`,
   }
 }
@@ -3434,6 +3447,8 @@ async function main() {
     log.line('  /new     начать новую сессию')
     log.line('  /token   сменить сохранённый API ключ')
     log.line('  /rag [list]  базы знаний сессии (--rag): что подключено и что есть в .dsh/rag.json')
+    log.line('  /rag-brief <вопрос>  справка по базе по шаблону: ОТВЕТ + ИСТОЧНИКИ + ЦИТАТЫ')
+    log.line('                идёт мимо агента, формат и проверка цитат гарантированы кодом')
     log.line('  /publish-day  git+gh: коммит → push → PR day→week (по .dsh/SKILLS)')
     log.line('  /create-project [что строим]  сессия архитектора проекта: опросник → .project-harness')
     log.line('                → гейт инструментов → ноды (по .dsh/SKILLS/create-project.md)')
@@ -4834,6 +4849,61 @@ async function main() {
         }
         log.dim('  смена баз — при следующем запуске: соединение поднимается вместе с рантаймом')
         log.dim('  сравнить режимы: --rag-no-filter (без порогов) или --rag-margin <0..1>')
+        break
+      }
+      case 'rag-brief': {
+        // Справка идёт МИМО агента: тот же строгий путь, что в проверке дня 24
+        // (`doc_index brief`), поэтому форма ответа и проверка источников с цитатами
+        // гарантированы кодом, а не послушанием модели.
+        const question = parts.slice(1).join(' ').trim()
+        if (!question) {
+          log.err('нужен вопрос: /rag-brief <вопрос>')
+          log.dim('пример: /rag-brief зачем нужны блокирующие гейты')
+          log.dim('ответ придёт по шаблону: ОТВЕТ + ИСТОЧНИКИ + ЦИТАТЫ и строка проверки')
+          break
+        }
+        if (!state.rag?.names?.length) {
+          log.err('rag-brief: база знаний в сессии не подключена')
+          log.dim('запуск: dsh-term --rag <имя> · доступные базы: /rag list')
+          break
+        }
+        const cli = state.rag.servers[0]?.ragCli
+        if (!cli) {
+          log.err('rag-brief: не удалось собрать параметры базы')
+          break
+        }
+        const argv = ['-m', 'doc_index', 'brief', question,
+          '--strategy', cli.strategy,
+          '--k', String(cli.k),
+          '--expand', String(cli.expand),
+          '--candidates', String(cli.candidates),
+          '--min-keep', String(cli.filter.minKeep)]
+        if (cli.filter.margin === null && cli.filter.minDense === null) {
+          argv.push('--no-filter')
+        } else {
+          if (cli.filter.margin !== null) argv.push('--margin', String(cli.filter.margin))
+          if (cli.filter.minDense !== null) argv.push('--min-dense', String(cli.filter.minDense))
+        }
+        log.dim(`rag-brief: база ${cli.base} · ${cli.filter.label} · собираю ответ по шаблону…`)
+        const brief = spawnSync(cli.python, argv, {
+          cwd: cli.root,
+          encoding: 'utf8',
+          timeout: 180000,
+          env: { ...process.env, ...(state.rag.servers[0].env ?? {}) },
+        })
+        if (brief.error) {
+          log.err(`rag-brief: не удалось запустить поиск — ${brief.error.message}`)
+          break
+        }
+        if (brief.status !== 0) {
+          log.err(`rag-brief: команда вернула код ${brief.status}`)
+          const tail = (brief.stderr ?? '').trim().split('\n').slice(-4).join('\n')
+          if (tail) log.dim(tail)
+          break
+        }
+        log.line('')
+        for (const line of (brief.stdout ?? '').trimEnd().split('\n')) log.line(line)
+        log.line('')
         break
       }
       case 'mcp': {

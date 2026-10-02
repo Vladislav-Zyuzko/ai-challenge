@@ -29,7 +29,7 @@ from .rerank import DEFAULT_MODEL_DIR as DEFAULT_RERANKER_DIR
 from .rerank import CrossEncoder, CrossEncoderUnavailable
 from .search import Searcher, snippet
 from .sweep import pick_best, sweep, write_report as write_sweep_report
-from .verify import run_verification, summarize as summarize_verification
+from .verify import brief, format_brief, run_verification, summarize as summarize_verification
 from .verify import write_report as write_verify_report
 
 DEFAULT_STRATEGIES = "fixed,structural"
@@ -317,20 +317,23 @@ def cmd_verify(args: argparse.Namespace) -> int:
     conn = store.connect(cfg.db_path())
     questions = load_control(Path(args.questions))
     answerable = sum(1 for item in questions if item.get("answerable", True))
+    # См. cmd_brief: порог отказа живёт в гейте, а не в фильтре кандидатов.
+    margin = None if args.no_filter else args.margin
+    floor = None if args.no_filter else args.min_dense
     filters = Filters(candidates=args.candidates, k=args.k, expand=args.expand,
-                      search_mode=args.search_mode, margin=args.margin,
-                      min_dense=args.min_dense, min_score=args.min_score,
+                      search_mode=args.search_mode, margin=margin,
+                      min_dense=None, min_score=args.min_score,
                       min_keep=args.min_keep)
     searcher = Searcher(conn, cfg, OllamaEmbedder(cfg), args.strategy)
     topics = args.topics or ""
     print(f"проверка источников и цитат: вопросов {len(questions)} "
           f"(отвечаемых {answerable}, вне корпуса {len(questions) - answerable}) · "
-          f"порог отказа {args.min_dense} · строгий формат"
+          f"порог отказа {floor} · строгий формат"
           + (" + судейство" if not args.no_judge else " (без судейства)"))
     with _answerer(args) as agent:
         result = run_verification(questions, searcher, agent, filters=filters,
                                   judge=not args.no_judge, max_chars=args.max_chars,
-                                  min_dense=args.min_dense, topics=topics)
+                                  min_dense=floor, topics=topics)
         path = write_verify_report(result, cfg.out, model=agent.model,
                                    strategy=args.strategy)
     summary = summarize_verification(result)
@@ -347,6 +350,28 @@ def cmd_verify(args: argparse.Namespace) -> int:
           f" · с уточнением: {summary['refusals_with_clarify']}/{summary['refusals_expected']}")
     print(f"  ложных отказов: {summary['false_refusals']}"
           f" · запрещённых формулировок: {summary['forbidden_hits']}")
+    return 0
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    """Справка по базе: один ответ по шаблону (ответ, источники, цитаты) + проверка."""
+    cfg = _config(args)
+    conn = store.connect(cfg.db_path())
+    # Абсолютный порог здесь — только гейт отказа (`min_dense`), поэтому в фильтр
+    # кандидатов он не передаётся: иначе один и тот же порог работал бы дважды
+    # и было бы непонятно, что именно отсекло фрагменты.
+    margin = None if args.no_filter else args.margin
+    floor = None if args.no_filter else args.min_dense
+    filters = Filters(candidates=args.candidates, k=args.k, expand=args.expand,
+                      search_mode=args.search_mode, margin=margin,
+                      min_dense=None, min_score=args.min_score,
+                      min_keep=args.min_keep)
+    searcher = Searcher(conn, cfg, OllamaEmbedder(cfg), args.strategy)
+    with _answerer(args) as agent:
+        result = brief(searcher, agent, args.question, filters=filters,
+                       max_chars=args.max_chars, min_dense=floor,
+                       topics=args.topics, judge=args.judge)
+    print(format_brief(result))
     return 0
 
 
@@ -429,6 +454,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_sweep.add_argument("--reranker-dir", default=str(DEFAULT_RERANKER_DIR))
     p_sweep.set_defaults(func=cmd_sweep)
 
+    p_brief = sub.add_parser("brief", help="справка по базе: ответ по шаблону с источниками и цитатами")
+    _add_common(p_brief)
+    add_rag_flags(p_brief)
+    p_brief.add_argument("question")
+    p_brief.add_argument("--candidates", type=int, default=20, help="топ-K до фильтрации")
+    p_brief.add_argument("--margin", type=float, default=0.04,
+                         help="относительный порог фильтрации кандидатов")
+    p_brief.add_argument("--min-score", type=float, default=0.2,
+                         help="порог оценки для heuristic и cross-encoder")
+    p_brief.add_argument("--min-keep", type=int, default=2,
+                         help="сколько фрагментов оставить даже ниже порога")
+    p_brief.add_argument("--min-dense", type=float, default=0.5,
+                         help="порог отказа: ниже него ответ «не знаю» без вызова модели")
+    p_brief.add_argument("--topics", default="AI SDLC: агентный харнесс, MCP, RAG, метрики, гейты",
+                         help="о чём база — попадает в ответ-отказ")
+    p_brief.add_argument("--judge", action="store_true",
+                         help="добавить оценку судьи «цитаты подтверждают ответ»")
+    p_brief.add_argument("--no-filter", action="store_true",
+                         help="без порогов: ни маржи, ни пола применимости (для сравнения)")
+    p_brief.set_defaults(func=cmd_brief)
+
     p_verify = sub.add_parser("verify", help="источники, цитаты и режим «не знаю» (день 24)")
     _add_common(p_verify)
     add_rag_flags(p_verify)
@@ -447,6 +493,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="о чём база — попадает в ответ-отказ")
     p_verify.add_argument("--no-judge", action="store_true",
                           help="без судьи «цитаты подтверждают ответ»")
+    p_verify.add_argument("--no-filter", action="store_true",
+                          help="без порогов: ни маржи, ни отказа (для сравнения)")
     p_verify.set_defaults(func=cmd_verify)
 
     p_compare = sub.add_parser("compare", help="сравнить пайплайны: фильтр, реранкинг, rewrite")

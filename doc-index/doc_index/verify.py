@@ -194,6 +194,75 @@ def summarize(result: dict) -> dict:
     }
 
 
+def brief(searcher: Searcher, agent: Answerer, question: str, *, filters: Filters | None = None,
+          max_chars: int = 6000, min_dense: float | None = 0.5, topics: str = "",
+          judge: bool = False) -> dict:
+    """Справка по базе для одного вопроса: строгий ответ + машинная проверка.
+
+    Это тот же путь, что в `verify`, но без набора и без статистики: нужен один
+    ответ фиксированной формы и вердикт, не выдуманы ли источники и цитаты.
+    Судья по умолчанию выключен — в интерактивной команде важнее скорость, а
+    дословность и реальность источников проверяются кодом.
+    """
+    filters = filters or Filters()
+    got = retrieve(searcher, question, pipeline="threshold", filters=filters)
+    reply = answer_question(agent, question, question_id="brief", mode="rag",
+                            hits=got.context_hits, max_chars=max_chars, strict=True,
+                            min_dense=min_dense, topics=topics)
+    parsed = parse_answer(reply.answer)
+    refused = reply.refused or parsed.refusal
+    check = QuoteCheck() if refused else check_citations(parsed, got.context_hits)
+    support: int | None = None
+    support_reason = ""
+    if judge and not refused:
+        prompt = SUPPORT_TEMPLATE.format(question=question, answer=parsed.answer,
+                                         quotes=quotes_block_text(parsed.quotes))
+        judge_reply = agent.ask(prompt)
+        support = parse_judgement(judge_reply.text)
+        support_reason = judge_reply.text.strip()
+    return {
+        "question": question,
+        "answer": reply.answer,
+        "parsed": parsed,
+        "check": check,
+        "refused": refused,
+        "refused_by_gate": reply.refused,
+        "best_score": reply.best_score,
+        "support": support,
+        "support_reason": support_reason,
+        "context_fragments": len(got.context_hits),
+        "sources": [hit["source"] for hit in got.hits],
+        "seconds": round(reply.seconds, 2),
+    }
+
+
+def format_brief(result: dict) -> str:
+    """Печать справки: ответ как есть плюс строка машинной проверки."""
+    check: QuoteCheck = result["check"]
+    lines = [result["answer"].strip()]
+    if result["refused"]:
+        source = "порогом, без вызова модели" if result["refused_by_gate"] else "моделью"
+        lines.append("")
+        lines.append(f"— отказ: {source} · лучшее совпадение "
+                     f"{result['best_score']:.3f} · фрагментов {result['context_fragments']}")
+        return "\n".join(lines)
+    parts = [
+        f"источники {check.sources_real}/{check.sources_total} реальны",
+        f"цитаты {check.verbatim}/{check.total} дословны",
+    ]
+    if check.misplaced:
+        parts.append(f"смещённых ссылок {len(check.misplaced)}")
+    parts.append(f"выдуманных {len(check.fabricated)}")
+    parts.append(f"фрагментов {result['context_fragments']}")
+    if result["best_score"] is not None:
+        parts.append(f"лучшее совпадение {result['best_score']:.3f}")
+    if result["support"] is not None:
+        parts.append(f"судья {result['support']}")
+    lines.append("")
+    lines.append("— проверка: " + " · ".join(parts))
+    return "\n".join(lines)
+
+
 def write_report(result: dict, out_dir: Path, *, model: str = "", strategy: str = "",
                  encoder_name: str = "") -> Path:
     """Отчёт проверки: обязательные источники и цитаты + режим «не знаю»."""

@@ -116,6 +116,10 @@ check('две базы: обе в инструкции', /`base-a`/.test(multi.o
 const help = run(['--help'])
 check('--rag описан в справке', /--rag <имя>/.test(help.out))
 check('команда /rag в списке команд', /\/rag \[list\]/.test(help.out))
+check('команда /rag-brief в списке команд', /\/rag-brief <вопрос>/.test(help.out))
+check('rag-brief описан как шаблонный ответ',
+  /ОТВЕТ \+ ИСТОЧНИКИ \+ ЦИТАТЫ/.test(help.out))
+check('rag-brief идёт мимо агента', /мимо агента/.test(help.out))
 
 // 9. Переключатель фильтра: сравнение режимов без правки реестра.
 const filtered = run(['--rag', 'test-base', '--mcp-check', 'rag', '--offline'],

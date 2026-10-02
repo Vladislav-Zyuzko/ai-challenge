@@ -18,7 +18,7 @@ from doc_index.citations import (  # noqa: E402
     quotes_block_text,
 )
 from doc_index.rag import REFUSAL_TEMPLATE, refusal_text  # noqa: E402
-from doc_index.verify import asks_clarification, check_forbidden  # noqa: E402
+from doc_index.verify import asks_clarification, check_forbidden, format_brief  # noqa: E402
 
 
 def hit(chunk_id, source, text, start=1, end=5):
@@ -230,6 +230,60 @@ class RefusalTests(unittest.TestCase):
     def test_template_has_no_placeholders_left(self):
         text = REFUSAL_TEMPLATE.format(best=0.4, floor=0.5, topics="темам базы")
         self.assertNotIn("{", text)
+
+
+class BriefTests(unittest.TestCase):
+    """Печать справки /rag-brief: форма ответа и строка машинной проверки."""
+
+    def _result(self, answer, check, **extra):
+        base = {
+            "question": "вопрос",
+            "answer": answer,
+            "parsed": parse_answer(answer),
+            "check": check,
+            "refused": False,
+            "refused_by_gate": False,
+            "best_score": 0.66,
+            "support": None,
+            "support_reason": "",
+            "context_fragments": 5,
+            "sources": [],
+            "seconds": 1.0,
+        }
+        base.update(extra)
+        return base
+
+    def test_prints_answer_and_check_line(self):
+        check = QuoteCheck(total=2, exact=2, sources_total=2, sources_real=2)
+        text = format_brief(self._result("ОТВЕТ: текст\nИСТОЧНИКИ:\n- [1] a.md", check))
+        self.assertIn("ОТВЕТ: текст", text)
+        self.assertIn("источники 2/2 реальны", text)
+        self.assertIn("цитаты 2/2 дословны", text)
+        self.assertIn("выдуманных 0", text)
+        self.assertIn("0.660", text)
+
+    def test_mentions_misplaced_links(self):
+        check = QuoteCheck(total=2, exact=1, misplaced=["цитата"], sources_total=1, sources_real=1)
+        text = format_brief(self._result("ОТВЕТ: текст", check))
+        self.assertIn("смещённых ссылок 1", text)
+
+    def test_refusal_by_gate_is_labelled(self):
+        text = format_brief(self._result(
+            "Не знаю: в базе нет ответа. Уточните, пожалуйста.",
+            QuoteCheck(), refused=True, refused_by_gate=True, best_score=0.41))
+        self.assertIn("отказ: порогом, без вызова модели", text)
+        self.assertIn("0.410", text)
+
+    def test_refusal_by_model_is_labelled(self):
+        text = format_brief(self._result(
+            "Не знаю: во фрагментах нет ответа. Уточните вопрос.",
+            QuoteCheck(), refused=True, refused_by_gate=False, best_score=0.70))
+        self.assertIn("отказ: моделью", text)
+
+    def test_judge_score_is_shown_when_present(self):
+        check = QuoteCheck(total=1, exact=1, sources_total=1, sources_real=1)
+        text = format_brief(self._result("ОТВЕТ: текст", check, support=2))
+        self.assertIn("судья 2", text)
 
 
 if __name__ == "__main__":
