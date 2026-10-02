@@ -5,3 +5,12 @@
 numpy>=2.0
 PyYAML>=6.0
 faiss-cpu>=1.8
+requests>=2.31
+
+# День 23: реранкер bge-reranker-v2-m3 прогоняется через ONNX Runtime без torch.
+# tokenizers читает tokenizer.json модели, onnxruntime считает логиты.
+# huggingface-hub нужен только команде fetch-reranker — она качает веса.
+# Без этих пакетов работает всё, кроме пайплайнов cross и full.
+onnxruntime>=1.17
+tokenizers>=0.20
+huggingface-hub>=0.20

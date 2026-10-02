@@ -22,8 +22,13 @@ from .config import DEFAULT_OUT, DEFAULT_VAULT, Config
 from .embed import OllamaEmbedder
 from .evaluate import evaluate, load_questions, source_skew, write_report as write_eval_report
 from .indexer import build_index
+from .pipelines import (PIPELINES, Filters, run_pipelines, summarize_pipelines,
+                        write_report as write_pipeline_report)
 from .rag import answer_question
+from .rerank import DEFAULT_MODEL_DIR as DEFAULT_RERANKER_DIR
+from .rerank import CrossEncoder, CrossEncoderUnavailable
 from .search import Searcher, snippet
+from .sweep import pick_best, sweep, write_report as write_sweep_report
 
 DEFAULT_STRATEGIES = "fixed,structural"
 ALL_STRATEGIES = "fixed,structural,structural_nobc"
@@ -217,6 +222,92 @@ def cmd_control(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reranker(dir_path: str) -> tuple[CrossEncoder | None, str]:
+    """Загрузить cross-encoder; если модели нет — не падать, а сказать об этом."""
+    try:
+        encoder = CrossEncoder(dir_path)
+        return encoder, Path(dir_path).name
+    except CrossEncoderUnavailable as exc:
+        print(f"cross-encoder недоступен: {exc}")
+        return None, ""
+
+
+def cmd_fetch_reranker(args: argparse.Namespace) -> int:
+    """Скачать ONNX-веса реранкера (567 МБ, один раз)."""
+    from .rerank import download_model
+
+    print(f"загрузка bge-reranker-v2-m3 (INT8/AVX2) в {args.reranker_dir}")
+    download_model(args.reranker_dir)
+    return 0
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    """Свип порогов отсечения на размеченном наборе вопросов."""
+    cfg = _config(args)
+    cfg.ensure_out()
+    conn = store.connect(cfg.db_path())
+    questions = load_questions(Path(args.questions))
+    searcher = Searcher(conn, cfg, OllamaEmbedder(cfg), args.strategy)
+    encoder, _name = (None, "") if args.no_cross else _reranker(args.reranker_dir)
+
+    print(f"свип порогов: {len(questions)} вопросов, кандидатов {args.candidates} → {args.k}")
+    result = sweep(searcher, questions, encoder=encoder, cfg=cfg,
+                   candidates=args.candidates, k=args.k, mode=args.search_mode)
+    path = write_sweep_report(result, cfg.out)
+    best = pick_best(result)
+    print(f"\nотчёт: {path}")
+    print(f"  лучшая конфигурация: {best['family']} = {best['value']} · "
+          f"precision {best['precision']:.3f} · recall@5 {best['recall@5']:.2f} · "
+          f"фрагментов {best['kept_avg']:.2f}")
+    return 0
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    """Сравнить пайплайны: без фильтра, порог, эвристика, cross-encoder, rewrite+фильтр."""
+    cfg = _config(args)
+    cfg.ensure_out()
+    conn = store.connect(cfg.db_path())
+    questions = load_control(Path(args.questions))
+    pipelines = tuple(_items(args.pipelines))
+    unknown = [name for name in pipelines if name not in PIPELINES]
+    if unknown:
+        raise SystemExit(f"неизвестные пайплайны: {', '.join(unknown)} (есть: {', '.join(PIPELINES)})")
+
+    filters = Filters(candidates=args.candidates, k=args.k, expand=args.expand,
+                      search_mode=args.search_mode, margin=args.margin,
+                      min_dense=args.min_dense, min_score=args.min_score,
+                      min_keep=args.min_keep)
+    searcher = Searcher(conn, cfg, OllamaEmbedder(cfg), args.strategy)
+    encoder, encoder_name = (None, "")
+    if "cross" in pipelines or "full" in pipelines:
+        encoder, encoder_name = _reranker(args.reranker_dir)
+
+    judge = not args.no_judge
+    print(f"пайплайны: {', '.join(pipelines)} · вопросов {len(questions)} · "
+          f"кандидатов {filters.candidates} → {filters.k}"
+          + (" + слепое судейство" if judge else " (без судейства)"))
+    with _answerer(args) as agent:
+        result = run_pipelines(questions, searcher, agent, pipelines=pipelines, filters=filters,
+                               judge=judge, max_chars=args.max_chars, encoder=encoder)
+        path = write_pipeline_report(
+            result, cfg.out, model=agent.model, encoder_name=encoder_name,
+            notes=[f"Порог выбран свипом: `python -m doc_index sweep` (см. `out/sweep.md`).",
+                   f"Маржа от top-1: {filters.margin}, порог оценки: {filters.min_score}, "
+                   f"абсолютный порог косинуса: {filters.min_dense}."],
+        )
+
+    summary = summarize_pipelines(result)
+    print(f"\nотчёт: {path}")
+    for name in pipelines:
+        part = summary[name]
+        judge_text = "—" if part["judge_mean"] is None else part["judge_mean"]
+        precision_text = "—" if part["precision"] is None else f"{part['precision']:.2f}"
+        print(f"  {name:<10} факты {part['facts_covered']}/{part['facts_total']} "
+              f"({part['facts_share']:.2f}) · судья {judge_text} · precision {precision_text} · "
+              f"фрагментов {part['kept_avg']} · токенов промпта {part['prompt_tokens']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="doc_index", description="Индексация документов: чанкинг, эмбеддинги, поиск")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -279,6 +370,43 @@ def build_parser() -> argparse.ArgumentParser:
                            default=str(Path(__file__).resolve().parent.parent / "data" / "control-questions.yaml"))
     p_control.add_argument("--no-judge", action="store_true", help="без слепого судейства моделью")
     p_control.set_defaults(func=cmd_control)
+
+    p_fetch = sub.add_parser("fetch-reranker", help="скачать ONNX-веса реранкера (567 МБ)")
+    p_fetch.add_argument("--reranker-dir", default=str(DEFAULT_RERANKER_DIR))
+    p_fetch.set_defaults(func=cmd_fetch_reranker)
+
+    p_sweep = sub.add_parser("sweep", help="настроить порог отсечения на размеченном наборе")
+    _add_common(p_sweep)
+    p_sweep.add_argument("--strategy", default="structural")
+    p_sweep.add_argument("--questions",
+                         default=str(Path(__file__).resolve().parent.parent / "data" / "questions.yaml"))
+    p_sweep.add_argument("--candidates", type=int, default=20, help="топ-K до фильтрации")
+    p_sweep.add_argument("--k", type=int, default=5, help="топ-K после фильтрации")
+    p_sweep.add_argument("--search-mode", default="dense", choices=["dense", "hybrid", "lexical"])
+    p_sweep.add_argument("--no-cross", action="store_true", help="без cross-encoder (быстро)")
+    p_sweep.add_argument("--reranker-dir", default=str(DEFAULT_RERANKER_DIR))
+    p_sweep.set_defaults(func=cmd_sweep)
+
+    p_compare = sub.add_parser("compare", help="сравнить пайплайны: фильтр, реранкинг, rewrite")
+    _add_common(p_compare)
+    add_rag_flags(p_compare)
+    p_compare.add_argument("--questions",
+                           default=str(Path(__file__).resolve().parent.parent / "data" / "control-questions.yaml"))
+    p_compare.add_argument("--pipelines", default=",".join(PIPELINES),
+                           help=f"через запятую из {', '.join(PIPELINES)}")
+    p_compare.add_argument("--candidates", type=int, default=20, help="топ-K до фильтрации")
+    p_compare.add_argument("--margin", type=float, default=0.08,
+                           help="относительный порог: маржа от лучшего результата")
+    p_compare.add_argument("--min-dense", type=float, default=None,
+                           help="абсолютный порог по косинусу")
+    p_compare.add_argument("--min-score", type=float, default=0.2,
+                           help="порог оценки для heuristic и cross-encoder")
+    p_compare.add_argument("--min-keep", type=int, default=1,
+                           help="сколько фрагментов оставить даже ниже порога: "
+                                "страховка от ошибки в топ-1")
+    p_compare.add_argument("--reranker-dir", default=str(DEFAULT_RERANKER_DIR))
+    p_compare.add_argument("--no-judge", action="store_true", help="без слепого судейства моделью")
+    p_compare.set_defaults(func=cmd_compare)
     return parser
 
 
