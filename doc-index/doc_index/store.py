@@ -84,9 +84,17 @@ CREATE TABLE IF NOT EXISTS runs (
 """
 
 
-def connect(path: Path) -> sqlite3.Connection:
+def connect(path: Path, *, check_same_thread: bool = True) -> sqlite3.Connection:
+    """Открыть базу и создать схему, если её ещё нет.
+
+    `check_same_thread=False` нужен многопоточным потребителям: MCP-сервер
+    обслуживает вызовы инструментов в разных потоках, а соединение SQLite по
+    умолчанию привязано к создавшему его потоку и падает с
+    «SQLite objects created in a thread can only be used in that same thread».
+    Однопоточные команды (CLI) оставляют проверку включённой.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     return conn
