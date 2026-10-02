@@ -23,13 +23,49 @@ import { basename, join, resolve } from 'node:path'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 
 // ---------- ANSI ----------
-const C = process.stdout.isTTY && !process.env.NO_COLOR
+// Режим цвета определяется ДО первого использования палитр: `--color <auto|always|never>`
+// (или переменная DSH_TERM_COLOR) сканируется здесь же, потому что C, PROMPT и DS
+// вычисляются на загрузке модуля — раньше, чем отработает основной парсер аргументов.
+// `always` нужен там, где TTY не определяется (терминалы Git Bash, обёртки) или где
+// окружение выставляет NO_COLOR: харнесс, например, ставит NO_COLOR=1 своим шеллам,
+// и запущенный оттуда dsh-term терял и цвета, и markdown-рендер.
+const COLOR_MODES = ['auto', 'always', 'never']
+const COLOR_MODE = (() => {
+  const at = process.argv.indexOf('--color')
+  const fromArgv = at >= 0 ? String(process.argv[at + 1] ?? '').toLowerCase() : ''
+  if (COLOR_MODES.includes(fromArgv)) return fromArgv
+  if (at >= 0) return 'auto' // значение проверит и объяснит основной парсер
+  const fromEnv = String(process.env.DSH_TERM_COLOR ?? '').toLowerCase()
+  return COLOR_MODES.includes(fromEnv) ? fromEnv : 'auto'
+})()
+
+/** Цвета включены принудительно (`--color always`), даже без TTY и при NO_COLOR. */
+function colorForced() {
+  return COLOR_MODE === 'always'
+}
+
+/** Явный запрет (`--color never`) или соглашение NO_COLOR. */
+function colorSuppressed() {
+  return COLOR_MODE === 'never' || (COLOR_MODE === 'auto' && !!process.env.NO_COLOR)
+}
+
+/**
+ * Нужно ли красить вывод: `always` — всегда, `never` и NO_COLOR — никогда,
+ * `auto` — только в интерактивном TTY. Проверка в рантайме: TTY мог появиться
+ * позже загрузки модуля (тесты подменяют поток).
+ */
+function colorOk() {
+  if (colorSuppressed()) return false
+  return colorForced() || !!process.stdout.isTTY
+}
+
+const C = colorOk()
   ? { dim: '\x1b[2m', reset: '\x1b[22m', cyan: '\x1b[36m', green: '\x1b[32m', red: '\x1b[31m', yellow: '\x1b[33m', bold: '\x1b[1m', off: '\x1b[0m' }
   : { dim: '', reset: '', cyan: '', green: '', red: '', yellow: '', bold: '', off: '' }
 
 // Промпт «dsh> »: «dsh» — жирным фирменным синим DeepSeek (#4D6BFE) для контраста;
 // без цвета (пайп / NO_COLOR) — как раньше.
-const PROMPT = process.stdout.isTTY && !process.env.NO_COLOR
+const PROMPT = colorOk()
   ? '\x1b[1;38;2;77;107;254mdsh\x1b[0m> '
   : 'dsh> '
 
@@ -340,10 +376,11 @@ if (meterTicker.unref) meterTicker.unref()
 // блоки (```/~~~) — состояние на весь ход. Только интерактивный TTY.
 const mdCtx = { inFence: false, lineStart: true }
 
-/** Цветной markdown-рендер включён: только интерактивный TTY, без NO_COLOR, не one-shot. */
+/** Цветной markdown-рендер включён: интерактивный TTY без NO_COLOR, либо `--color always`. */
 function mdColorEnabled() {
   if (process.env.DSH_TERM_FORCE_MD) return true // диагностика/тесты
-  return !!process.stdout.isTTY && !process.env.NO_COLOR && !UI.oneShot
+  if (!colorOk()) return false
+  return colorForced() || !UI.oneShot
 }
 
 /**
@@ -463,8 +500,8 @@ const CAPTION_TEXT = 'Deep diving…'
  * Без цвета (пайп / NO_COLOR) — обычная подпись cyan bold, как раньше.
  */
 function captionFor(frame) {
-  const colorOk = process.stdout.isTTY && !process.env.NO_COLOR
-  if (!colorOk) return C.bold + C.cyan + CAPTION_TEXT + C.off
+  const colorHere = colorOk()
+  if (!colorHere) return C.bold + C.cyan + CAPTION_TEXT + C.off
   const from = [65, 102, 213] // #4166D5 — тёмно-синий (акцент DeepSeek)
   const to = [178, 202, 255]  // светло-голубой (гребень «волны»)
   const L = CAPTION_TEXT.length
@@ -1138,6 +1175,16 @@ function parseArgs(argv) {
       case '--with-profiles': opts.withProfiles = true; break
       case '--user-profile': opts.userProfile = next(); break
       case '--rag': opts.rag = [...(opts.rag ?? []), next()]; break
+      case '--color': {
+        // Значение уже прочитано при загрузке модуля (палитры вычисляются раньше),
+        // здесь только проверяем его и объясняем ошибку.
+        const value = String(next() ?? '').toLowerCase()
+        if (!COLOR_MODES.includes(value)) {
+          log.err(`--color: ожидается ${COLOR_MODES.join(' | ')}, получено «${value}»`)
+          opts.help = true
+        }
+        break
+      }
       case '--rag-margin': opts.ragMargin = Number(next()); break
       case '--rag-min-dense': opts.ragMinDense = Number(next()); break
       case '--rag-min-keep': opts.ragMinKeep = Number(next()); break
@@ -1435,8 +1482,8 @@ function menuWidth() {
 
 // Фирменная гамма DeepSeek (см. uicolours.com/brands/deepseek): основной синий
 // #4D6BFE (77,107,254), светло-синий вариант #6E8BFF (110,139,255). Truecolor SGR;
-// вне TTY / при NO_COLOR — пустые коды (рендер без цвета).
-const DS = process.stdout.isTTY && !process.env.NO_COLOR
+// выключено при NO_COLOR, `--color never` и вне TTY (если цвет не форсирован).
+const DS = colorOk()
   ? { blue: '\x1b[38;2;77;107;254m', sky: '\x1b[38;2;110;139;255m' }
   : { blue: '', sky: '' }
 
@@ -3431,6 +3478,8 @@ async function main() {
     log.line('  --rag-margin <0..1> переопределить маржу от лучшего результата (флаг сессии главнее реестра)')
     log.line('  --rag-min-dense <0..1>  переопределить пол применимости базы')
     log.line('  --rag-min-keep <n>  сколько фрагментов оставить даже ниже порога (default 2)')
+    log.line('  --color <режим>     цвет и markdown-рендер: auto | always | never (default auto)')
+    log.line('                      always — красить даже без TTY и при NO_COLOR (env DSH_TERM_COLOR)')
     log.line('  --mcp-toolsets <l>  тулсеты MCP-сервера: список через запятую или all (полный набор дороже по токенам)')
     log.line('  --mcp-readwrite     снять режим «только чтение» у MCP-пресета (по умолчанию readonly)')
     log.line('  --mcp-check [пресет] диагностика: подключиться к MCP и напечатать список инструментов, без сессии')
@@ -5084,7 +5133,7 @@ async function main() {
     const res = await rpc.request('initialize', initParams)
     log.dim(`runtime: ${res.serverInfo.name} ${res.serverInfo.version} · provider=${opts.provider} model=${opts.model}`)
     // Диагностика UI: понятно, почему нет цветов/рендера (tty/NO_COLOR/one-shot).
-    log.dim(`ui: in-tty=${process.stdin.isTTY ? 1 : 0} out-tty=${process.stdout.isTTY ? 1 : 0} colors=${C.cyan ? 1 : 0} md=${mdColorEnabled() ? 1 : 0}`)
+    log.dim(`ui: in-tty=${process.stdin.isTTY ? 1 : 0} out-tty=${process.stdout.isTTY ? 1 : 0} colors=${C.cyan ? 1 : 0} md=${mdColorEnabled() ? 1 : 0} color=${COLOR_MODE}${colorSuppressed() ? ' (no-color)' : ''}`)
     log.dim(`compress: ${compress.mode}${compressPolicyText(compress)}`)
     if (state.userProfile) {
       log.dim(`profile: «${state.userProfile.title}» (${state.userProfile.slug}) · ~${userProfileTokens(state.userProfile)} токенов в system prompt · файл: ${userProfilePath(opts.dshHome, state.userProfile.slug)}`)
