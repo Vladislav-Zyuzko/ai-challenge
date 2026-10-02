@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -80,6 +81,7 @@ class KnowledgeBase:
     expand: bool = True
     _searcher: Searcher | None = field(default=None, repr=False)
     _conn: object = field(default=None, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def config(self) -> Config:
         return Config(out=self.root / "out")
@@ -89,12 +91,20 @@ class KnowledgeBase:
         return (self.config().db_path()).exists()
 
     def searcher(self) -> Searcher:
-        """Поиск по базе. Индекс и модель поднимаются при первом обращении."""
-        if self._searcher is None:
-            cfg = self.config()
-            self._conn = store.connect(cfg.db_path())
-            self._searcher = Searcher(self._conn, cfg, OllamaEmbedder(cfg), self.strategy)
-        return self._searcher
+        """Поиск по базе. Индекс и модель поднимаются при первом обращении.
+
+        Соединение открывается с `check_same_thread=False`, а доступ к нему
+        сериализуется блокировкой: MCP-сервер вызывает инструменты из разных
+        потоков, и привязанное к создавшему потоку соединение падало на втором
+        вызове («SQLite objects created in a thread can only be used in that
+        same thread») — это поймал длинный сценарий дня 25.
+        """
+        with self._lock:
+            if self._searcher is None:
+                cfg = self.config()
+                self._conn = store.connect(cfg.db_path(), check_same_thread=False)
+                self._searcher = Searcher(self._conn, cfg, OllamaEmbedder(cfg), self.strategy)
+            return self._searcher
 
     def search(self, query: str, *, k: int = DEFAULT_K, mode: str = "dense") -> SearchOutcome:
         """Фрагменты по запросу: раскрытие → поиск → пол применимости → маржа → топ-k.
@@ -103,7 +113,14 @@ class KnowledgeBase:
         («ЗУН» → «знания умения навыки»), результаты сливаются через RRF. Исходный
         вариант идёт первым: раскрытие помогает не всегда, и терять то, что и так
         находилось, незачем.
+
+        Весь поиск идёт под блокировкой: вызовы инструментов приходят из разных
+        потоков, а соединение SQLite у базы одно (см. `searcher`).
         """
+        with self._lock:
+            return self._search(query, k=k, mode=mode)
+
+    def _search(self, query: str, *, k: int, mode: str) -> SearchOutcome:
         variants = [query]
         if self.expand:
             expanded = expand_abbreviations(query)
