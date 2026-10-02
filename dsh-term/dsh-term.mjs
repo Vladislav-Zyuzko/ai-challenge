@@ -376,7 +376,11 @@ function mdStyle(s, ctx) {
           const bodyStart = i + mHead[0].length
           const e = s.indexOf('\n', bodyStart)
           const end = e < 0 ? n : e
-          out += s.slice(i, bodyStart) + C.bold + DS.blue + s.slice(bodyStart, end) + C.off
+          // Escape-коды прописаны явно, как в инлайн-правилах ниже: палитры C и DS
+          // пусты вне настоящего TTY, и от них зависели только заголовки — при
+          // DSH_TERM_FORCE_MD (диагностика и тесты) они оставались неокрашенными.
+          out += s.slice(i, bodyStart) + '\x1b[1m\x1b[38;2;77;107;254m'
+            + s.slice(bodyStart, end) + '\x1b[0m'
           i = end
           continue
         }
@@ -4902,7 +4906,12 @@ async function main() {
           break
         }
         log.line('')
-        for (const line of (brief.stdout ?? '').trimEnd().split('\n')) log.line(line)
+        // Прогоняем через тот же markdown-рендер, что ответы агента: в интерактивном
+        // TTY заголовки ОТВЕТ / ИСТОЧНИКИ / ЦИТАТЫ подсветятся, а в пайпе и `-p`
+        // текст останется исходным markdown — его можно скопировать как есть.
+        const styled = mdStyle((brief.stdout ?? '').replace(/\r\n/g, '\n').trimEnd(),
+          { inFence: false, lineStart: true })
+        for (const line of styled.split('\n')) log.line(line)
         log.line('')
         break
       }

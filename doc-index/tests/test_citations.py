@@ -255,12 +255,34 @@ class BriefTests(unittest.TestCase):
 
     def test_prints_answer_and_check_line(self):
         check = QuoteCheck(total=2, exact=2, sources_total=2, sources_real=2)
-        text = format_brief(self._result("ОТВЕТ: текст\nИСТОЧНИКИ:\n- [1] a.md", check))
-        self.assertIn("ОТВЕТ: текст", text)
+        text = format_brief(self._result("ОТВЕТ: текст\nИСТОЧНИКИ:\n- [1] a.md\n"
+                                         "ЦИТАТЫ:\n- [1] «кусок текста подлиннее»", check))
+        self.assertIn("## ОТВЕТ", text)
+        self.assertIn("## ИСТОЧНИКИ", text)
+        self.assertIn("## ЦИТАТЫ", text)
+        self.assertIn("**Проверка:**", text)
         self.assertIn("источники 2/2 реальны", text)
         self.assertIn("цитаты 2/2 дословны", text)
         self.assertIn("выдуманных 0", text)
         self.assertIn("0.660", text)
+
+    def test_blocks_are_separated_by_blank_lines(self):
+        """Заголовок не липнет к тексту: между блоками пустая строка."""
+        check = QuoteCheck(total=1, exact=1, sources_total=1, sources_real=1)
+        text = format_brief(self._result("ОТВЕТ: текст\nИСТОЧНИКИ:\n- [1] a.md\n"
+                                         "ЦИТАТЫ:\n- [1] «кусок текста подлиннее»", check))
+        self.assertIn("\n\n## ИСТОЧНИКИ\n\n", text)
+        self.assertIn("\n\n## ЦИТАТЫ\n\n", text)
+        self.assertIn("\n\n---\n\n", text)
+        self.assertTrue(text.startswith("## ОТВЕТ\n\n"))
+
+    def test_source_and_quote_lines_are_markdown(self):
+        check = QuoteCheck(total=1, exact=1, sources_total=1, sources_real=1)
+        text = format_brief(self._result(
+            "ОТВЕТ: текст\nИСТОЧНИКИ:\n- [3] structural:a.md#0000 · a.md · Раздел › Тема\n"
+            "ЦИТАТЫ:\n- [3] «дословный фрагмент из заметки»", check))
+        self.assertIn("- **[3]** `structural:a.md#0000` — Раздел › Тема", text)
+        self.assertIn("- **[3]** «дословный фрагмент из заметки»", text)
 
     def test_mentions_misplaced_links(self):
         check = QuoteCheck(total=2, exact=1, misplaced=["цитата"], sources_total=1, sources_real=1)
@@ -271,14 +293,16 @@ class BriefTests(unittest.TestCase):
         text = format_brief(self._result(
             "Не знаю: в базе нет ответа. Уточните, пожалуйста.",
             QuoteCheck(), refused=True, refused_by_gate=True, best_score=0.41))
-        self.assertIn("отказ: порогом, без вызова модели", text)
+        self.assertIn("## ОТВЕТ", text)
+        self.assertIn("**Проверка:** отказ — порогом, без вызова модели", text)
         self.assertIn("0.410", text)
+        self.assertNotIn("## ИСТОЧНИКИ", text)
 
     def test_refusal_by_model_is_labelled(self):
         text = format_brief(self._result(
             "Не знаю: во фрагментах нет ответа. Уточните вопрос.",
             QuoteCheck(), refused=True, refused_by_gate=False, best_score=0.70))
-        self.assertIn("отказ: моделью", text)
+        self.assertIn("**Проверка:** отказ — моделью", text)
 
     def test_judge_score_is_shown_when_present(self):
         check = QuoteCheck(total=1, exact=1, sources_total=1, sources_real=1)

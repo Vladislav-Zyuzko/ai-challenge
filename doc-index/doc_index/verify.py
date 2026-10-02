@@ -237,15 +237,43 @@ def brief(searcher: Searcher, agent: Answerer, question: str, *, filters: Filter
 
 
 def format_brief(result: dict) -> str:
-    """Печать справки: ответ как есть плюс строка машинной проверки."""
+    """Печать справки: блоки-заголовки ОТВЕТ / ИСТОЧНИКИ / ЦИТАТЫ и строка проверки.
+
+    Разметка markdown, а не «плоский» текст, по двум причинам: терминал dsh-term
+    раскрашивает заголовки (а в пайпе и в `-p` остаётся исходный markdown — его
+    можно скопировать как есть), и блоки видно с первого взгляда.
+    """
+    parsed: ParsedAnswer = result["parsed"]
     check: QuoteCheck = result["check"]
-    lines = [result["answer"].strip()]
+    lines: list[str] = ["## ОТВЕТ", ""]
+    lines.append((parsed.answer or result["answer"]).strip())
+    lines.append("")
+
+    if not result["refused"]:
+        if parsed.sources:
+            lines.extend(["## ИСТОЧНИКИ", ""])
+            for source in parsed.sources:
+                head = f"- **[{source.number}]**"
+                if source.chunk_id:
+                    head += f" `{source.chunk_id}`"
+                if source.section:
+                    head += f" — {source.section}"
+                lines.append(head)
+            lines.append("")
+        if parsed.quotes:
+            lines.extend(["## ЦИТАТЫ", ""])
+            for quote in parsed.quotes:
+                mark = f"**[{quote.number}]** " if quote.number else ""
+                lines.append(f"- {mark}«{quote.text}»")
+            lines.append("")
+
+    lines.extend(["---", ""])
     if result["refused"]:
         source = "порогом, без вызова модели" if result["refused_by_gate"] else "моделью"
-        lines.append("")
-        lines.append(f"— отказ: {source} · лучшее совпадение "
+        lines.append(f"**Проверка:** отказ — {source} · лучшее совпадение "
                      f"{result['best_score']:.3f} · фрагментов {result['context_fragments']}")
         return "\n".join(lines)
+
     parts = [
         f"источники {check.sources_real}/{check.sources_total} реальны",
         f"цитаты {check.verbatim}/{check.total} дословны",
@@ -258,8 +286,7 @@ def format_brief(result: dict) -> str:
         parts.append(f"лучшее совпадение {result['best_score']:.3f}")
     if result["support"] is not None:
         parts.append(f"судья {result['support']}")
-    lines.append("")
-    lines.append("— проверка: " + " · ".join(parts))
+    lines.append("**Проверка:** " + " · ".join(parts))
     return "\n".join(lines)
 
 
