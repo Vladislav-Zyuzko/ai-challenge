@@ -69,8 +69,9 @@ check('база без токена: заголовков нет', !/Authorizati
 check('оверлей системного промпта', /- id: system-prompt/.test(base.out))
 check('инструкция называет инструмент', /инструмент `rag_search`/.test(base.out))
 check('инструкция перечисляет базу', /`test-base` — тестовая база/.test(base.out))
-check('правило про источники', /ссылайся на заметку и строки/.test(base.out))
-check('правило про «ответа нет»', /скажи об этом прямо/.test(base.out))
+check('правило про источники', /называй источник: заметку и строки/.test(base.out))
+check('правило про дословные цитаты', /цитируй дословно/.test(base.out))
+check('правило про отказ и уточнение', /попроси уточнить/.test(base.out))
 
 // 3. Неизвестная база: внятная ошибка и список доступных.
 const unknown = run(['--rag', 'nope', '--mcp-check', 'rag', '--offline'],
@@ -115,6 +116,10 @@ check('две базы: обе в инструкции', /`base-a`/.test(multi.o
 const help = run(['--help'])
 check('--rag описан в справке', /--rag <имя>/.test(help.out))
 check('команда /rag в списке команд', /\/rag \[list\]/.test(help.out))
+check('команда /rag-brief в списке команд', /\/rag-brief <вопрос>/.test(help.out))
+check('rag-brief описан как шаблонный ответ',
+  /ОТВЕТ \+ ИСТОЧНИКИ \+ ЦИТАТЫ/.test(help.out))
+check('rag-brief идёт мимо агента', /мимо агента/.test(help.out))
 
 // 9. Переключатель фильтра: сравнение режимов без правки реестра.
 const filtered = run(['--rag', 'test-base', '--mcp-check', 'rag', '--offline'],

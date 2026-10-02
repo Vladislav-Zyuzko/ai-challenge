@@ -23,13 +23,49 @@ import { basename, join, resolve } from 'node:path'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 
 // ---------- ANSI ----------
-const C = process.stdout.isTTY && !process.env.NO_COLOR
+// Режим цвета определяется ДО первого использования палитр: `--color <auto|always|never>`
+// (или переменная DSH_TERM_COLOR) сканируется здесь же, потому что C, PROMPT и DS
+// вычисляются на загрузке модуля — раньше, чем отработает основной парсер аргументов.
+// `always` нужен там, где TTY не определяется (терминалы Git Bash, обёртки) или где
+// окружение выставляет NO_COLOR: харнесс, например, ставит NO_COLOR=1 своим шеллам,
+// и запущенный оттуда dsh-term терял и цвета, и markdown-рендер.
+const COLOR_MODES = ['auto', 'always', 'never']
+const COLOR_MODE = (() => {
+  const at = process.argv.indexOf('--color')
+  const fromArgv = at >= 0 ? String(process.argv[at + 1] ?? '').toLowerCase() : ''
+  if (COLOR_MODES.includes(fromArgv)) return fromArgv
+  if (at >= 0) return 'auto' // значение проверит и объяснит основной парсер
+  const fromEnv = String(process.env.DSH_TERM_COLOR ?? '').toLowerCase()
+  return COLOR_MODES.includes(fromEnv) ? fromEnv : 'auto'
+})()
+
+/** Цвета включены принудительно (`--color always`), даже без TTY и при NO_COLOR. */
+function colorForced() {
+  return COLOR_MODE === 'always'
+}
+
+/** Явный запрет (`--color never`) или соглашение NO_COLOR. */
+function colorSuppressed() {
+  return COLOR_MODE === 'never' || (COLOR_MODE === 'auto' && !!process.env.NO_COLOR)
+}
+
+/**
+ * Нужно ли красить вывод: `always` — всегда, `never` и NO_COLOR — никогда,
+ * `auto` — только в интерактивном TTY. Проверка в рантайме: TTY мог появиться
+ * позже загрузки модуля (тесты подменяют поток).
+ */
+function colorOk() {
+  if (colorSuppressed()) return false
+  return colorForced() || !!process.stdout.isTTY
+}
+
+const C = colorOk()
   ? { dim: '\x1b[2m', reset: '\x1b[22m', cyan: '\x1b[36m', green: '\x1b[32m', red: '\x1b[31m', yellow: '\x1b[33m', bold: '\x1b[1m', off: '\x1b[0m' }
   : { dim: '', reset: '', cyan: '', green: '', red: '', yellow: '', bold: '', off: '' }
 
 // Промпт «dsh> »: «dsh» — жирным фирменным синим DeepSeek (#4D6BFE) для контраста;
 // без цвета (пайп / NO_COLOR) — как раньше.
-const PROMPT = process.stdout.isTTY && !process.env.NO_COLOR
+const PROMPT = colorOk()
   ? '\x1b[1;38;2;77;107;254mdsh\x1b[0m> '
   : 'dsh> '
 
@@ -340,10 +376,11 @@ if (meterTicker.unref) meterTicker.unref()
 // блоки (```/~~~) — состояние на весь ход. Только интерактивный TTY.
 const mdCtx = { inFence: false, lineStart: true }
 
-/** Цветной markdown-рендер включён: только интерактивный TTY, без NO_COLOR, не one-shot. */
+/** Цветной markdown-рендер включён: интерактивный TTY без NO_COLOR, либо `--color always`. */
 function mdColorEnabled() {
   if (process.env.DSH_TERM_FORCE_MD) return true // диагностика/тесты
-  return !!process.stdout.isTTY && !process.env.NO_COLOR && !UI.oneShot
+  if (!colorOk()) return false
+  return colorForced() || !UI.oneShot
 }
 
 /**
@@ -376,7 +413,11 @@ function mdStyle(s, ctx) {
           const bodyStart = i + mHead[0].length
           const e = s.indexOf('\n', bodyStart)
           const end = e < 0 ? n : e
-          out += s.slice(i, bodyStart) + C.bold + DS.blue + s.slice(bodyStart, end) + C.off
+          // Escape-коды прописаны явно, как в инлайн-правилах ниже: палитры C и DS
+          // пусты вне настоящего TTY, и от них зависели только заголовки — при
+          // DSH_TERM_FORCE_MD (диагностика и тесты) они оставались неокрашенными.
+          out += s.slice(i, bodyStart) + '\x1b[1m\x1b[38;2;77;107;254m'
+            + s.slice(bodyStart, end) + '\x1b[0m'
           i = end
           continue
         }
@@ -459,8 +500,8 @@ const CAPTION_TEXT = 'Deep diving…'
  * Без цвета (пайп / NO_COLOR) — обычная подпись cyan bold, как раньше.
  */
 function captionFor(frame) {
-  const colorOk = process.stdout.isTTY && !process.env.NO_COLOR
-  if (!colorOk) return C.bold + C.cyan + CAPTION_TEXT + C.off
+  const colorHere = colorOk()
+  if (!colorHere) return C.bold + C.cyan + CAPTION_TEXT + C.off
   const from = [65, 102, 213] // #4166D5 — тёмно-синий (акцент DeepSeek)
   const to = [178, 202, 255]  // светло-голубой (гребень «волны»)
   const L = CAPTION_TEXT.length
@@ -1134,6 +1175,16 @@ function parseArgs(argv) {
       case '--with-profiles': opts.withProfiles = true; break
       case '--user-profile': opts.userProfile = next(); break
       case '--rag': opts.rag = [...(opts.rag ?? []), next()]; break
+      case '--color': {
+        // Значение уже прочитано при загрузке модуля (палитры вычисляются раньше),
+        // здесь только проверяем его и объясняем ошибку.
+        const value = String(next() ?? '').toLowerCase()
+        if (!COLOR_MODES.includes(value)) {
+          log.err(`--color: ожидается ${COLOR_MODES.join(' | ')}, получено «${value}»`)
+          opts.help = true
+        }
+        break
+      }
       case '--rag-margin': opts.ragMargin = Number(next()); break
       case '--rag-min-dense': opts.ragMinDense = Number(next()); break
       case '--rag-min-keep': opts.ragMinKeep = Number(next()); break
@@ -1346,6 +1397,7 @@ const COMMANDS = [
   { name: 'profile', usage: '/profile [show|list|use <slug>|new|off]', desc: 'профиль пользователя (персонализация): показать, сменить, создать, выключить' },
   { name: 'mcp', usage: '/mcp [show|tools|refresh]', desc: 'MCP-серверы: соединение, список инструментов и их цена в промпте' },
   { name: 'rag', usage: '/rag [list]', desc: 'базы знаний сессии (--rag): что подключено и какие есть в реестре' },
+  { name: 'rag-brief', usage: '/rag-brief <вопрос>', desc: 'справка по базе по шаблону: ответ + источники + цитаты (мимо агента)' },
   { name: 'resume', usage: '/resume [id]', desc: 'продолжить сессию: по id или выбором из списка' },
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
@@ -1430,8 +1482,8 @@ function menuWidth() {
 
 // Фирменная гамма DeepSeek (см. uicolours.com/brands/deepseek): основной синий
 // #4D6BFE (77,107,254), светло-синий вариант #6E8BFF (110,139,255). Truecolor SGR;
-// вне TTY / при NO_COLOR — пустые коды (рендер без цвета).
-const DS = process.stdout.isTTY && !process.env.NO_COLOR
+// выключено при NO_COLOR, `--color never` и вне TTY (если цвет не форсирован).
+const DS = colorOk()
   ? { blue: '\x1b[38;2;77;107;254m', sky: '\x1b[38;2;110;139;255m' }
   : { blue: '', sky: '' }
 
@@ -2550,9 +2602,11 @@ function ragInstructionText(names, bases) {
     '',
     'Правила работы с базой:',
     '- вопросы по темам базы — сначала `rag_search`, потом ответ; опирайся на найденные фрагменты;',
-    '- в ответе ссылайся на заметку и строки из выдачи (source, «строки N–M»);',
-    '- если инструмент ответил, что ответа нет, — скажи об этом прямо, не достраивай по памяти;',
-    '- база не заменяет твои знания: вопросы вне её тем разбирай как обычно, без выдуманных ссылок.',
+    '- в ответе называй источник: заметку и строки из выдачи (source, «строки N–M»);',
+    '- цитируй дословно: 1–3 фрагмента из выдачи в кавычках; пересказ за цитату не выдавай;',
+    '- если инструмент ответил, что ответа нет, — так и скажи и попроси уточнить, о чём именно речь, '
+      + 'вместо догадок по памяти;',
+    '- база не заменяет твои знания: вопросы вне её тем разбирай как обычно, но без выдуманных ссылок.',
   )
   return lines.join('\n')
 }
@@ -2596,6 +2650,18 @@ function ragServerFor(names, bases, { cwd = process.cwd(), opts = {} } = {}) {
     args,
     env: { PYTHONPATH: root, PYTHONIOENCODING: 'utf-8' },
     filter,
+    // Параметры для командной справки (/rag-brief): она идёт мимо агента, тем же
+    // строгим путём, что проверка дня 24, поэтому ей нужны база и настройки фильтра.
+    ragCli: {
+      root,
+      python: process.env.DSH_TERM_RAG_PYTHON || 'python',
+      base: names[0],
+      strategy: String(first.strategy || RAG_DEFAULT_STRATEGY),
+      k: 5,
+      expand: 1,
+      candidates: 20,
+      filter,
+    },
     what: `поиск по базе знаний с источниками и строками — ${what}`,
   }
 }
@@ -3412,6 +3478,8 @@ async function main() {
     log.line('  --rag-margin <0..1> переопределить маржу от лучшего результата (флаг сессии главнее реестра)')
     log.line('  --rag-min-dense <0..1>  переопределить пол применимости базы')
     log.line('  --rag-min-keep <n>  сколько фрагментов оставить даже ниже порога (default 2)')
+    log.line('  --color <режим>     цвет и markdown-рендер: auto | always | never (default auto)')
+    log.line('                      always — красить даже без TTY и при NO_COLOR (env DSH_TERM_COLOR)')
     log.line('  --mcp-toolsets <l>  тулсеты MCP-сервера: список через запятую или all (полный набор дороже по токенам)')
     log.line('  --mcp-readwrite     снять режим «только чтение» у MCP-пресета (по умолчанию readonly)')
     log.line('  --mcp-check [пресет] диагностика: подключиться к MCP и напечатать список инструментов, без сессии')
@@ -3432,6 +3500,8 @@ async function main() {
     log.line('  /new     начать новую сессию')
     log.line('  /token   сменить сохранённый API ключ')
     log.line('  /rag [list]  базы знаний сессии (--rag): что подключено и что есть в .dsh/rag.json')
+    log.line('  /rag-brief <вопрос>  справка по базе по шаблону: ОТВЕТ + ИСТОЧНИКИ + ЦИТАТЫ')
+    log.line('                идёт мимо агента, формат и проверка цитат гарантированы кодом')
     log.line('  /publish-day  git+gh: коммит → push → PR day→week (по .dsh/SKILLS)')
     log.line('  /create-project [что строим]  сессия архитектора проекта: опросник → .project-harness')
     log.line('                → гейт инструментов → ноды (по .dsh/SKILLS/create-project.md)')
@@ -4834,6 +4904,66 @@ async function main() {
         log.dim('  сравнить режимы: --rag-no-filter (без порогов) или --rag-margin <0..1>')
         break
       }
+      case 'rag-brief': {
+        // Справка идёт МИМО агента: тот же строгий путь, что в проверке дня 24
+        // (`doc_index brief`), поэтому форма ответа и проверка источников с цитатами
+        // гарантированы кодом, а не послушанием модели.
+        const question = parts.slice(1).join(' ').trim()
+        if (!question) {
+          log.err('нужен вопрос: /rag-brief <вопрос>')
+          log.dim('пример: /rag-brief зачем нужны блокирующие гейты')
+          log.dim('ответ придёт по шаблону: ОТВЕТ + ИСТОЧНИКИ + ЦИТАТЫ и строка проверки')
+          break
+        }
+        if (!state.rag?.names?.length) {
+          log.err('rag-brief: база знаний в сессии не подключена')
+          log.dim('запуск: dsh-term --rag <имя> · доступные базы: /rag list')
+          break
+        }
+        const cli = state.rag.servers[0]?.ragCli
+        if (!cli) {
+          log.err('rag-brief: не удалось собрать параметры базы')
+          break
+        }
+        const argv = ['-m', 'doc_index', 'brief', question,
+          '--strategy', cli.strategy,
+          '--k', String(cli.k),
+          '--expand', String(cli.expand),
+          '--candidates', String(cli.candidates),
+          '--min-keep', String(cli.filter.minKeep)]
+        if (cli.filter.margin === null && cli.filter.minDense === null) {
+          argv.push('--no-filter')
+        } else {
+          if (cli.filter.margin !== null) argv.push('--margin', String(cli.filter.margin))
+          if (cli.filter.minDense !== null) argv.push('--min-dense', String(cli.filter.minDense))
+        }
+        log.dim(`rag-brief: база ${cli.base} · ${cli.filter.label} · собираю ответ по шаблону…`)
+        const brief = spawnSync(cli.python, argv, {
+          cwd: cli.root,
+          encoding: 'utf8',
+          timeout: 180000,
+          env: { ...process.env, ...(state.rag.servers[0].env ?? {}) },
+        })
+        if (brief.error) {
+          log.err(`rag-brief: не удалось запустить поиск — ${brief.error.message}`)
+          break
+        }
+        if (brief.status !== 0) {
+          log.err(`rag-brief: команда вернула код ${brief.status}`)
+          const tail = (brief.stderr ?? '').trim().split('\n').slice(-4).join('\n')
+          if (tail) log.dim(tail)
+          break
+        }
+        log.line('')
+        // Прогоняем через тот же markdown-рендер, что ответы агента: в интерактивном
+        // TTY заголовки ОТВЕТ / ИСТОЧНИКИ / ЦИТАТЫ подсветятся, а в пайпе и `-p`
+        // текст останется исходным markdown — его можно скопировать как есть.
+        const styled = mdStyle((brief.stdout ?? '').replace(/\r\n/g, '\n').trimEnd(),
+          { inFence: false, lineStart: true })
+        for (const line of styled.split('\n')) log.line(line)
+        log.line('')
+        break
+      }
       case 'mcp': {
         const m = state.mcp
         if (!m || !m.servers.length) {
@@ -5003,7 +5133,7 @@ async function main() {
     const res = await rpc.request('initialize', initParams)
     log.dim(`runtime: ${res.serverInfo.name} ${res.serverInfo.version} · provider=${opts.provider} model=${opts.model}`)
     // Диагностика UI: понятно, почему нет цветов/рендера (tty/NO_COLOR/one-shot).
-    log.dim(`ui: in-tty=${process.stdin.isTTY ? 1 : 0} out-tty=${process.stdout.isTTY ? 1 : 0} colors=${C.cyan ? 1 : 0} md=${mdColorEnabled() ? 1 : 0}`)
+    log.dim(`ui: in-tty=${process.stdin.isTTY ? 1 : 0} out-tty=${process.stdout.isTTY ? 1 : 0} colors=${C.cyan ? 1 : 0} md=${mdColorEnabled() ? 1 : 0} color=${COLOR_MODE}${colorSuppressed() ? ' (no-color)' : ''}`)
     log.dim(`compress: ${compress.mode}${compressPolicyText(compress)}`)
     if (state.userProfile) {
       log.dim(`profile: «${state.userProfile.title}» (${state.userProfile.slug}) · ~${userProfileTokens(state.userProfile)} токенов в system prompt · файл: ${userProfilePath(opts.dshHome, state.userProfile.slug)}`)
