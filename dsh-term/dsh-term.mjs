@@ -23,13 +23,49 @@ import { basename, join, resolve } from 'node:path'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 
 // ---------- ANSI ----------
-const C = process.stdout.isTTY && !process.env.NO_COLOR
+// Режим цвета определяется ДО первого использования палитр: `--color <auto|always|never>`
+// (или переменная DSH_TERM_COLOR) сканируется здесь же, потому что C, PROMPT и DS
+// вычисляются на загрузке модуля — раньше, чем отработает основной парсер аргументов.
+// `always` нужен там, где TTY не определяется (терминалы Git Bash, обёртки) или где
+// окружение выставляет NO_COLOR: харнесс, например, ставит NO_COLOR=1 своим шеллам,
+// и запущенный оттуда dsh-term терял и цвета, и markdown-рендер.
+const COLOR_MODES = ['auto', 'always', 'never']
+const COLOR_MODE = (() => {
+  const at = process.argv.indexOf('--color')
+  const fromArgv = at >= 0 ? String(process.argv[at + 1] ?? '').toLowerCase() : ''
+  if (COLOR_MODES.includes(fromArgv)) return fromArgv
+  if (at >= 0) return 'auto' // значение проверит и объяснит основной парсер
+  const fromEnv = String(process.env.DSH_TERM_COLOR ?? '').toLowerCase()
+  return COLOR_MODES.includes(fromEnv) ? fromEnv : 'auto'
+})()
+
+/** Цвета включены принудительно (`--color always`), даже без TTY и при NO_COLOR. */
+function colorForced() {
+  return COLOR_MODE === 'always'
+}
+
+/** Явный запрет (`--color never`) или соглашение NO_COLOR. */
+function colorSuppressed() {
+  return COLOR_MODE === 'never' || (COLOR_MODE === 'auto' && !!process.env.NO_COLOR)
+}
+
+/**
+ * Нужно ли красить вывод: `always` — всегда, `never` и NO_COLOR — никогда,
+ * `auto` — только в интерактивном TTY. Проверка в рантайме: TTY мог появиться
+ * позже загрузки модуля (тесты подменяют поток).
+ */
+function colorOk() {
+  if (colorSuppressed()) return false
+  return colorForced() || !!process.stdout.isTTY
+}
+
+const C = colorOk()
   ? { dim: '\x1b[2m', reset: '\x1b[22m', cyan: '\x1b[36m', green: '\x1b[32m', red: '\x1b[31m', yellow: '\x1b[33m', bold: '\x1b[1m', off: '\x1b[0m' }
   : { dim: '', reset: '', cyan: '', green: '', red: '', yellow: '', bold: '', off: '' }
 
 // Промпт «dsh> »: «dsh» — жирным фирменным синим DeepSeek (#4D6BFE) для контраста;
 // без цвета (пайп / NO_COLOR) — как раньше.
-const PROMPT = process.stdout.isTTY && !process.env.NO_COLOR
+const PROMPT = colorOk()
   ? '\x1b[1;38;2;77;107;254mdsh\x1b[0m> '
   : 'dsh> '
 
@@ -340,10 +376,11 @@ if (meterTicker.unref) meterTicker.unref()
 // блоки (```/~~~) — состояние на весь ход. Только интерактивный TTY.
 const mdCtx = { inFence: false, lineStart: true }
 
-/** Цветной markdown-рендер включён: только интерактивный TTY, без NO_COLOR, не one-shot. */
+/** Цветной markdown-рендер включён: интерактивный TTY без NO_COLOR, либо `--color always`. */
 function mdColorEnabled() {
   if (process.env.DSH_TERM_FORCE_MD) return true // диагностика/тесты
-  return !!process.stdout.isTTY && !process.env.NO_COLOR && !UI.oneShot
+  if (!colorOk()) return false
+  return colorForced() || !UI.oneShot
 }
 
 /**
@@ -376,7 +413,11 @@ function mdStyle(s, ctx) {
           const bodyStart = i + mHead[0].length
           const e = s.indexOf('\n', bodyStart)
           const end = e < 0 ? n : e
-          out += s.slice(i, bodyStart) + C.bold + DS.blue + s.slice(bodyStart, end) + C.off
+          // Escape-коды прописаны явно, как в инлайн-правилах ниже: палитры C и DS
+          // пусты вне настоящего TTY, и от них зависели только заголовки — при
+          // DSH_TERM_FORCE_MD (диагностика и тесты) они оставались неокрашенными.
+          out += s.slice(i, bodyStart) + '\x1b[1m\x1b[38;2;77;107;254m'
+            + s.slice(bodyStart, end) + '\x1b[0m'
           i = end
           continue
         }
@@ -459,8 +500,8 @@ const CAPTION_TEXT = 'Deep diving…'
  * Без цвета (пайп / NO_COLOR) — обычная подпись cyan bold, как раньше.
  */
 function captionFor(frame) {
-  const colorOk = process.stdout.isTTY && !process.env.NO_COLOR
-  if (!colorOk) return C.bold + C.cyan + CAPTION_TEXT + C.off
+  const colorHere = colorOk()
+  if (!colorHere) return C.bold + C.cyan + CAPTION_TEXT + C.off
   const from = [65, 102, 213] // #4166D5 — тёмно-синий (акцент DeepSeek)
   const to = [178, 202, 255]  // светло-голубой (гребень «волны»)
   const L = CAPTION_TEXT.length
@@ -1104,6 +1145,11 @@ function parseArgs(argv) {
     mcpReadwrite: undefined, // --mcp-readwrite: снять режим «только чтение» у MCP-пресета
     mcpCheck: undefined,     // --mcp-check [preset]: только соединение + список инструментов, без сессии
     offline: undefined,      // --mcp-check --offline: показать оверлей и выйти (без сети)
+    rag: undefined,          // --rag <имя>: подключить базу знаний из .dsh/rag.json (повторяемый)
+    ragMargin: undefined,    // --rag-margin <0..1>: переопределить маржу от лучшего результата
+    ragMinDense: undefined,  // --rag-min-dense <0..1>: переопределить пол применимости базы
+    ragMinKeep: undefined,   // --rag-min-keep <n>: сколько фрагментов оставить даже ниже порога
+    ragNoFilter: undefined,  // --rag-no-filter: отдавать топ-K без порогов (для сравнения)
     autoApprove: undefined,  // разрешать запросы доступа без вопросов (env DSH_TERM_AUTO_APPROVE)
     help: false,
   }
@@ -1128,6 +1174,21 @@ function parseArgs(argv) {
       case '--auto-approve': opts.autoApprove = true; break
       case '--with-profiles': opts.withProfiles = true; break
       case '--user-profile': opts.userProfile = next(); break
+      case '--rag': opts.rag = [...(opts.rag ?? []), next()]; break
+      case '--color': {
+        // Значение уже прочитано при загрузке модуля (палитры вычисляются раньше),
+        // здесь только проверяем его и объясняем ошибку.
+        const value = String(next() ?? '').toLowerCase()
+        if (!COLOR_MODES.includes(value)) {
+          log.err(`--color: ожидается ${COLOR_MODES.join(' | ')}, получено «${value}»`)
+          opts.help = true
+        }
+        break
+      }
+      case '--rag-margin': opts.ragMargin = Number(next()); break
+      case '--rag-min-dense': opts.ragMinDense = Number(next()); break
+      case '--rag-min-keep': opts.ragMinKeep = Number(next()); break
+      case '--rag-no-filter': opts.ragNoFilter = true; break
       case '--mcp': opts.mcp = [...(opts.mcp ?? []), next()]; break
       case '--mcp-toolsets': opts.mcpToolsets = next(); break
       case '--mcp-readwrite': opts.mcpReadwrite = true; break
@@ -1335,6 +1396,8 @@ const COMMANDS = [
   { name: 'context', usage: '/context', desc: 'контекст: стратегия, факты, метрики, последний summary' },
   { name: 'profile', usage: '/profile [show|list|use <slug>|new|off]', desc: 'профиль пользователя (персонализация): показать, сменить, создать, выключить' },
   { name: 'mcp', usage: '/mcp [show|tools|refresh]', desc: 'MCP-серверы: соединение, список инструментов и их цена в промпте' },
+  { name: 'rag', usage: '/rag [list]', desc: 'базы знаний сессии (--rag): что подключено и какие есть в реестре' },
+  { name: 'rag-brief', usage: '/rag-brief <вопрос>', desc: 'справка по базе по шаблону: ответ + источники + цитаты (мимо агента)' },
   { name: 'resume', usage: '/resume [id]', desc: 'продолжить сессию: по id или выбором из списка' },
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
@@ -1419,8 +1482,8 @@ function menuWidth() {
 
 // Фирменная гамма DeepSeek (см. uicolours.com/brands/deepseek): основной синий
 // #4D6BFE (77,107,254), светло-синий вариант #6E8BFF (110,139,255). Truecolor SGR;
-// вне TTY / при NO_COLOR — пустые коды (рендер без цвета).
-const DS = process.stdout.isTTY && !process.env.NO_COLOR
+// выключено при NO_COLOR, `--color never` и вне TTY (если цвет не форсирован).
+const DS = colorOk()
   ? { blue: '\x1b[38;2;77;107;254m', sky: '\x1b[38;2;110;139;255m' }
   : { blue: '', sky: '' }
 
@@ -2070,21 +2133,34 @@ function profileNoticeText(profile) {
 }
 
 /**
- * YAML-оверлей: профиль как personaPrefix системного промпта.
+ * YAML-оверлей: фрагмент системного промпта (personaPrefix).
  *
- * Оверлей пишется из {@link userProfilePromptText} (профиль + рамка приоритета),
- * а не из «сырого» текста профиля: рамка — часть того, что видит модель.
+ * Несёт всё, что dsh-term добавляет к системному промпту: профиль пользователя и
+ * инструкции сессии (например, про подключённую базу знаний из `--rag`). Части
+ * склеиваются в один оверлей намеренно: `personaPrefix` в конфиге один, и два
+ * оверлея `- id: system-prompt` перетёрли бы друг друга.
  */
-function userProfileOverlayYaml(profile) {
-  const indented = userProfilePromptText(profile).split('\n').map((l) => `      ${l}`).join('\n')
+function systemPromptOverlayYaml(parts) {
+  const text = parts.filter(Boolean).join('\n\n')
+  const indented = text.split('\n').map((l) => `      ${l}`).join('\n')
   return [
-    '# dsh-term: профиль пользователя в system prompt (personaPrefix).',
+    '# dsh-term: профиль пользователя и инструкции сессии в system prompt.',
     '- id: system-prompt',
     '  config:',
     '    personaPrefix: |-',
     indented,
     '',
   ].join('\n')
+}
+
+/**
+ * Оверлей профиля пользователя.
+ *
+ * Пишется из {@link userProfilePromptText} (профиль + рамка приоритета), а не из
+ * «сырого» текста профиля: рамка — часть того, что видит модель.
+ */
+function userProfileOverlayYaml(profile) {
+  return systemPromptOverlayYaml([userProfilePromptText(profile)])
 }
 
 /** Слить новые пункты в секции: без дублей, с лимитом пунктов на секцию. */
@@ -2426,6 +2502,213 @@ function mcpPatchYaml(servers) {
   return lines.join('\n') + '\n'
 }
 
+// ---- RAG (day23): локальные базы знаний как возможность сессии ---------------
+// `--rag <имя>` подключает к сессии проиндексированный набор документов. Механика
+// та же, что у MCP-пресетов: харнесс поднимает stdio-сервер `doc_index.mcp_server`
+// через мост `@deepseek-ai/dsh-mcp-client`, а инструменты появляются у агента.
+// Сверх этого в системный промпт уходит инструкция опираться на базу — иначе
+// инструмент есть, а привычки им пользоваться нет.
+//
+// Реестр баз — файл `.dsh/rag.json` в рабочей папке: базы добавляются без правки
+// этого файла. Формат: { "имя": { title, index, what, strategy, margin, minDense } },
+// где `index` — каталог проекта doc-index (внутри ожидается out/index.db).
+const RAG_REGISTRY_NAME = 'rag.json'
+const RAG_SERVER_NAME = 'rag'
+const RAG_DEFAULT_STRATEGY = 'structural'
+const RAG_DEFAULT_MARGIN = 0.04
+const RAG_DEFAULT_MIN_DENSE = 0.5
+const RAG_DEFAULT_MIN_KEEP = 2
+
+function ragRegistryPath(cwd = process.cwd()) {
+  return process.env.DSH_TERM_RAG_FILE || join(cwd, '.dsh', RAG_REGISTRY_NAME)
+}
+
+/** Прочитать реестр баз. Ошибка разбора не роняет сессию: её видно в диагностике. */
+function readRagRegistry(cwd = process.cwd()) {
+  const path = ragRegistryPath(cwd)
+  if (!existsSync(path)) return { path, bases: {}, error: null, missing: true }
+  try {
+    const data = JSON.parse(readFileSync(path, 'utf8'))
+    const bases = data && typeof data.bases === 'object' ? data.bases : data
+    if (!bases || typeof bases !== 'object') throw new Error('ожидается объект «имя → база»')
+    return { path, bases, error: null, missing: false }
+  } catch (e) {
+    return { path, bases: {}, error: e.message, missing: false }
+  }
+}
+
+/** Имена баз из `--rag`: повторяемый флаг и списки через запятую. */
+function ragRequestedNames(opts) {
+  const raw = opts.rag ?? []
+  const names = []
+  for (const value of raw) {
+    for (const part of String(value).split(',')) {
+      const name = part.trim()
+      if (name && !names.includes(name)) names.push(name)
+    }
+  }
+  return names
+}
+
+/**
+ * Настройки фильтра для сессии: флаг → реестр → умолчание.
+ *
+ * Флаги нужны, чтобы сравнивать режимы, не правя реестр и не перезапуская всё
+ * дважды с разными файлами: `--rag-no-filter` выключает пороги, `--rag-margin`
+ * и `--rag-min-dense` ставят свои значения.
+ */
+function ragFilterSettings(opts, base = {}) {
+  if (opts.ragNoFilter) return { margin: null, minDense: null, minKeep: 1, label: 'без фильтра' }
+  const margin = opts.ragMargin ?? base.margin ?? RAG_DEFAULT_MARGIN
+  const minDense = opts.ragMinDense ?? base.minDense ?? RAG_DEFAULT_MIN_DENSE
+  const minKeep = opts.ragMinKeep ?? base.minKeep ?? RAG_DEFAULT_MIN_KEEP
+  return {
+    margin: Number(margin),
+    minDense: Number(minDense),
+    minKeep: Number(minKeep),
+    label: `маржа ${margin} · пол ${minDense} · мин.фрагментов ${minKeep}`,
+  }
+}
+
+/** Проверить числовые флаги фильтра: NaN уехал бы в аргументы сервера молча. */
+function ragFilterError(opts) {
+  const numeric = [['--rag-margin', opts.ragMargin], ['--rag-min-dense', opts.ragMinDense],
+    ['--rag-min-keep', opts.ragMinKeep]]
+  for (const [flag, value] of numeric) {
+    if (value !== undefined && !Number.isFinite(value)) return `${flag}: нужно число`
+  }
+  return null
+}
+
+/**
+ * Описание баз для системного промпта.
+ *
+ * Инструкция намеренно короткая: она едет в каждый запрос, а её задача — задать
+ * привычку («сначала спроси базу») и правило ссылок, а не пересказать корпус.
+ */
+function ragInstructionText(names, bases) {
+  const lines = [
+    'В этой сессии подключена база знаний — инструмент `rag_search`.',
+    '',
+    'Что в базе:',
+  ]
+  for (const name of names) {
+    const entry = bases[name] ?? {}
+    const title = entry.title ? ` — ${entry.title}` : ''
+    const what = entry.what ? `: ${entry.what}` : ''
+    lines.push(`- \`${name}\`${title}${what}`)
+  }
+  lines.push(
+    '',
+    'Правила работы с базой:',
+    '- вопросы по темам базы — сначала `rag_search`, потом ответ; опирайся на найденные фрагменты;',
+    '- в ответе называй источник: заметку и строки из выдачи (source, «строки N–M»);',
+    '- цитируй дословно: 1–3 фрагмента из выдачи в кавычках; пересказ за цитату не выдавай;',
+    '- если инструмент ответил, что ответа нет, — так и скажи и попроси уточнить, о чём именно речь, '
+      + 'вместо догадок по памяти;',
+    '- база не заменяет твои знания: вопросы вне её тем разбирай как обычно, но без выдуманных ссылок.',
+  )
+  return lines.join('\n')
+}
+
+/**
+ * Синтезировать MCP-сервер RAG из выбранных баз: один stdio-процесс на все базы.
+ *
+ * `python` берётся из PATH; сам пакет лежит в каталоге doc-index, поэтому путь к
+ * нему уходит в PYTHONPATH — иначе `-m doc_index.mcp_server` не найдётся.
+ */
+function ragServerFor(names, bases, { cwd = process.cwd(), opts = {} } = {}) {
+  const first = bases[names[0]] ?? {}
+  const indexDirs = names.map((name) => resolve(cwd, String(bases[name]?.index ?? '')))
+  const root = indexDirs[0]
+  const args = ['-m', 'doc_index.mcp_server']
+  for (const [i, name] of names.entries()) {
+    const entry = bases[name] ?? {}
+    args.push('--base', `${name}=${indexDirs[i]}`)
+    if (entry.title) args.push('--title', `${name}=${entry.title}`)
+    if (entry.what) args.push('--what', `${name}=${entry.what}`)
+  }
+  // Настройки фильтра: флаги сессии главнее реестра. При `--no-filter` пороги
+  // выключаются совсем — иначе «нулевая маржа» оставила бы один лучший фрагмент.
+  const filter = ragFilterSettings(opts, first)
+  args.push('--strategy', String(first.strategy || RAG_DEFAULT_STRATEGY))
+  args.push('--min-keep', String(filter.minKeep))
+  if (filter.margin === null && filter.minDense === null) {
+    args.push('--no-filter')
+  } else {
+    if (filter.margin !== null) args.push('--margin', String(filter.margin))
+    if (filter.minDense !== null) args.push('--min-dense', String(filter.minDense))
+  }
+  const what = names
+    .map((name) => `${name}${bases[name]?.what ? ` (${bases[name].what})` : ''}`)
+    .join(', ')
+  return {
+    serverName: RAG_SERVER_NAME,
+    title: 'RAG: локальные базы знаний (stdio)',
+    transport: 'stdio',
+    command: process.env.DSH_TERM_RAG_PYTHON || 'python',
+    args,
+    env: { PYTHONPATH: root, PYTHONIOENCODING: 'utf-8' },
+    filter,
+    // Параметры для командной справки (/rag-brief): она идёт мимо агента, тем же
+    // строгим путём, что проверка дня 24, поэтому ей нужны база и настройки фильтра.
+    ragCli: {
+      root,
+      python: process.env.DSH_TERM_RAG_PYTHON || 'python',
+      base: names[0],
+      strategy: String(first.strategy || RAG_DEFAULT_STRATEGY),
+      k: 5,
+      expand: 1,
+      candidates: 20,
+      filter,
+    },
+    what: `поиск по базе знаний с источниками и строками — ${what}`,
+  }
+}
+
+/**
+ * Разобрать `--rag`: что подключено, чем и с какой инструкцией.
+ *
+ * Ошибки возвращаются, а не печатаются: вызывающая сторона решает, падать или
+ * продолжать без базы знаний.
+ */
+function resolveRag(opts) {
+  const names = ragRequestedNames(opts)
+  if (!names.length) return { names: [], servers: [], instruction: null, registry: null, error: null }
+  const badNumber = ragFilterError(opts)
+  if (badNumber) {
+    return { names, servers: [], instruction: null, registry: null, error: badNumber }
+  }
+  const registry = readRagRegistry()
+  if (registry.error) {
+    return { names, servers: [], instruction: null, registry,
+             error: `реестр баз ${registry.path} не читается: ${registry.error}` }
+  }
+  if (registry.missing) {
+    return { names, servers: [], instruction: null, registry,
+             error: `нет файла реестра баз ${registry.path}` }
+  }
+  const unknown = names.filter((name) => !registry.bases[name])
+  if (unknown.length) {
+    return { names, servers: [], instruction: null, registry,
+             error: `неизвестная база знаний: ${unknown.join(', ')}` }
+  }
+  // Каталог проверяем до старта: иначе ошибка всплывёт уже в рантайме, где её
+  // причина теряется среди вывода MCP-моста.
+  const missing = names.filter((name) => !existsSync(resolve(process.cwd(), String(registry.bases[name].index ?? ''))))
+  if (missing.length) {
+    return { names, servers: [], instruction: null, registry,
+             error: `каталог базы не найден: ${missing.map((n) => `${n} → ${registry.bases[n].index}`).join(', ')}` }
+  }
+  return {
+    names,
+    servers: [ragServerFor(names, registry.bases, { opts })],
+    instruction: ragInstructionText(names, registry.bases),
+    registry,
+    error: null,
+  }
+}
+
 /**
  * Есть ли уже MCP-строка в пользовательском слое профиля: `insert` не
  * идемпотентен, повторная вставка того же id валит дерево плагинов
@@ -2449,8 +2732,13 @@ async function mcpProbeStdio(server, { timeoutMs = 20000 } = {}) {
   return await new Promise((resolve) => {
     let child
     try {
-      child = spawn(server.command, [...(server.args ?? []), server.script], {
+      // `script` — это последний аргумент stdio-сервера (так записан figma-мост).
+      // У серверов, которые запускаются пакетом (`python -m …`), скрипта нет:
+      // добавлять `undefined` в argv нельзя, спавн падает на типе аргумента.
+      // env нужен тем же серверам: путь к пакету у них едет через PYTHONPATH.
+      child = spawn(server.command, [...(server.args ?? []), ...(server.script ? [server.script] : [])], {
         stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, ...(server.env ?? {}) },
       })
     } catch (e) {
       resolve(fail(e.message))
@@ -2657,32 +2945,58 @@ function mcpRegisteredTokens(probe) {
 async function runMcpCheck(opts) {
   // День 20: серверов несколько, и проверять их вместе полезнее, чем по одному —
   // поэтому принимаем и список `figma,sltracker`, и `all`.
+  // День 23: имя `rag` здесь означает не пресет, а синтезированный из `--rag`
+  // сервер базы знаний — его тоже нужно уметь проверить до старта сессии.
   const requested = String(opts.mcpCheck ?? '').trim()
-  const names = requested === MCP_ALL_PRESETS
-    ? Object.keys(MCP_PRESETS)
+  const rag = resolveRag(opts)
+  if (rag.error) {
+    log.err(rag.error)
+    const known = rag.registry ? Object.keys(rag.registry.bases) : []
+    if (known.length) log.dim(`доступно: ${known.join(' | ')}`)
+    else if (rag.registry?.missing) {
+      log.dim('реестр баз: .dsh/rag.json — { "имя": { "title": "…", "index": "doc-index", "what": "…" } }')
+    }
+    return 1
+  }
+  const wantsAll = requested === MCP_ALL_PRESETS
+  const names = wantsAll
+    ? [...Object.keys(MCP_PRESETS), ...(rag.names.length ? [RAG_SERVER_NAME] : [])]
     : requested.split(',').map((x) => x.trim()).filter(Boolean)
+  const wantsRag = names.includes(RAG_SERVER_NAME)
   const { servers, unknown } = resolveMcpServers({
-    mcp: names,
+    mcp: names.filter((n) => n !== RAG_SERVER_NAME),
     mcpToolsets: opts.mcpToolsets,
     mcpReadwrite: opts.mcpReadwrite,
   })
   if (unknown.length) {
     log.err(`неизвестный MCP-пресет: ${unknown.join(', ')}`)
-    log.dim(`доступно: ${Object.keys(MCP_PRESETS).join(' | ')}`)
+    log.dim(`доступно: ${Object.keys(MCP_PRESETS).join(' | ')}${rag.names.length ? ' | rag' : ''}`)
     return 1
+  }
+  if (wantsRag) {
+    if (!rag.servers.length) {
+      log.err('mcp-check rag: база знаний не выбрана — нужен --rag <имя>')
+      log.dim(`доступные базы: ${Object.keys(readRagRegistry().bases).join(' | ') || 'реестр пуст'}`)
+      return 1
+    }
+    servers.push(...rag.servers)
   }
   if (!servers.length) {
     log.err('нечего проверять: не задан MCP-пресет')
     return 1
   }
-  mcpAttachTokens(servers)
+  mcpAttachTokens(servers.filter((s) => s.serverName !== RAG_SERVER_NAME))
   for (const s of servers) {
     if (s.tokenError) log.err(`${s.serverName}: ${s.tokenError}`)
   }
   log.line(`${C.bold}mcp-check${C.off} ${servers.map((s) => s.serverName).join(', ')}`)
-  log.dim(`  режим: ${servers.map(mcpModeLabel).join(' | ')}`)
+  log.dim(`  режим: ${servers.map((s) => (s.serverName === RAG_SERVER_NAME ? 'rag' : mcpModeLabel(s))).join(' | ')}`)
   log.dim(`  оверлей (уходит в рантайм через --patch, секретов в файле нет):`)
   for (const l of mcpPatchYaml(servers).trimEnd().split('\n')) log.dim(`    ${l}`)
+  if (rag.instruction) {
+    log.dim('  оверлей системного промпта (инструкция опираться на базу):')
+    for (const l of systemPromptOverlayYaml([rag.instruction]).trimEnd().split('\n')) log.dim(`    ${l}`)
+  }
   if (opts.offline) {
     log.dim('  --offline: сеть не трогаем, соединение не проверялось')
     return 0
@@ -3158,6 +3472,14 @@ async function main() {
     log.line('  --user-profile <id> включить конкретный профиль пользователя (env DSH_TERM_USER_PROFILE)')
     log.line(`  --mcp <preset>      подключить MCP-сервер; флаг повторяемый (${Object.keys(MCP_PRESETS).join(' | ')})`)
     log.line('                      инструменты появятся как mcp__<сервер>__<тул>')
+    log.line('  --rag <имя>         подключить базу знаний из .dsh/rag.json; флаг повторяемый')
+    log.line('                      агент получает инструмент rag_search и инструкцию опираться на базу')
+    log.line('  --rag-no-filter     отдавать топ-K без порогов — сравнить работу фильтра')
+    log.line('  --rag-margin <0..1> переопределить маржу от лучшего результата (флаг сессии главнее реестра)')
+    log.line('  --rag-min-dense <0..1>  переопределить пол применимости базы')
+    log.line('  --rag-min-keep <n>  сколько фрагментов оставить даже ниже порога (default 2)')
+    log.line('  --color <режим>     цвет и markdown-рендер: auto | always | never (default auto)')
+    log.line('                      always — красить даже без TTY и при NO_COLOR (env DSH_TERM_COLOR)')
     log.line('  --mcp-toolsets <l>  тулсеты MCP-сервера: список через запятую или all (полный набор дороже по токенам)')
     log.line('  --mcp-readwrite     снять режим «только чтение» у MCP-пресета (по умолчанию readonly)')
     log.line('  --mcp-check [пресет] диагностика: подключиться к MCP и напечатать список инструментов, без сессии')
@@ -3177,6 +3499,9 @@ async function main() {
     log.line('  /resume [id]  продолжить сессию: по id или выбором из списка')
     log.line('  /new     начать новую сессию')
     log.line('  /token   сменить сохранённый API ключ')
+    log.line('  /rag [list]  базы знаний сессии (--rag): что подключено и что есть в .dsh/rag.json')
+    log.line('  /rag-brief <вопрос>  справка по базе по шаблону: ОТВЕТ + ИСТОЧНИКИ + ЦИТАТЫ')
+    log.line('                идёт мимо агента, формат и проверка цитат гарантированы кодом')
     log.line('  /publish-day  git+gh: коммит → push → PR day→week (по .dsh/SKILLS)')
     log.line('  /create-project [что строим]  сессия архитектора проекта: опросник → .project-harness')
     log.line('                → гейт инструментов → ноды (по .dsh/SKILLS/create-project.md)')
@@ -3408,6 +3733,31 @@ async function main() {
     return readUserProfile(opts.dshHome, slug)
   }
 
+  // ---- RAG (day23): базы знаний сессии ---------------------------------------
+  // Разрешается ДО применения профиля: инструкция про базу едет в тот же оверлей
+  // системного промпта, что и профиль, — personaPrefix в конфиге один.
+  const rag = resolveRag(opts)
+  if (rag.error) {
+    log.err(rag.error)
+    if (rag.registry && !rag.registry.missing) {
+      const known = Object.keys(rag.registry.bases)
+      if (known.length) log.dim(`доступно: ${known.join(' | ')}`)
+    } else {
+      log.dim('реестр баз: .dsh/rag.json — { "имя": { "title": "…", "index": "doc-index", "what": "…" } }')
+    }
+    process.exit(1)
+  }
+  state.ragInstruction = rag.instruction
+  state.rag = rag.names.length
+    ? { names: rag.names, servers: rag.servers, registry: rag.registry?.path ?? null,
+        filter: rag.servers[0]?.filter ?? null }
+    : null
+  if (rag.names.length) {
+    const filter = rag.servers[0]?.filter
+    log.dim(`rag: ${rag.names.join(', ')}${filter ? ` · ${filter.label}` : ''}`
+      + ' · инструмент rag_search (детали: /rag)')
+  }
+
   const personaPatchPath = join(opts.dshHome, 'dsh-term-persona.patch.yml')
   const profileSlug = opts.userProfile ?? process.env.DSH_TERM_USER_PROFILE ?? null
   let userProfile = null
@@ -3428,17 +3778,23 @@ async function main() {
    * едет в system prompt оверлеем `- id: system-prompt` + personaPrefix, а
    * system prompt фиксируется при спавне — поэтому смена профиля помечается
    * флагом profileDirty, и перед следующим ходом рантайм перезапускается.
+   *
+   * В тот же оверлей попадает инструкция сессии про базу знаний (`--rag`):
+   * personaPrefix один, поэтому текст собирается из частей, а не двумя оверлеями.
    */
   function applyUserProfile(profile, { dirty = true } = {}) {
     state.userProfile = profile
     let patches = (opts.patches ?? []).filter((p) => p !== personaPatchPath)
-    if (profile !== null) {
+    const parts = []
+    if (profile !== null) parts.push(userProfilePromptText(profile))
+    if (state.ragInstruction) parts.push(state.ragInstruction)
+    if (parts.length) {
       try {
         mkdirSync(opts.dshHome, { recursive: true })
-        writeFileSync(personaPatchPath, userProfileOverlayYaml(profile), 'utf8')
+        writeFileSync(personaPatchPath, systemPromptOverlayYaml(parts), 'utf8')
         patches = [...patches, personaPatchPath]
       } catch (e) {
-        log.err(`persona patch failed: ${e.message}`)
+        log.err(`prompt patch failed: ${e.message}`)
       }
     }
     opts.patches = patches
@@ -3458,6 +3814,10 @@ async function main() {
   // Секрет (токен GitHub) едет через env рантайма: в файле-оверлее только `!!js`.
   const mcpEnv = {}
   const { servers: mcpServers, unknown: mcpUnknown } = resolveMcpServers(opts)
+  // Базы знаний едут тем же мостом, что MCP-пресеты: для рантайма это просто ещё
+  // один stdio-сервер инструментов, поэтому и диагностика (`/mcp`, зонд, цена в
+  // промпте) у него общая с пресетами.
+  if (rag.servers.length) mcpServers.push(...rag.servers)
   if (mcpUnknown.length) {
     log.err(`неизвестный MCP-пресет: ${mcpUnknown.join(', ')}`)
     log.dim(`доступно: ${Object.keys(MCP_PRESETS).join(' | ')}`)
@@ -4494,6 +4854,116 @@ async function main() {
         }
         break
       }
+      case 'rag': {
+        // Базы выбираются при старте, как MCP-серверы: соединение поднимается
+        // вместе с рантаймом, поэтому «подключить на лету» нельзя — команда
+        // показывает состояние и подсказывает строку следующего запуска.
+        const sub = (parts[1] ?? '').toLowerCase()
+        const registry = readRagRegistry()
+        if (sub === 'list' || sub === 'ls') {
+          if (registry.error) {
+            log.err(`реестр баз ${registry.path} не читается: ${registry.error}`)
+            break
+          }
+          if (registry.missing) {
+            log.err(`нет файла реестра баз: ${registry.path}`)
+            log.dim('формат: { "имя": { "title": "…", "index": "doc-index", "what": "…" } }')
+            break
+          }
+          const names = Object.keys(registry.bases)
+          if (!names.length) {
+            log.dim(`реестр ${registry.path} пуст`)
+            break
+          }
+          if (state.rag?.names?.length) log.dim(`в этой сессии фильтр: ${state.rag.filter?.label ?? '—'}`)
+          log.line(`базы знаний (${registry.path}):`)
+          for (const name of names) {
+            const entry = registry.bases[name] ?? {}
+            const active = state.rag?.names?.includes(name) ? '●' : '○'
+            log.line(`  ${active} ${name}${entry.title ? ` — ${entry.title}` : ''}`)
+            if (entry.what) log.dim(`      ${entry.what}`)
+            log.dim(`      каталог: ${entry.index ?? '—'}`
+              + (entry.strategy ? ` · стратегия ${entry.strategy}` : '')
+              + (entry.margin !== undefined ? ` · маржа ${entry.margin}` : ''))
+          }
+          log.dim('подключение: dsh-term --rag <имя>')
+          break
+        }
+        if (!state.rag?.names?.length) {
+          log.dim('база знаний в этой сессии не подключена')
+          log.dim('запуск: dsh-term --rag <имя> · список баз: /rag list')
+          break
+        }
+        log.line(`база знаний: ${state.rag.names.join(', ')} · инструмент rag_search`)
+        if (state.rag.filter) log.dim(`  фильтр: ${state.rag.filter.label}`)
+        if (state.rag.registry) log.dim(`  реестр: ${state.rag.registry}`)
+        for (const server of state.rag.servers) {
+          log.dim(`  сервер: ${server.serverName} · ${mcpTarget(server)}`)
+        }
+        log.dim('  смена баз — при следующем запуске: соединение поднимается вместе с рантаймом')
+        log.dim('  сравнить режимы: --rag-no-filter (без порогов) или --rag-margin <0..1>')
+        break
+      }
+      case 'rag-brief': {
+        // Справка идёт МИМО агента: тот же строгий путь, что в проверке дня 24
+        // (`doc_index brief`), поэтому форма ответа и проверка источников с цитатами
+        // гарантированы кодом, а не послушанием модели.
+        const question = parts.slice(1).join(' ').trim()
+        if (!question) {
+          log.err('нужен вопрос: /rag-brief <вопрос>')
+          log.dim('пример: /rag-brief зачем нужны блокирующие гейты')
+          log.dim('ответ придёт по шаблону: ОТВЕТ + ИСТОЧНИКИ + ЦИТАТЫ и строка проверки')
+          break
+        }
+        if (!state.rag?.names?.length) {
+          log.err('rag-brief: база знаний в сессии не подключена')
+          log.dim('запуск: dsh-term --rag <имя> · доступные базы: /rag list')
+          break
+        }
+        const cli = state.rag.servers[0]?.ragCli
+        if (!cli) {
+          log.err('rag-brief: не удалось собрать параметры базы')
+          break
+        }
+        const argv = ['-m', 'doc_index', 'brief', question,
+          '--strategy', cli.strategy,
+          '--k', String(cli.k),
+          '--expand', String(cli.expand),
+          '--candidates', String(cli.candidates),
+          '--min-keep', String(cli.filter.minKeep)]
+        if (cli.filter.margin === null && cli.filter.minDense === null) {
+          argv.push('--no-filter')
+        } else {
+          if (cli.filter.margin !== null) argv.push('--margin', String(cli.filter.margin))
+          if (cli.filter.minDense !== null) argv.push('--min-dense', String(cli.filter.minDense))
+        }
+        log.dim(`rag-brief: база ${cli.base} · ${cli.filter.label} · собираю ответ по шаблону…`)
+        const brief = spawnSync(cli.python, argv, {
+          cwd: cli.root,
+          encoding: 'utf8',
+          timeout: 180000,
+          env: { ...process.env, ...(state.rag.servers[0].env ?? {}) },
+        })
+        if (brief.error) {
+          log.err(`rag-brief: не удалось запустить поиск — ${brief.error.message}`)
+          break
+        }
+        if (brief.status !== 0) {
+          log.err(`rag-brief: команда вернула код ${brief.status}`)
+          const tail = (brief.stderr ?? '').trim().split('\n').slice(-4).join('\n')
+          if (tail) log.dim(tail)
+          break
+        }
+        log.line('')
+        // Прогоняем через тот же markdown-рендер, что ответы агента: в интерактивном
+        // TTY заголовки ОТВЕТ / ИСТОЧНИКИ / ЦИТАТЫ подсветятся, а в пайпе и `-p`
+        // текст останется исходным markdown — его можно скопировать как есть.
+        const styled = mdStyle((brief.stdout ?? '').replace(/\r\n/g, '\n').trimEnd(),
+          { inFence: false, lineStart: true })
+        for (const line of styled.split('\n')) log.line(line)
+        log.line('')
+        break
+      }
       case 'mcp': {
         const m = state.mcp
         if (!m || !m.servers.length) {
@@ -4663,7 +5133,7 @@ async function main() {
     const res = await rpc.request('initialize', initParams)
     log.dim(`runtime: ${res.serverInfo.name} ${res.serverInfo.version} · provider=${opts.provider} model=${opts.model}`)
     // Диагностика UI: понятно, почему нет цветов/рендера (tty/NO_COLOR/one-shot).
-    log.dim(`ui: in-tty=${process.stdin.isTTY ? 1 : 0} out-tty=${process.stdout.isTTY ? 1 : 0} colors=${C.cyan ? 1 : 0} md=${mdColorEnabled() ? 1 : 0}`)
+    log.dim(`ui: in-tty=${process.stdin.isTTY ? 1 : 0} out-tty=${process.stdout.isTTY ? 1 : 0} colors=${C.cyan ? 1 : 0} md=${mdColorEnabled() ? 1 : 0} color=${COLOR_MODE}${colorSuppressed() ? ' (no-color)' : ''}`)
     log.dim(`compress: ${compress.mode}${compressPolicyText(compress)}`)
     if (state.userProfile) {
       log.dim(`profile: «${state.userProfile.title}» (${state.userProfile.slug}) · ~${userProfileTokens(state.userProfile)} токенов в system prompt · файл: ${userProfilePath(opts.dshHome, state.userProfile.slug)}`)

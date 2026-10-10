@@ -1,0 +1,10 @@
+{
+  "effective-ai": {
+    "title": "база знаний по AI SDLC",
+    "index": "doc-index",
+    "what": "понятия, агентный харнесс, MCP, RAG, метрики, гейты, ЗУН-матрицы",
+    "strategy": "structural",
+    "margin": 0.04,
+    "minDense": 0.5
+  }
+}
