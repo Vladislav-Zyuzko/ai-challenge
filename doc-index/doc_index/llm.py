@@ -25,7 +25,24 @@ from .agent import AgentReply
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
+# Локальная модель в Ollama отдаёт тот же OpenAI-совместимый протокол, поэтому
+# отдельного клиента не нужно — только другой адрес и фиктивный ключ.
+LOCAL_ROOT = "http://127.0.0.1:11434"
+LOCAL_MODEL = "qwen3:8b"
 CREDENTIALS_PATH = Path.home() / ".dsh-term" / ".credentials.yaml"
+
+
+def local_base_url(root: str | None = None) -> str:
+    """`http://127.0.0.1:11434` → `http://127.0.0.1:11434/v1` (эндпоинт Ollama)."""
+    root = (root or os.environ.get("DSH_TERM_OLLAMA") or LOCAL_ROOT).rstrip("/")
+    return root if root.endswith("/v1") else f"{root}/v1"
+
+
+def local_client(model: str = LOCAL_MODEL, *, root: str | None = None,
+                 timeout: float = 600.0, **kwargs) -> "LlmClient":
+    """Клиент локальной модели: длинный таймаут, потому что на CPU она считает медленно."""
+    return LlmClient(model=model, base_url=local_base_url(root), api_key="ollama",
+                     timeout=timeout, **kwargs)
 
 
 class LlmError(RuntimeError):
