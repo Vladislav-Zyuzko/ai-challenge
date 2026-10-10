@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from doc_index import local_check  # noqa: E402
-from doc_index.llm import LOCAL_MODEL, local_base_url, local_client  # noqa: E402
+from doc_index.llm import LOCAL_MODEL, LlmClient, local_base_url, local_client  # noqa: E402
 
 
 class LocalClientTests(unittest.TestCase):
@@ -35,6 +35,17 @@ class LocalClientTests(unittest.TestCase):
 
     def test_default_model_name(self):
         self.assertEqual(local_client().model, LOCAL_MODEL)
+
+    def test_local_client_disables_reasoning(self):
+        """Рассуждения qwen3 выключаются только через reasoning_effort: none."""
+        self.assertEqual(local_client().reasoning_effort, "none")
+
+    def test_cloud_client_does_not_send_reasoning_flag(self):
+        """Облачный путь не меняется: флаг уходит только локальной модели."""
+        self.assertIsNone(LlmClient(model="deepseek-v4-flash", api_key="test").reasoning_effort)
+
+    def test_reasoning_can_be_enabled_explicitly(self):
+        self.assertIsNone(local_client(reasoning_effort=None).reasoning_effort)
 
 
 class TaskSetTests(unittest.TestCase):

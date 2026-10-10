@@ -39,10 +39,17 @@ def local_base_url(root: str | None = None) -> str:
 
 
 def local_client(model: str = LOCAL_MODEL, *, root: str | None = None,
-                 timeout: float = 600.0, **kwargs) -> "LlmClient":
-    """Клиент локальной модели: длинный таймаут, потому что на CPU она считает медленно."""
+                 timeout: float = 600.0, reasoning_effort: str | None = "none",
+                 **kwargs) -> "LlmClient":
+    """Клиент локальной модели: длинный таймаут и без рассуждений по умолчанию.
+
+    Таймаут большой, потому что на CPU модель считает медленно (замеры: обработка
+    промпта ~53 ток/с, генерация ~6-8 ток/с). Рассуждения выключены: у qwen3 они
+    включены по умолчанию, стоят в разы больше токенов, чем ответ, и именно из-за
+    них строгая справка выглядела «зависшей».
+    """
     return LlmClient(model=model, base_url=local_base_url(root), api_key="ollama",
-                     timeout=timeout, **kwargs)
+                     timeout=timeout, reasoning_effort=reasoning_effort, **kwargs)
 
 
 class LlmError(RuntimeError):
@@ -76,12 +83,19 @@ class LlmClient:
 
     def __init__(self, *, model: str = DEFAULT_MODEL, base_url: str = DEFAULT_BASE_URL,
                  api_key: str | None = None, max_tokens: int = 4000,
-                 timeout: float = 240.0) -> None:
+                 timeout: float = 240.0, reasoning_effort: str | None = None) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key or load_api_key()
         self.max_tokens = max_tokens
         self.timeout = timeout
+        # `reasoning_effort: none` выключает рассуждения у qwen3 в Ollama. Это
+        # единственный работающий способ через OpenAI-совместимый эндпоинт:
+        # `think: false` он игнорирует (проверено), `/no_think` в промпте и
+        # `chat_template_kwargs` тоже не действуют, а без выключения модель тратит
+        # на размышления больше токенов, чем на ответ: на CPU это минуты, и при
+        # исчерпании бюджета ответ приходит пустым.
+        self.reasoning_effort = reasoning_effort
         self.calls = 0
         self.seconds = 0.0
         self.retries = 0
@@ -115,6 +129,8 @@ class LlmClient:
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
