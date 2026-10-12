@@ -1869,7 +1869,13 @@ function pickListTTY(spec) {
     })
   }
   const render = (st) => {
-    const row0 = st.prompt + st.query
+    const cols = meterCols()
+    // Каждую строку кадра обрезаем по ширине терминала — и строку ввода, и нижнюю
+    // подсказку. Перенос делает из одной логической строки две физические, а возврат
+    // курсора ниже считает строки вручную: расхождение ровно на строку оставляло на
+    // экране копию «model>» на каждом тике перерисовки, и меню «плыло» вниз
+    // (регресс: tests/model-picker.test.mjs).
+    const row0 = menuClip(st.prompt + st.query)
     const rows = []
     const { start, count } = pickWindow(st.items.length, st.sel, 8)
     if (st.items.length === 0) rows.push(menuClip(`${C.dim}  (ничего не найдено)${C.off}`))
@@ -1883,7 +1889,15 @@ function pickListTTY(spec) {
       const note = it.note ? ` ${C.dim}${it.note}${C.reset}` : ''
       rows.push(menuClip(`${mark} ${dot} ${box}${label}${note}`))
     }
-    process.stdout.write(`\r\x1b[J${row0}\n${[menuSeparator(), ...rows, `${C.dim}${SESSION_PICK_KEYS}${C.off}`].join('\n')}\x1b[${rows.length + 2}A\x1b[${meterVis(row0) + 1}G`)
+    rows.push(menuClip(`${C.dim}${SESSION_PICK_KEYS}${C.off}`))
+    const lines = [menuSeparator(), ...rows]
+    // Высота кадра в ФИЗИЧЕСКИХ строках: строка ввода тоже может перенестись,
+    // если реальная ширина терминала меньше той, по которой обрезали.
+    const visible = meterVis(row0)
+    const promptRows = Math.max(1, Math.ceil(visible / cols))
+    const up = lines.length + promptRows - 1
+    const col = visible > 0 && visible % cols === 0 ? cols : (visible % cols) + 1
+    process.stdout.write(`\r\x1b[J${row0}\n${lines.join('\n')}\x1b[${up}A\x1b[${col}G`)
   }
   return new Promise((resolve) => {
     const st = { prompt: spec.prompt, query: '', sel: 0, items: filter(''), chosen: new Set() }
@@ -1905,7 +1919,7 @@ function pickListTTY(spec) {
       if (done) return
       done = true
       cleanup()
-      process.stdout.write(`\r\x1b[J${st.prompt}${st.query}\n`)
+      process.stdout.write(`\r\x1b[J${menuClip(st.prompt + st.query)}\n`)
       resolve(id)
     }
     const onEnd = () => finish(null)
