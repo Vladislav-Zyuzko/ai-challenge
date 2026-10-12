@@ -739,10 +739,15 @@ function statePath(dshHome) { return join(dshHome, 'dsh-term-state.json') }
 function loadState(dshHome) {
   try { return JSON.parse(readFileSync(statePath(dshHome), 'utf8')) } catch { return null }
 }
-function saveState(dshHome, sessionId, titles, locked) {
+/**
+ * Сохранить состояние. `llm` — выбранная модель: undefined оставляет прежний выбор,
+ * null его сбрасывает. Остальные поля берём из файла, чтобы автозапись сессии
+ * не затирала настройки, выставленные командами.
+ */
+function saveState(dshHome, sessionId, titles, locked, llm) {
   try {
     mkdirSync(dshHome, { recursive: true })
-    const data = { lastSessionId: sessionId }
+    const data = { ...(loadState(dshHome) ?? {}), lastSessionId: sessionId }
     if (titles && Object.keys(titles).length) {
       // Мягкая обрезка: держим не больше 500 последних заголовков.
       const keys = Object.keys(titles)
@@ -750,6 +755,10 @@ function saveState(dshHome, sessionId, titles, locked) {
       data.titles = titles
     }
     if (locked && locked.size) data.titleLocked = [...locked].slice(-500)
+    if (llm !== undefined) {
+      if (llm === null) delete data.llm
+      else data.llm = llm
+    }
     writeFileSync(statePath(dshHome), JSON.stringify(data, null, 2) + '\n', 'utf8')
   } catch {}
 }
@@ -1159,8 +1168,8 @@ function parseArgs(argv) {
     switch (a) {
       case '--dsh-home': opts.dshHome = next(); break
       case '--profile': opts.profile = next(); break
-      case '--provider': opts.provider = next(); break
-      case '--model': opts.model = next(); break
+      case '--provider': opts.provider = next(); opts.providerExplicit = true; break
+      case '--model': opts.model = next(); opts.modelExplicit = true; break
       case '--max-tokens': opts.maxTokens = Number(next()); break
       case '--temperature': opts.temperature = Number(next()); break
       case '--session': case '--resume': opts.session = next(); break
@@ -1200,6 +1209,8 @@ function parseArgs(argv) {
       }
       case '--offline': opts.offline = true; break
       case '--figma-node': opts.figmaNode = next(); break
+      case '--llm-check': opts.llmCheck = true; break
+      case '--ollama-url': opts.ollamaUrl = next(); break
       case '-p': case '--print': opts.prompt = next(); break
       case '--workspace': opts.workspace = next(); break
       case '--dsh-bin': opts.dshBin = next(); break
@@ -1398,6 +1409,7 @@ const COMMANDS = [
   { name: 'mcp', usage: '/mcp [show|tools|refresh]', desc: 'MCP-серверы: соединение, список инструментов и их цена в промпте' },
   { name: 'rag', usage: '/rag [list]', desc: 'базы знаний сессии (--rag): что подключено и какие есть в реестре' },
   { name: 'rag-brief', usage: '/rag-brief <вопрос>', desc: 'справка по базе по шаблону: ответ + источники + цитаты (мимо агента)' },
+  { name: 'model', usage: '/model [имя|show]', desc: 'модель сессии: облачные DeepSeek и локальная LLM через Ollama' },
   { name: 'resume', usage: '/resume [id]', desc: 'продолжить сессию: по id или выбором из списка' },
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
@@ -2580,6 +2592,109 @@ function ragFilterError(opts) {
   return null
 }
 
+// ---- Модели: облако и локальная LLM (day26) ----------------------------------
+// Локальная модель подключается маршрутом pi-ai: конфиг объявляет OpenAI-совместимый
+// эндпоинт Ollama, и харнесс обращается к нему так же, как к облаку. Отдельный
+// плагин для этого не нужен — маршруты описываются конфигом (см. README
+// `@deepseek-ai/dsh-llm-pi-ai`), поэтому dsh-term пишет патч-оверлей.
+const LOCAL_PROVIDER = 'local'
+// Модель по умолчанию: используется, если Ollama недоступна и список моделей пуст.
+const LOCAL_MODEL = process.env.DSH_TERM_LOCAL_MODEL ?? 'qwen3:8b'
+const OLLAMA_URL = process.env.DSH_TERM_OLLAMA ?? 'http://127.0.0.1:11434'
+// Маркеры секции в settings.yaml: по ним dsh-term перезаписывает только свой блок.
+const SETTINGS_BEGIN = '>>> dsh-term: локальная модель (Ollama, day26)'
+const SETTINGS_END = '<<< dsh-term: локальная модель'
+// Модели облачного провайдера харнесса (dsh-llm-deepseek). Список статический:
+// это то, что реально умеет маршрутизировать рантайм, а не то, что отдаёт HTTP API.
+const CLOUD_MODELS = [
+  { model: 'deepseek-v4-flash', label: 'DeepSeek-V4-Flash' },
+  { model: 'deepseek-v4-pro', label: 'DeepSeek-V4-Pro' },
+  { model: 'deepseek-flash', label: 'DeepSeek-V41-Flash' },
+  { model: 'deepseek-v4-flash-vision-exp', label: 'DeepSeek-V4-Flash-Vision-Exp' },
+]
+// Модели эмбеддингов в списке для чата не нужны: они не генерируют текст.
+const EMBEDDING_HINTS = ['bge', 'embed', 'gte', 'e5', 'nomic']
+
+/** Локальные модели из Ollama. Молча возвращает пустой список, если Ollama не поднята. */
+async function ollamaModels(url = OLLAMA_URL, timeoutMs = 1500) {
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const response = await fetch(`${url}/api/tags`, { signal: controller.signal })
+    clearTimeout(timer)
+    if (!response.ok) return []
+    const data = await response.json()
+    return (data.models ?? []).map((m) => ({
+      name: String(m.name ?? ''),
+      sizeGb: m.size ? Math.round((m.size / 1e9) * 10) / 10 : 0,
+    })).filter((m) => m.name && !EMBEDDING_HINTS.some((hint) => m.name.toLowerCase().includes(hint)))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Секция настроек с маршрутом локальной модели.
+ *
+ * Маршрут объявляется не патчем, а документом настроек `$DSH_HOME/settings.yaml`:
+ * адаптер `@deepseek-ai/dsh-llm-pi-ai` смонтирован «спящим» (ноль маршрутов), и
+ * секция `llm-pi-ai:` поднимает маршруты на лету — так же, как это делает веб-страница
+ * моделей. Патч тут не годится: вставка второго экземпляра адаптера падает с
+ * «provider already declared», потому что первый регистрирует весь каталог pi-ai.
+ *
+ * Блок обёрнут маркерами: dsh-term перезаписывает только свой участок и не трогает
+ * остальные настройки пользователя.
+ *
+ * `contextWindow` задаём явно: у qwen3 в Ollama по умолчанию 4096 токенов, а RAG
+ * кладёт в промпт несколько тысяч токенов контекста плюс схемы инструментов —
+ * с дефолтом контекст молча обрезался бы.
+ */
+function localLlmSettingsYaml(models) {
+  const names = models.length ? models.map((m) => m.name) : [LOCAL_MODEL]
+  const lines = [
+    `# ${SETTINGS_BEGIN}`,
+    'llm-pi-ai:',
+    '  providers:',
+    `    ${LOCAL_PROVIDER}:`,
+    '      displayName: Локальная модель (Ollama)',
+    '      api: openai-completions',
+    `      baseURL: ${OLLAMA_URL}/v1`,
+    '      apiKeyEnv: OLLAMA_API_KEY',
+    '      models:',
+  ]
+  for (const name of names) {
+    lines.push(`        - id: '${name}'`)
+    lines.push(`          name: '${name} (локально)'`)
+    lines.push('          contextWindow: 32768')
+    lines.push('          maxTokens: 4096')
+  }
+  lines.push(`# ${SETTINGS_END}`)
+  return lines.join('\n') + '\n'
+}
+
+/**
+ * Записать секцию локальной модели в `settings.yaml`, сохранив остальное.
+ *
+ * YAML правим текстом, а не парсером: в dsh-term нет YAML-зависимостей, а блок
+ * ограничен маркерами — так пользовательские настройки вне блока остаются как есть.
+ */
+function writeLocalLlmSettings(dshHome, models) {
+  const path = join(dshHome, 'settings.yaml')
+  const block = localLlmSettingsYaml(models)
+  const existing = readTextIfExists(path) ?? ''
+  const start = existing.indexOf(SETTINGS_BEGIN)
+  const end = existing.indexOf(SETTINGS_END)
+  let text
+  if (start >= 0 && end > start) {
+    text = existing.slice(0, start) + block + existing.slice(end + SETTINGS_END.length).replace(/^\n+/, '')
+  } else {
+    text = (existing.trim() ? existing.trimEnd() + '\n\n' : '') + block
+  }
+  mkdirSync(dshHome, { recursive: true })
+  writeFileSync(path, text.endsWith('\n') ? text : text + '\n', 'utf8')
+  return path
+}
+
 /**
  * Описание баз для системного промпта.
  *
@@ -3456,7 +3571,7 @@ async function main() {
     log.line('                      -p "$(Get-Content prompt.md -Raw)"')
     log.line('  --dsh-home <path>   Harness home (default: ~/.dsh-term)')
     log.line('  --profile <name>    профиль рантайма (default: sdk)')
-    log.line('  --provider <id>     провайдер (default: deepseek-official; env DSH_TERM_PROVIDER)')
+    log.line('  --provider <id>     провайдер: deepseek-official (облако) | local (Ollama) (env DSH_TERM_PROVIDER)')
     log.line('  --model <name>      модель (default: deepseek-v4-flash; env DSH_TERM_MODEL)')
     log.line('  --max-tokens <n>    лимит токенов ответа (жёсткий кап адаптера)')
     log.line('  --temperature <n>   температура сэмплинга 0..2 (по умолчанию — провайдерская, 1.0)')
@@ -3480,6 +3595,8 @@ async function main() {
     log.line('  --rag-min-keep <n>  сколько фрагментов оставить даже ниже порога (default 2)')
     log.line('  --color <режим>     цвет и markdown-рендер: auto | always | never (default auto)')
     log.line('                      always — красить даже без TTY и при NO_COLOR (env DSH_TERM_COLOR)')
+    log.line('  --llm-check         диагностика локальной модели: маршрут в settings.yaml и модели Ollama')
+    log.line('  --ollama-url <url>  адрес Ollama для локальной модели (default: http://127.0.0.1:11434)')
     log.line('  --mcp-toolsets <l>  тулсеты MCP-сервера: список через запятую или all (полный набор дороже по токенам)')
     log.line('  --mcp-readwrite     снять режим «только чтение» у MCP-пресета (по умолчанию readonly)')
     log.line('  --mcp-check [пресет] диагностика: подключиться к MCP и напечатать список инструментов, без сессии')
@@ -3502,6 +3619,7 @@ async function main() {
     log.line('  /rag [list]  базы знаний сессии (--rag): что подключено и что есть в .dsh/rag.json')
     log.line('  /rag-brief <вопрос>  справка по базе по шаблону: ОТВЕТ + ИСТОЧНИКИ + ЦИТАТЫ')
     log.line('                идёт мимо агента, формат и проверка цитат гарантированы кодом')
+    log.line('  /model [имя|show]  модель сессии: облачные DeepSeek и локальная LLM (Ollama)')
     log.line('  /publish-day  git+gh: коммит → push → PR day→week (по .dsh/SKILLS)')
     log.line('  /create-project [что строим]  сессия архитектора проекта: опросник → .project-harness')
     log.line('                → гейт инструментов → ноды (по .dsh/SKILLS/create-project.md)')
@@ -3530,6 +3648,32 @@ async function main() {
     // Код возврата становится кодом выхода: --mcp-check пригоден для скриптов и тестов.
     const code = await runMcpCheck(opts)
     process.exitCode = code
+    return
+  }
+
+  // ---- --llm-check: что записано про локальную модель (без сессии) -------------
+  // Диагностика в том же духе, что --mcp-check: показывает секцию settings.yaml,
+  // по которой харнесс поднимает маршрут, и список моделей, которые видит Ollama.
+  if (opts.llmCheck !== undefined) {
+    const models = await ollamaModels(opts.ollamaUrl)
+    const yaml = localLlmSettingsYaml(models)
+    log.line(`${C.bold}llm-check${C.off} ${opts.ollamaUrl ?? OLLAMA_URL}`)
+    log.dim(`  локальные модели: ${models.length ? models.map((m) => `${m.name} (${m.sizeGb} ГБ)`).join(', ') : 'Ollama не отвечает'}`)
+    if (opts.dshHome) {
+      try {
+        const path = writeLocalLlmSettings(opts.dshHome, models)
+        log.dim(`  записано в: ${path}`)
+      } catch (e) {
+        log.err(`  не удалось записать: ${e.message}`)
+      }
+    }
+    log.line('  секция settings.yaml (маршрут pi-ai на Ollama):')
+    for (const line of yaml.trimEnd().split('\n')) log.dim(`    ${line}`)
+    if (!models.length) {
+      log.dim('  Ollama не отвечает: в секции остаётся одна модель по умолчанию')
+      log.dim(`  запустить Ollama и подтянуть модель: ollama pull ${LOCAL_MODEL}`)
+    }
+    process.exitCode = 0
     return
   }
 
@@ -3606,6 +3750,12 @@ async function main() {
   // Патч компрессии пишем ПОСЛЕ выбора стратегии: в режиме стратегии
   // автокомпакция харнесса выключается, чтобы контекстом управлял только клиент.
   const saved = loadState(opts.dshHome)
+  // Модель: явный флаг перекрывает сохранённый выбор (`/model`), иначе берём
+  // сохранённый — так выбранная однажды локальная модель держится между запусками.
+  if (!opts.modelExplicit && !opts.providerExplicit && saved?.llm?.model) {
+    opts.provider = saved.llm.provider ?? opts.provider
+    opts.model = saved.llm.model
+  }
   const isOneShot = opts.prompt !== undefined
   const sessionId = opts.session ?? (isOneShot ? randomUUID() : saved?.lastSessionId ?? randomUUID())
 
@@ -3856,6 +4006,28 @@ async function main() {
   state.mcp = mcpServers.length
     ? { servers: mcpServers, probes: new Map(), tokens: 0, patchPath: mcpPatchPath }
     : null
+
+  // ---- Локальная модель (day26) ------------------------------------------------
+  // Маршрут пишем в документ настроек: адаптер pi-ai смонтирован «спящим» и
+  // поднимает маршруты из секции `llm-pi-ai:` (hot-reload). Патчем его не добавить —
+  // второй экземпляр падает с «provider is already declared».
+  const localModels = await ollamaModels()
+  let llmSettingsPath = ''
+  try {
+    llmSettingsPath = writeLocalLlmSettings(opts.dshHome, localModels)
+  } catch (e) {
+    log.err(`не удалось записать маршрут локальной модели: ${e.message}`)
+  }
+  opts.localModels = localModels.map((m) => m.name)
+  // Ollama не проверяет ключ, но маршрут pi-ai требует значение, иначе запрос
+  // падает с MISSING_CREDENTIAL ещё до сети.
+  mcpEnv.OLLAMA_API_KEY = process.env.OLLAMA_API_KEY ?? 'ollama'
+  if (opts.provider === LOCAL_PROVIDER) {
+    log.dim(`модель: ${opts.model} · локально через Ollama (${OLLAMA_URL})`
+      + (opts.localModels.includes(opts.model)
+        ? '' : ` · ВНИМАНИЕ: модели нет в Ollama — ollama pull ${opts.model}`))
+    if (llmSettingsPath) log.dim(`  маршрут: ${llmSettingsPath}`)
+  }
 
   // Локальные stdio-серверы зондируем ДО спавна рантайма. Порядок принципиален:
   // такой сервер поднимает сам харнесс, а у figma-моста порт фиксированный (3055),
@@ -4937,6 +5109,12 @@ async function main() {
           if (cli.filter.margin !== null) argv.push('--margin', String(cli.filter.margin))
           if (cli.filter.minDense !== null) argv.push('--min-dense', String(cli.filter.minDense))
         }
+        // Сессия на локальной модели — справку считает она же. Строгий путь не требует
+        // агентского цикла (контекст вкладывается в промпт), поэтому локальная модель
+        // здесь работает без выбора инструментов, в отличие от живого чата с агентом.
+        if (opts.provider === LOCAL_PROVIDER) {
+          argv.push('--backend', 'local', '--llm-model', opts.model)
+        }
         log.dim(`rag-brief: база ${cli.base} · ${cli.filter.label} · собираю ответ по шаблону…`)
         const brief = spawnSync(cli.python, argv, {
           cwd: cli.root,
@@ -4962,6 +5140,71 @@ async function main() {
           { inFence: false, lineStart: true })
         for (const line of styled.split('\n')) log.line(line)
         log.line('')
+        break
+      }
+      case 'model': {
+        // Список моделей: облачные с маршрута харнесса + локальные из Ollama.
+        // Смена — это перезапуск рантайма: provider и model уходят в initialize
+        // сессии, а не в отдельный запрос (как и системный промпт профиля).
+        const cloud = CLOUD_MODELS.map((m) => ({
+          provider: 'deepseek-official',
+          model: m.model,
+          label: `${m.label} · облако DeepSeek`,
+        }))
+        const local = (opts.localModels ?? []).map((name) => ({
+          provider: LOCAL_PROVIDER,
+          model: name,
+          label: `${name} · локально (Ollama)`,
+        }))
+        const all = [...cloud, ...local]
+        const arg = parts.slice(1).join(' ').trim()
+        const currentLabel = all.find((m) => m.model === opts.model && m.provider === opts.provider)
+        const showList = () => {
+          log.line(`модель: ${opts.model} · провайдер ${opts.provider}`
+            + (currentLabel ? '' : ' (не из списка — задана флагом)'))
+          for (const m of all) {
+            const mark = m.provider === opts.provider && m.model === opts.model ? '●' : '○'
+            log.line(`  ${mark} ${m.label}`)
+          }
+          log.dim(`  всего ${all.length} · локальных ${local.length}`
+            + (local.length ? '' : ` (Ollama не отвечает на ${OLLAMA_URL})`))
+          log.dim('  выбрать: /model <имя> или /model без аргумента (меню)')
+        }
+        if (arg.toLowerCase() === 'show' || arg.toLowerCase() === 'list') {
+          showList()
+          break
+        }
+        let chosen = null
+        if (arg) {
+          // Разрешаем и свободную модель: мало ли какая ещё лежит в Ollama.
+          chosen = all.find((m) => m.model === arg)
+            ?? { provider: LOCAL_PROVIDER, model: arg, label: `${arg} · локально (Ollama)` }
+        } else {
+          if (!colorOk() || !process.stdin.isTTY) { showList(); break }
+          const items = all.map((m) => ({
+            id: m.model,
+            label: m.label,
+            note: m.provider === opts.provider && m.model === opts.model ? 'текущая' : '',
+            current: m.provider === opts.provider && m.model === opts.model,
+          }))
+          const picked = await pickListTTY({ prompt: 'model> ', items })
+          if (!picked) { log.line('отменено'); break }
+          chosen = all.find((m) => m.model === picked)
+            ?? { provider: LOCAL_PROVIDER, model: picked, label: picked }
+        }
+        if (chosen.provider === opts.provider && chosen.model === opts.model) {
+          log.dim(`модель уже выбрана: ${chosen.label}`)
+          break
+        }
+        opts.provider = chosen.provider
+        opts.model = chosen.model
+        saveState(opts.dshHome, state.sessionId, state.titles, state.titleLocked,
+          { provider: chosen.provider, model: chosen.model })
+        log.ok(`модель: ${chosen.label}`)
+        if (chosen.provider === LOCAL_PROVIDER && !(opts.localModels ?? []).includes(chosen.model)) {
+          log.dim(`  модели нет в Ollama — подтянуть: ollama pull ${chosen.model}`)
+        }
+        await restartRuntime(`смена модели на ${chosen.model}`)
         break
       }
       case 'mcp': {

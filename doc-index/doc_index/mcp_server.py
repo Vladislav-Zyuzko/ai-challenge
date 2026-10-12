@@ -190,15 +190,29 @@ def format_hits(base: KnowledgeBase, query: str, outcome: SearchOutcome) -> str:
     return "\n".join(lines)
 
 
+INSTRUCTIONS = "Поиск по проиндексированным базам знаний с указанием источников."
+
+
+def new_server():
+    """Сервер MCP, совместимый с обеими ветками SDK.
+
+    В `mcp` 2.x класс называется `MCPServer`, в 1.x — `FastMCP`; набор методов
+    (`tool`, `run`) и их параметры совпадают, поэтому различия скрыты здесь.
+    Поддерживаем обе ветки намеренно: пакет в окружении уже менялся (2.2.0 → 1.30.0),
+    и сервер не должен падать из-за этого — иначе агент молча остаётся без инструментов.
+    """
+    try:
+        from mcp.server.mcpserver import MCPServer  # mcp 2.x
+        return MCPServer(name="rag", title="RAG: локальные базы знаний",
+                         instructions=INSTRUCTIONS)
+    except ModuleNotFoundError:
+        from mcp.server.fastmcp import FastMCP  # mcp 1.x
+        return FastMCP(name="rag", instructions=INSTRUCTIONS)
+
+
 def build_server(bases: list[KnowledgeBase], *, default_k: int = DEFAULT_K):
     """MCP-сервер с инструментами поиска. Импорт SDK внутри: модуль не обязателен."""
-    from mcp.server.mcpserver import MCPServer
-
-    server = MCPServer(
-        name="rag",
-        title="RAG: локальные базы знаний",
-        instructions="Поиск по проиндексированным базам знаний с указанием источников.",
-    )
+    server = new_server()
     by_name = {base.name: base for base in bases}
     listing = "; ".join(base.name for base in bases) or "нет баз"
 
@@ -292,6 +306,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"rag: базы {', '.join(b.name for b in bases)} · стратегия {args.strategy} · "
           f"маржа {margin} · пол {min_dense} · мин.фрагментов {min_keep} · "
           f"раскрытие {'выкл' if args.no_expand else 'вкл'}", file=sys.stderr, flush=True)
+    # Интерпретатор печатаем намеренно: сервер запускает харнесс, а не пользователь,
+    # и при расхождении версий или путей именно эта строка показывает, кто запущен.
+    print(f"rag: python {sys.executable} · {sys.version.split()[0]}", file=sys.stderr, flush=True)
     build_server(bases).run("stdio")
     return 0
 
