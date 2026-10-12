@@ -40,16 +40,25 @@ def local_base_url(root: str | None = None) -> str:
 
 def local_client(model: str = LOCAL_MODEL, *, root: str | None = None,
                  timeout: float = 600.0, reasoning_effort: str | None = "none",
+                 temperature: float | None = 0.0, max_tokens: int = 400,
                  **kwargs) -> "LlmClient":
-    """Клиент локальной модели: длинный таймаут и без рассуждений по умолчанию.
+    """Клиент локальной модели: длинный таймаут, без рассуждений, детерминированно.
 
     Таймаут большой, потому что на CPU модель считает медленно (замеры: обработка
     промпта ~53 ток/с, генерация ~6-8 ток/с). Рассуждения выключены: у qwen3 они
     включены по умолчанию, стоят в разы больше токенов, чем ответ, и именно из-за
     них строгая справка выглядела «зависшей».
+
+    `temperature=0` и `max_tokens=400` — результат дня 29: у задачи справки есть
+    правильный ответ, случайность вредит, а контрактный ответ длиннее 400 токенов
+    не бывает. Важная деталь: Ollama-специфичное поле `options` этот эндпоинт
+    **молча игнорирует** (проверено: `options.num_predict` не влияет ни на что),
+    поэтому `num_ctx` и `num_predict` задаются в самой модели через `Modelfile`
+    (см. `doc_index.optimize`), а здесь работают только стандартные поля OpenAI.
     """
     return LlmClient(model=model, base_url=local_base_url(root), api_key="ollama",
-                     timeout=timeout, reasoning_effort=reasoning_effort, **kwargs)
+                     timeout=timeout, reasoning_effort=reasoning_effort,
+                     temperature=temperature, max_tokens=max_tokens, **kwargs)
 
 
 class LlmError(RuntimeError):
@@ -83,12 +92,16 @@ class LlmClient:
 
     def __init__(self, *, model: str = DEFAULT_MODEL, base_url: str = DEFAULT_BASE_URL,
                  api_key: str | None = None, max_tokens: int = 4000,
-                 timeout: float = 240.0, reasoning_effort: str | None = None) -> None:
+                 timeout: float = 240.0, reasoning_effort: str | None = None,
+                 temperature: float | None = None) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key or load_api_key()
         self.max_tokens = max_tokens
         self.timeout = timeout
+        # `None` — «не вмешиваться»: у облачной модели температура подобрана
+        # провайдером, и локальные выводы дня 29 на неё не переносятся.
+        self.temperature = temperature
         # `reasoning_effort: none` выключает рассуждения у qwen3 в Ollama. Это
         # единственный работающий способ через OpenAI-совместимый эндпоинт:
         # `think: false` он игнорирует (проверено), `/no_think` в промпте и
@@ -131,6 +144,8 @@ class LlmClient:
         }
         if self.reasoning_effort is not None:
             payload["reasoning_effort"] = self.reasoning_effort
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
