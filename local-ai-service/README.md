@@ -22,7 +22,7 @@ curl / скрипты    ─┘           лимит параллелизма,
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\pip install "litellm[proxy]"
-Copy-Item .env.example .env          # и поменять LITELLM_MASTER_KEY
+Copy-Item env.example .env            # и поменять LITELLM_MASTER_KEY
 
 .\scripts\service.ps1 start          # сам сервис
 docker compose up -d                 # веб-чат на http://127.0.0.1:3000

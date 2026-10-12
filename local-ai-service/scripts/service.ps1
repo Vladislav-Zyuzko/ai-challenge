@@ -23,7 +23,9 @@ $root = Split-Path -Parent $PSScriptRoot
 $outDir = Join-Path $root 'out'
 $pidFile = Join-Path $outDir 'litellm.pid'
 $envFile = Join-Path $root '.env'
-$exampleFile = Join-Path $root '.env.example'
+# Шаблон назван без ведущей точки: корневой .gitignore исключает `.env.*`,
+# и файл-образец иначе молча не попал бы в репозиторий.
+$exampleFile = Join-Path $root 'env.example'
 
 function Read-EnvFile {
     param([string]$Path)

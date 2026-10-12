@@ -211,7 +211,7 @@ node dsh-term/dsh-term.mjs --ollama-url http://127.0.0.1:4000 --llm-check
 ```
 local-ai-service/
 ├── README.md                      архитектура, запуск, что работает и что нет
-├── .env.example                   ключи, адреса, порты
+├── env.example                    ключи, адреса, порты (без ведущей точки: `.env.*` в .gitignore)
 ├── compose.yaml                   Open WebUI (чат) на сервис
 ├── litellm/config.yaml            модели, rpm, лимит параллелизма, reasoning_effort
 ├── scripts/service.ps1            start/stop/status сервиса
