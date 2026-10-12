@@ -1,0 +1,35 @@
+# Веб-чат к приватному сервису (день 30).
+#
+# Open WebUI не знает про Ollama вообще: он видит только наш сервис как обычный
+# OpenAI-совместимый API с ключом. Так и должно быть — модель спрятана за
+# сервисным слоем, а чат остаётся всего лишь одним из клиентов.
+#
+# host.docker.internal — это путь «из контейнера на хост», то есть через сеть,
+# а не через петлю. Им же проверяется доступ к сервису по сети.
+#
+# Запуск:  docker compose up -d
+# Адрес:   http://127.0.0.1:3000  (первый зарегистрированный пользователь — админ)
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: ai-service-webui
+    restart: unless-stopped
+    ports:
+      - "${WEBUI_PORT:-3000}:8080"
+    environment:
+      - OPENAI_API_BASE_URL=http://host.docker.internal:4000/v1
+      - OPENAI_API_KEY=${LITELLM_MASTER_KEY}
+      # Локальную Ollama чат не видит намеренно: единственная точка входа — сервис.
+      - ENABLE_OLLAMA_API=false
+      - WEBUI_AUTH=true
+      - WEBUI_NAME=Приватный AI-сервис (локальная модель)
+      - ENABLE_SIGNUP=true
+      - DEFAULT_MODELS=rag-brief
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - webui-data:/app/backend/data
+
+volumes:
+  webui-data:

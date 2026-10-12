@@ -29,6 +29,10 @@ DEFAULT_MODEL = "deepseek-v4-flash"
 # отдельного клиента не нужно — только другой адрес и фиктивный ключ.
 LOCAL_ROOT = "http://127.0.0.1:11434"
 LOCAL_MODEL = "qwen3:8b"
+# Ключ сервисного слоя (день 30). Сама Ollama ключи не проверяет, но когда
+# локальная модель стоит за сервисом (LiteLLM с ключом и лимитами), клиент
+# обязан ключ предъявить. Пусто — прямое обращение к Ollama, как в днях 26–29.
+SERVICE_KEY_ENV = "DSH_AI_SERVICE_KEY"
 CREDENTIALS_PATH = Path.home() / ".dsh-term" / ".credentials.yaml"
 
 
@@ -41,7 +45,7 @@ def local_base_url(root: str | None = None) -> str:
 def local_client(model: str = LOCAL_MODEL, *, root: str | None = None,
                  timeout: float = 600.0, reasoning_effort: str | None = "none",
                  temperature: float | None = 0.0, max_tokens: int = 400,
-                 **kwargs) -> "LlmClient":
+                 api_key: str | None = None, **kwargs) -> "LlmClient":
     """Клиент локальной модели: длинный таймаут, без рассуждений, детерминированно.
 
     Таймаут большой, потому что на CPU модель считает медленно (замеры: обработка
@@ -55,8 +59,13 @@ def local_client(model: str = LOCAL_MODEL, *, root: str | None = None,
     **молча игнорирует** (проверено: `options.num_predict` не влияет ни на что),
     поэтому `num_ctx` и `num_predict` задаются в самой модели через `Modelfile`
     (см. `doc_index.optimize`), а здесь работают только стандартные поля OpenAI.
+
+    Ключ берётся из `DSH_AI_SERVICE_KEY`, когда модель стоит за сервисом (день 30):
+    адрес сервиса задаётся тем же `DSH_TERM_OLLAMA`, потому что протокол один и
+    тот же — меняется только то, что теперь нужен ключ.
     """
-    return LlmClient(model=model, base_url=local_base_url(root), api_key="ollama",
+    key = api_key or os.environ.get(SERVICE_KEY_ENV, "").strip() or "ollama"
+    return LlmClient(model=model, base_url=local_base_url(root), api_key=key,
                      timeout=timeout, reasoning_effort=reasoning_effort,
                      temperature=temperature, max_tokens=max_tokens, **kwargs)
 

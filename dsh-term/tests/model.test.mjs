@@ -7,8 +7,9 @@
  *
  * Запуск: node dsh-term/tests/model.test.mjs
  */
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -23,6 +24,35 @@ function run(args, env = {}) {
     env: { ...process.env, NO_COLOR: '1', ...env },
   })
   return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, code: r.status }
+}
+
+/**
+ * Асинхронный запуск нужен там, где рядом живёт заглушечный сервер.
+ * `spawnSync` блокирует цикл событий процесса-теста, и сервер физически не может
+ * ответить: запрос истекает по таймауту, и тест «доказывает» несуществующую поломку.
+ */
+function runAsync(args, env = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [dshTerm, ...args], {
+      env: { ...process.env, NO_COLOR: '1', ...env },
+    })
+    let out = ''
+    child.stdout.on('data', (chunk) => { out += chunk })
+    child.stderr.on('data', (chunk) => { out += chunk })
+    child.on('close', (code) => resolve({ out, code }))
+    child.stdin.end()
+  })
+}
+
+/** Поднять заглушку на свободном порту и вернуть её адрес. */
+function serve(handler) {
+  const server = createServer(handler)
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({
+      url: `http://127.0.0.1:${server.address().port}`,
+      close: () => server.close(),
+    }))
+  })
 }
 
 const home = mkdtempSync(join(tmpdir(), 'dsh-llm-'))
@@ -76,6 +106,56 @@ const help = run(['--help'])
 check('--llm-check в справке', /--llm-check/.test(help.out))
 check('команда /model в справке', /\/model \[имя\|show\]/.test(help.out))
 check('--provider упоминает local', /--provider <id>.*local/.test(help.out))
+
+// 7. Сервисный слой (день 30): адрес без /api/tags, но с /v1/models и ключом.
+// Проверяется то, ради чего модель выносят за сервис: маршрут обязан указывать
+// на сервис, а список моделей — приходить из его OpenAI-совместимого ответа.
+const service = await serve((req, res) => {
+  const authorized = req.headers.authorization === 'Bearer sk-service'
+  if (req.url === '/api/tags') {
+    res.writeHead(404, { 'Content-Type': 'application/json' })
+    res.end('{"error":"not found"}')
+    return
+  }
+  if (req.url === '/v1/models') {
+    if (!authorized) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end('{"error":"no key"}')
+      return
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ data: [{ id: 'rag-brief' }, { id: 'qwen3-8b' }, { id: 'bge-m3:latest' }] }))
+    return
+  }
+  res.writeHead(404)
+  res.end('{}')
+})
+const serviceHome = mkdtempSync(join(tmpdir(), 'dsh-llm-service-'))
+const serviceRun = await runAsync(['--llm-check', '--dsh-home', serviceHome, '--ollama-url', service.url],
+  { OLLAMA_API_KEY: 'sk-service' })
+service.close()
+
+check('сервис: код 0', serviceRun.code === 0, `code=${serviceRun.code}`)
+check('сервис: модели из /v1/models', /rag-brief/.test(serviceRun.out) && /qwen3-8b/.test(serviceRun.out),
+  serviceRun.out.split('\n').find((l) => l.includes('локальные модели')) ?? serviceRun.out.slice(0, 200))
+check('сервис: эмбеддинги в списке чата не нужны', !/bge-m3/.test(serviceRun.out))
+{
+  const serviceText = readFileSync(join(serviceHome, 'settings.yaml'), 'utf8')
+  check('сервис: маршрут указывает на сервис', serviceText.includes(`baseURL: ${service.url}/v1`),
+    serviceText.split('\n').find((l) => l.includes('baseURL')) ?? '')
+}
+
+// 8. Без ключа сервис моделей не отдаёт — значит и список пустой, но не падение.
+const noKeyHome = mkdtempSync(join(tmpdir(), 'dsh-llm-nokey-'))
+const gate = await serve((req, res) => {
+  res.writeHead(req.url === '/v1/models' ? 401 : 404, { 'Content-Type': 'application/json' })
+  res.end('{"error":"no key"}')
+})
+const noKeyRun = await runAsync(['--llm-check', '--dsh-home', noKeyHome, '--ollama-url', gate.url],
+  { OLLAMA_API_KEY: 'неверный' })
+gate.close()
+check('без ключа: код 0', noKeyRun.code === 0, `code=${noKeyRun.code}`)
+check('без ключа: модель по умолчанию остаётся', /id: 'qwen3:8b'/.test(readFileSync(join(noKeyHome, 'settings.yaml'), 'utf8')))
 
 let failed = 0
 for (const c of checks) {
