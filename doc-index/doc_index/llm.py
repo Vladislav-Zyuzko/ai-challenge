@@ -25,7 +25,49 @@ from .agent import AgentReply
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
+# Локальная модель в Ollama отдаёт тот же OpenAI-совместимый протокол, поэтому
+# отдельного клиента не нужно — только другой адрес и фиктивный ключ.
+LOCAL_ROOT = "http://127.0.0.1:11434"
+LOCAL_MODEL = "qwen3:8b"
+# Ключ сервисного слоя (день 30). Сама Ollama ключи не проверяет, но когда
+# локальная модель стоит за сервисом (LiteLLM с ключом и лимитами), клиент
+# обязан ключ предъявить. Пусто — прямое обращение к Ollama, как в днях 26–29.
+SERVICE_KEY_ENV = "DSH_AI_SERVICE_KEY"
 CREDENTIALS_PATH = Path.home() / ".dsh-term" / ".credentials.yaml"
+
+
+def local_base_url(root: str | None = None) -> str:
+    """`http://127.0.0.1:11434` → `http://127.0.0.1:11434/v1` (эндпоинт Ollama)."""
+    root = (root or os.environ.get("DSH_TERM_OLLAMA") or LOCAL_ROOT).rstrip("/")
+    return root if root.endswith("/v1") else f"{root}/v1"
+
+
+def local_client(model: str = LOCAL_MODEL, *, root: str | None = None,
+                 timeout: float = 600.0, reasoning_effort: str | None = "none",
+                 temperature: float | None = 0.0, max_tokens: int = 400,
+                 api_key: str | None = None, **kwargs) -> "LlmClient":
+    """Клиент локальной модели: длинный таймаут, без рассуждений, детерминированно.
+
+    Таймаут большой, потому что на CPU модель считает медленно (замеры: обработка
+    промпта ~53 ток/с, генерация ~6-8 ток/с). Рассуждения выключены: у qwen3 они
+    включены по умолчанию, стоят в разы больше токенов, чем ответ, и именно из-за
+    них строгая справка выглядела «зависшей».
+
+    `temperature=0` и `max_tokens=400` — результат дня 29: у задачи справки есть
+    правильный ответ, случайность вредит, а контрактный ответ длиннее 400 токенов
+    не бывает. Важная деталь: Ollama-специфичное поле `options` этот эндпоинт
+    **молча игнорирует** (проверено: `options.num_predict` не влияет ни на что),
+    поэтому `num_ctx` и `num_predict` задаются в самой модели через `Modelfile`
+    (см. `doc_index.optimize`), а здесь работают только стандартные поля OpenAI.
+
+    Ключ берётся из `DSH_AI_SERVICE_KEY`, когда модель стоит за сервисом (день 30):
+    адрес сервиса задаётся тем же `DSH_TERM_OLLAMA`, потому что протокол один и
+    тот же — меняется только то, что теперь нужен ключ.
+    """
+    key = api_key or os.environ.get(SERVICE_KEY_ENV, "").strip() or "ollama"
+    return LlmClient(model=model, base_url=local_base_url(root), api_key=key,
+                     timeout=timeout, reasoning_effort=reasoning_effort,
+                     temperature=temperature, max_tokens=max_tokens, **kwargs)
 
 
 class LlmError(RuntimeError):
@@ -59,12 +101,23 @@ class LlmClient:
 
     def __init__(self, *, model: str = DEFAULT_MODEL, base_url: str = DEFAULT_BASE_URL,
                  api_key: str | None = None, max_tokens: int = 4000,
-                 timeout: float = 240.0) -> None:
+                 timeout: float = 240.0, reasoning_effort: str | None = None,
+                 temperature: float | None = None) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key or load_api_key()
         self.max_tokens = max_tokens
         self.timeout = timeout
+        # `None` — «не вмешиваться»: у облачной модели температура подобрана
+        # провайдером, и локальные выводы дня 29 на неё не переносятся.
+        self.temperature = temperature
+        # `reasoning_effort: none` выключает рассуждения у qwen3 в Ollama. Это
+        # единственный работающий способ через OpenAI-совместимый эндпоинт:
+        # `think: false` он игнорирует (проверено), `/no_think` в промпте и
+        # `chat_template_kwargs` тоже не действуют, а без выключения модель тратит
+        # на размышления больше токенов, чем на ответ: на CPU это минуты, и при
+        # исчерпании бюджета ответ приходит пустым.
+        self.reasoning_effort = reasoning_effort
         self.calls = 0
         self.seconds = 0.0
         self.retries = 0
@@ -98,6 +151,10 @@ class LlmClient:
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),

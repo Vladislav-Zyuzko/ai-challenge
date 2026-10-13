@@ -160,14 +160,19 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def _answerer(args: argparse.Namespace):
-    """Кто отвечает: чистый клиент модели или агент харнесса.
+    """Кто отвечает: чистый клиент модели, локальная модель в Ollama или агент харнесса.
 
     По умолчанию чистый клиент: у агента харнесса есть инструменты, и он может
     выйти за пределы переданного контекста, тогда как для сравнения режимов
-    нужен ровно один источник знаний — блок контекста.
+    нужен ровно один источник знаний — блок контекста. `local` — тот же чистый
+    клиент, но с адресом Ollama: строгий путь дня 24 (источники, цитаты, отказ)
+    работает с локальной моделью без агентского цикла.
     """
     if args.backend == "harness":
         return HarnessAgent(model=args.llm_model, cwd=Path(args.out).expanduser())
+    if args.backend == "local":
+        from .llm import local_client
+        return local_client(args.llm_model)
     return LlmClient(model=args.llm_model)
 
 
@@ -419,9 +424,10 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--llm-model", default="deepseek-v4-flash", help="модель агента")
         parser.add_argument("--expand", type=int, default=0,
                             help="добавить в контекст N соседних чанков каждой найденной заметки")
-        parser.add_argument("--backend", default="api", choices=["api", "harness"],
-                            help="api — чистый вызов модели (по умолчанию); harness — агент с инструментами, "
-                                 "он умеет читать файлы и может подглядеть в корпус или в эталоны")
+        parser.add_argument("--backend", default="api", choices=["api", "local", "harness"],
+                            help="api — чистый вызов модели (по умолчанию); local — локальная модель "
+                                 "в Ollama (тот же строгий путь, но без облака); harness — агент "
+                                 "с инструментами, он умеет читать файлы и может подглядеть в корпус")
 
     p_ask = sub.add_parser("ask", help="спросить базу: с RAG и без RAG")
     _add_common(p_ask)
