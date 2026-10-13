@@ -1400,7 +1400,7 @@ function formatInstruction(v) {
 
 // ---------- реестр команд REPL + git/gh (SKILLS) ----------
 const COMMANDS = [
-  { name: 'help', usage: '/help [команда]', desc: 'список команд / справка по команде' },
+  { name: 'help', usage: '/help [команда | вопрос]', desc: 'список команд, справка по команде или ответ по проекту' },
   { name: 'session', usage: '/session', desc: 'показать текущую сессию (заголовок и id)' },
   { name: 'strategy', usage: '/strategy [id]', desc: 'стратегия контекста: sliding | facts | branch | harness (меню)' },
   { name: 'branch', usage: '/branch [id|new]', desc: 'ветки диалога: чекпоинт, новая ветка, переключение (включает режим branch)' },
@@ -2544,6 +2544,10 @@ const RAG_DEFAULT_STRATEGY = 'structural'
 const RAG_DEFAULT_MARGIN = 0.04
 const RAG_DEFAULT_MIN_DENSE = 0.5
 const RAG_DEFAULT_MIN_KEEP = 2
+// База документации проекта для команды `/help` (день 31). Называется фиксированно:
+// команда должна работать и без `--rag проект` — она читает реестр и запускает CLI
+// сама, потому что строгий путь идёт мимо агента и база ему не нужна.
+const PROJECT_BASE = 'project'
 
 function ragRegistryPath(cwd = process.cwd()) {
   return process.env.DSH_TERM_RAG_FILE || join(cwd, '.dsh', RAG_REGISTRY_NAME)
@@ -2771,17 +2775,29 @@ function ragInstructionText(names, bases) {
 function ragServerFor(names, bases, { cwd = process.cwd(), opts = {} } = {}) {
   const first = bases[names[0]] ?? {}
   const indexDirs = names.map((name) => resolve(cwd, String(bases[name]?.index ?? '')))
+  // Каталог индекса может лежать отдельно от каталога пакета: у базы проекта пакет
+  // живёт в `doc-index`, а индекс документации — в `project-index/out`. Раньше это
+  // было одно поле, и вторая база искала бы чужой индекс.
+  const outDirs = names.map((name) => {
+    const value = bases[name]?.out
+    return value ? resolve(cwd, String(value)) : null
+  })
   const root = indexDirs[0]
   const args = ['-m', 'doc_index.mcp_server']
   for (const [i, name] of names.entries()) {
     const entry = bases[name] ?? {}
     args.push('--base', `${name}=${indexDirs[i]}`)
+    if (outDirs[i]) args.push('--base-out', `${name}=${outDirs[i]}`)
     if (entry.title) args.push('--title', `${name}=${entry.title}`)
     if (entry.what) args.push('--what', `${name}=${entry.what}`)
   }
   // Настройки фильтра: флаги сессии главнее реестра. При `--no-filter` пороги
   // выключаются совсем — иначе «нулевая маржа» оставила бы один лучший фрагмент.
   const filter = ragFilterSettings(opts, first)
+  // Контекст проекта для агента: ветка, изменения, diff и список файлов. Рабочая
+  // папка сессии и есть репозиторий, поэтому передаём её — иначе инструменты проекта
+  // не регистрируются и агент не может ответить даже на вопрос «какая сейчас ветка».
+  args.push('--repo', cwd)
   args.push('--strategy', String(first.strategy || RAG_DEFAULT_STRATEGY))
   args.push('--min-keep', String(filter.minKeep))
   if (filter.margin === null && filter.minDense === null) {
@@ -2805,6 +2821,7 @@ function ragServerFor(names, bases, { cwd = process.cwd(), opts = {} } = {}) {
     // строгим путём, что проверка дня 24, поэтому ей нужны база и настройки фильтра.
     ragCli: {
       root,
+      outDir: outDirs[0],
       python: process.env.DSH_TERM_RAG_PYTHON || 'python',
       base: names[0],
       strategy: String(first.strategy || RAG_DEFAULT_STRATEGY),
@@ -2818,12 +2835,94 @@ function ragServerFor(names, bases, { cwd = process.cwd(), opts = {} } = {}) {
 }
 
 /**
+ * Параметры базы документации проекта для `/help`.
+ *
+ * Сначала ищем базу в уже подключённых (`--rag project`), иначе собираем её из реестра:
+ * команда не должна требовать, чтобы база была подключена в сессии — она запускает
+ * `doc_index brief` отдельным процессом, а тому нужен только каталог с индексом.
+ */
+function projectBaseSpec(opts, state) {
+  const fromSession = (state.rag?.servers ?? []).find((s) => s.ragCli?.base === PROJECT_BASE)
+  if (fromSession) return { cli: fromSession.ragCli, env: fromSession.env, source: 'сессия' }
+  const registry = readRagRegistry(opts.workspace)
+  if (registry.error) return { error: `реестр баз ${registry.path} не читается: ${registry.error}` }
+  if (registry.missing) return { error: `нет файла реестра баз ${registry.path}` }
+  if (!registry.bases?.[PROJECT_BASE]) {
+    return { error: `в реестре баз нет записи «${PROJECT_BASE}» — добавьте её в .dsh/rag.json` }
+  }
+  const dir = resolve(opts.workspace, String(registry.bases[PROJECT_BASE].index ?? ''))
+  if (!existsSync(dir)) {
+    return { error: `каталог базы «${PROJECT_BASE}» не найден: ${dir}` }
+  }
+  const spec = ragServerFor([PROJECT_BASE], registry.bases, { cwd: opts.workspace, opts })
+  return { cli: spec.ragCli, env: spec.env, source: 'реестр' }
+}
+
+/**
+ * Ответ на вопрос о проекте: документация из базы + живой контекст git.
+ *
+ * Идёт строгим путём (`doc_index brief --repo`), а не через агента: локальная модель
+ * теряется среди инструментов харнесса (день 26), а здесь выбор инструментов не нужен —
+ * контекст и данные git вкладываются в промпт кодом, форма ответа гарантирована.
+ */
+function helpAboutProject(opts, state, question) {
+  const found = projectBaseSpec(opts, state)
+  if (!found.cli) {
+    log.err(`help: ${found.error}`)
+    log.dim('собрать индекс документации: python -m doc_index index --project-docs --vault .')
+    return
+  }
+  const cli = found.cli
+  const argv = ['-m', 'doc_index', 'brief', question,
+    '--strategy', cli.strategy,
+    '--k', String(cli.k),
+    '--expand', String(cli.expand),
+    '--candidates', String(cli.candidates),
+    '--min-keep', String(cli.filter.minKeep),
+    // Живой контекст проекта: ветка, HEAD, изменённые файлы. Именно это отличает
+    // /help от /rag-brief — вопросы о текущем состоянии в документации не ищутся.
+    '--repo', opts.workspace]
+  if (cli.outDir) argv.push('--out', cli.outDir)
+  if (cli.filter.margin === null && cli.filter.minDense === null) {
+    argv.push('--no-filter')
+  } else {
+    if (cli.filter.margin !== null) argv.push('--margin', String(cli.filter.margin))
+    if (cli.filter.minDense !== null) argv.push('--min-dense', String(cli.filter.minDense))
+  }
+  if (opts.provider === LOCAL_PROVIDER) {
+    argv.push('--backend', 'local', '--llm-model', opts.model)
+  }
+  log.dim(`help: база ${cli.base} (${found.source}) · контекст проекта ${opts.workspace} · собираю ответ…`)
+  const brief = spawnSync(cli.python, argv, {
+    cwd: cli.root,
+    encoding: 'utf8',
+    timeout: 240000,
+    env: { ...process.env, ...(found.env ?? {}) },
+  })
+  if (brief.error) {
+    log.err(`help: не удалось запустить поиск — ${brief.error.message}`)
+    return
+  }
+  if (brief.status !== 0) {
+    log.err(`help: команда вернула код ${brief.status}`)
+    const tail = (brief.stderr ?? '').trim().split('\n').slice(-4).join('\n')
+    if (tail) log.dim(tail)
+    return
+  }
+  log.line('')
+  const styled = mdStyle((brief.stdout ?? '').replace(/\r\n/g, '\n').trimEnd(),
+    { inFence: false, lineStart: true })
+  for (const line of styled.split('\n')) log.line(line)
+  log.line('')
+  log.dim('подсказка: «/help <команда>» — справка по команде, «/help <вопрос>» — ответ по проекту')
+}
+
+/**
  * Разобрать `--rag`: что подключено, чем и с какой инструкцией.
  *
  * Ошибки возвращаются, а не печатаются: вызывающая сторона решает, падать или
  * продолжать без базы знаний.
- */
-function resolveRag(opts) {
+ */function resolveRag(opts) {
   const names = ragRequestedNames(opts)
   if (!names.length) return { names: [], servers: [], instruction: null, registry: null, error: null }
   const badNumber = ragFilterError(opts)
@@ -4840,11 +4939,20 @@ async function main() {
     const arg = parts.slice(1).join(' ')
     switch (cmd.name) {
       case 'help': {
-        if (arg) {
-          const c = COMMANDS.find((x) => x.name === arg.toLowerCase())
-          if (c) printCommandUsage(c.name)
-          else log.err(`нет команды /${arg} — «/» для списка`)
-        } else printCommandList()
+        // Три режима в одной команде: без аргумента — список команд, с именем
+        // команды — справка по ней, с любым другим текстом — ответ по проекту
+        // (документация из базы + живой контекст git).
+        const question = parts.slice(1).join(' ').trim()
+        if (!question) {
+          printCommandList()
+          break
+        }
+        const known = COMMANDS.find((x) => x.name === question.toLowerCase())
+        if (known) {
+          printCommandUsage(known.name)
+          break
+        }
+        helpAboutProject(opts, state, question)
         break
       }
       case 'strategy': {
@@ -5139,6 +5247,7 @@ async function main() {
           '--expand', String(cli.expand),
           '--candidates', String(cli.candidates),
           '--min-keep', String(cli.filter.minKeep)]
+        if (cli.outDir) argv.push('--out', cli.outDir)
         if (cli.filter.margin === null && cli.filter.minDense === null) {
           argv.push('--no-filter')
         } else {

@@ -2,8 +2,11 @@
 
 Сеть, Ollama и модель не нужны: поиск подменяется заглушкой, поэтому проверяются
 фильтрация, пол применимости, формат выдачи и то, что SDK видит инструменты.
+Инструменты контекста проекта проверяются на временном git-репозитории.
 """
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -167,6 +170,107 @@ class ServerTests(unittest.TestCase):
 
     def test_default_k_is_used(self):
         self.assertEqual(DEFAULT_K, 5)
+
+
+class BaseOutTest(unittest.TestCase):
+    """Каталог индекса может лежать отдельно от каталога пакета (день 31)."""
+
+    def test_default_index_is_root_out(self):
+        base = KnowledgeBase(name="b", root=Path(r"C:\repo\doc-index"))
+        self.assertEqual(base.config().db_path(), Path(r"C:\repo\doc-index") / "out" / "index.db")
+
+    def test_explicit_out_dir(self):
+        base = KnowledgeBase(name="project", root=Path(r"C:\repo\doc-index"),
+                             out=Path(r"C:\repo\project-index\out"))
+        self.assertEqual(base.config().db_path(),
+                         Path(r"C:\repo\project-index\out") / "index.db")
+
+    def test_server_accepts_base_out(self):
+        """Флаг `--base-out имя=путь` доходит до KnowledgeBase."""
+        import argparse
+        from doc_index.mcp_server import parse_base
+        # Значения разбираются в main: проверяем сам разбор и сборку базы.
+        name, root = parse_base(f"project={Path(__file__).resolve().parent}")
+        self.assertEqual(name, "project")
+        base = KnowledgeBase(name=name, root=root, out=Path(r"C:\idx\out"))
+        self.assertEqual(base.config().out, Path(r"C:\idx\out"))
+
+
+class ProjectToolTests(unittest.TestCase):
+    """Инструменты контекста проекта (день 31): появляются только с `--repo`."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        run = lambda *args: subprocess.run(args, cwd=self.repo, check=True, capture_output=True)  # noqa: E731
+        run("git", "init", "-b", "main")
+        run("git", "config", "user.email", "test@local")
+        run("git", "config", "user.name", "Тест")
+        (self.repo / "README.md").write_text("# Проект\n", encoding="utf-8")
+        (self.repo / "docs").mkdir()
+        (self.repo / "docs" / "api.md").write_text("# API\n", encoding="utf-8")
+        run("git", "add", "-A")
+        run("git", "commit", "-m", "первый коммит")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def names(self, server) -> list[str]:
+        registry = getattr(getattr(server, "_tool_manager", None), "_tools", None)
+        if not registry:
+            self.skipTest("внутренний реестр инструментов недоступен в этой версии SDK")
+        return sorted(registry)
+
+    def fn(self, server, name):
+        registry = getattr(getattr(server, "_tool_manager", None), "_tools", None)
+        if not registry or name not in registry:
+            self.skipTest("внутренний реестр инструментов недоступен в этой версии SDK")
+        return registry[name].fn
+
+    def test_search_only_without_repo(self):
+        """Без `--repo` инструменты проекта не регистрируются: лишние описания
+        инструментов стоят контекста (цена измерена в дне 16)."""
+        self.assertEqual(self.names(build_server([])), ["rag_bases", "rag_search"])
+
+    def test_project_tools_registered_with_repo(self):
+        server = build_server([], repo=self.repo)
+        self.assertEqual(self.names(server),
+                         ["git_branch", "git_diff", "git_status", "project_files",
+                          "rag_bases", "rag_search"])
+
+    def test_branch_tool(self):
+        text = self.fn(build_server([], repo=self.repo), "git_branch")()
+        self.assertIn("ветка: main", text)
+        self.assertIn("первый коммит", text)
+
+    def test_status_tool_clean_and_changed(self):
+        server = build_server([], repo=self.repo)
+        self.assertIn("чистое", self.fn(server, "git_status")())
+        (self.repo / "README.md").write_text("# Проект\n\nправка\n", encoding="utf-8")
+        text = self.fn(server, "git_status")()
+        self.assertIn("изменено файлов: 1", text)
+        self.assertIn("README.md", text)
+
+    def test_diff_tool_reports_files(self):
+        (self.repo / "README.md").write_text("# Проект\n\nправка\n", encoding="utf-8")
+        text = self.fn(build_server([], repo=self.repo), "git_diff")()
+        self.assertIn("README.md", text)
+
+    def test_files_tool_and_filter(self):
+        server = build_server([], repo=self.repo)
+        everything = self.fn(server, "project_files")()
+        self.assertIn("файлов в проекте: 2", everything)
+        filtered = self.fn(server, "project_files")(pattern="docs/")
+        self.assertIn("docs/api.md", filtered)
+        self.assertNotIn("README.md", filtered)
+
+    def test_missing_repo_is_explained_not_raised(self):
+        """Инструмент обязан вернуть объяснение: падение внутри MCP оставит агента
+        без ответа и без причины."""
+        empty = self.repo / "не-репозиторий"
+        empty.mkdir()
+        text = self.fn(build_server([], repo=empty), "git_branch")()
+        self.assertIn("Контекст проекта недоступен", text)
 
 
 if __name__ == "__main__":

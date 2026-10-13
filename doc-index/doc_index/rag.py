@@ -44,6 +44,17 @@ WITH_CONTEXT_STRICT = (
     "Ниже приведены фрагменты базы знаний с их chunk_id. Отвечай только по ним "
     "и цитируй их дословно."
 )
+# Правило для команды /help: часть контекста — не документация, а живые данные git.
+# Без него строгий контракт заставляет модель отвечать «Не знаю» на вопрос «какая
+# сейчас ветка»: во фрагментах базы ветки нет и быть не может.
+PROJECT_CONTEXT_RULE = (
+    "Дополнительно дан блок «КОНТЕКСТ ПРОЕКТА» — это данные git о текущем состоянии "
+    "репозитория, а не документация. Если вопрос про текущее состояние (какая ветка, "
+    "что изменено, что не закоммичено) — отвечай ТОЛЬКО по этому блоку, коротко, и "
+    "НЕ добавляй блоки ИСТОЧНИКИ и ЦИТАТЫ: цитировать здесь нечего, а данные git не "
+    "являются фрагментом базы. Блоки ИСТОЧНИКИ и ЦИТАТЫ нужны только тогда, когда "
+    "ответ взят из фрагментов документации."
+)
 # Шаблон отказа: показывается без вызова модели, когда поиск не нашёл ничего
 # достаточно близкого. Требование «обязан сказать не знаю» выполняется кодом,
 # а не надеждой на послушание модели.
@@ -118,15 +129,21 @@ def usage(agent: object) -> tuple[int, int]:
 
 
 def build_prompt(question: str, hits: list[dict] | None = None, *, max_chars: int = 6000,
-                 strict: bool = False, topics: str = "") -> str:
+                 strict: bool = False, topics: str = "", project_context: str = "") -> str:
     """Промпт для обоих режимов: отличается только блоком контекста.
 
     `strict` (день 24) добавляет контракт ответа — источники и дословные цитаты —
     и подписывает фрагменты их chunk_id. Обычный режим не меняется: результаты
     дней 22–23 должны оставаться воспроизводимыми.
+
+    `project_context` (день 31) добавляет блок данных git и правило, что отвечать по
+    нему можно без ссылок и цитат. Блок идёт прямо перед вопросом — так модель видит
+    его последним и не смешивает с документацией.
     """
     if strict:
         lines = [STRICT_RULES, WITH_CONTEXT_STRICT if hits else WITHOUT_CONTEXT]
+        if project_context:
+            lines.append(PROJECT_CONTEXT_RULE)
         if hits:
             lines.append("")
             lines.append(CONTEXT_HEADER)
@@ -140,6 +157,9 @@ def build_prompt(question: str, hits: list[dict] | None = None, *, max_chars: in
             lines.append(build_context(hits, max_chars))
         else:
             lines.append(WITHOUT_CONTEXT)
+    if project_context:
+        lines.append("")
+        lines.append(project_context)
     lines.append("")
     lines.append(f"ВОПРОС: {question}")
     return "\n".join(lines)
@@ -154,12 +174,18 @@ def refusal_text(best: float | None, floor: float, topics: str = "") -> str:
 def answer_question(agent: Answerer, question: str, *, question_id: str, mode: str,
                     hits: list[dict] | None = None, max_chars: int = 6000,
                     strict: bool = False, min_dense: float | None = None,
-                    topics: str = "") -> RagAnswer:
+                    topics: str = "", project_context: str = "") -> RagAnswer:
     """Ответ на вопрос. При `min_dense` слабый контекст даёт отказ без вызова модели.
 
     Гейт стоит перед моделью намеренно: «обязан сказать не знаю» — это требование
     к поведению, а не пожелание в промпте. Заодно не тратятся токены на вопрос,
     которого в базе нет.
+
+    Исключение — `project_context`: когда в промпт добавлены живые данные проекта,
+    слабая выдача поиска ещё не значит, что ответа нет. Вопрос «какая сейчас ветка»
+    по документации не ищется вовсе, и гейт отказал бы, не спросив модель. Поэтому
+    при заданном контексте проекта вопрос всегда доходит до модели, а дисциплину
+    «не знаю» держит контракт ответа.
     """
     if mode not in MODES:
         raise ValueError(f"неизвестный режим: {mode}")
@@ -169,7 +195,8 @@ def answer_question(agent: Answerer, question: str, *, question_id: str, mode: s
         scores = [float(h["dense_score"]) for h in context
                   if isinstance(h.get("dense_score"), (int, float))]
         best = max(scores) if scores else None
-    if context and min_dense is not None and best is not None and best < min_dense:
+    if (context and min_dense is not None and best is not None and best < min_dense
+            and not project_context):
         return RagAnswer(
             question_id=question_id,
             question=question,
@@ -183,7 +210,8 @@ def answer_question(agent: Answerer, question: str, *, question_id: str, mode: s
             refused=True,
             strict=strict,
         )
-    prompt = build_prompt(question, context, max_chars=max_chars, strict=strict, topics=topics)
+    prompt = build_prompt(question, context, max_chars=max_chars, strict=strict, topics=topics,
+                          project_context=project_context)
     reply: AgentReply = agent.ask(prompt)
     return RagAnswer(
         question_id=question_id,

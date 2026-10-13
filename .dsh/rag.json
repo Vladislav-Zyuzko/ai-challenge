@@ -6,5 +6,14 @@
     "strategy": "structural",
     "margin": 0.04,
     "minDense": 0.5
+  },
+  "project": {
+    "title": "документация проекта ai-challenge",
+    "index": "doc-index",
+    "out": "project-index/out",
+    "what": "README, docs, отчёты по дням, правила и скиллы проекта",
+    "strategy": "structural",
+    "margin": 0.04,
+    "minDense": 0.5
   }
 }
