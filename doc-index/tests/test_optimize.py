@@ -246,6 +246,17 @@ class ClientPayloadTest(unittest.TestCase):
         в модели. Отправлять поле значило бы имитировать настройку, которой нет."""
         self.assertNotIn("options", self._payload(local_client("rag-brief:8b")))
 
+    def test_service_key_comes_from_environment(self):
+        """Когда локальная модель стоит за сервисом (день 30), клиент обязан
+        предъявить ключ; без сервиса остаётся фиктивный ключ Ollama."""
+        with mock.patch.dict("os.environ", {"DSH_AI_SERVICE_KEY": "sk-service"}):
+            self.assertEqual(local_client("rag-brief").api_key, "sk-service")
+        with mock.patch.dict("os.environ", {"DSH_AI_SERVICE_KEY": "sk-service"}):
+            # Явный аргумент важнее окружения.
+            self.assertEqual(local_client("rag-brief", api_key="sk-explicit").api_key, "sk-explicit")
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(local_client("rag-brief").api_key, "ollama")
+
 
 class ReportTest(unittest.TestCase):
     def profile(self, pid: str, model: str, *, quality: float, gbps: float) -> dict:

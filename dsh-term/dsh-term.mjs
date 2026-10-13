@@ -1869,7 +1869,13 @@ function pickListTTY(spec) {
     })
   }
   const render = (st) => {
-    const row0 = st.prompt + st.query
+    const cols = meterCols()
+    // Каждую строку кадра обрезаем по ширине терминала — и строку ввода, и нижнюю
+    // подсказку. Перенос делает из одной логической строки две физические, а возврат
+    // курсора ниже считает строки вручную: расхождение ровно на строку оставляло на
+    // экране копию «model>» на каждом тике перерисовки, и меню «плыло» вниз
+    // (регресс: tests/model-picker.test.mjs).
+    const row0 = menuClip(st.prompt + st.query)
     const rows = []
     const { start, count } = pickWindow(st.items.length, st.sel, 8)
     if (st.items.length === 0) rows.push(menuClip(`${C.dim}  (ничего не найдено)${C.off}`))
@@ -1883,7 +1889,15 @@ function pickListTTY(spec) {
       const note = it.note ? ` ${C.dim}${it.note}${C.reset}` : ''
       rows.push(menuClip(`${mark} ${dot} ${box}${label}${note}`))
     }
-    process.stdout.write(`\r\x1b[J${row0}\n${[menuSeparator(), ...rows, `${C.dim}${SESSION_PICK_KEYS}${C.off}`].join('\n')}\x1b[${rows.length + 2}A\x1b[${meterVis(row0) + 1}G`)
+    rows.push(menuClip(`${C.dim}${SESSION_PICK_KEYS}${C.off}`))
+    const lines = [menuSeparator(), ...rows]
+    // Высота кадра в ФИЗИЧЕСКИХ строках: строка ввода тоже может перенестись,
+    // если реальная ширина терминала меньше той, по которой обрезали.
+    const visible = meterVis(row0)
+    const promptRows = Math.max(1, Math.ceil(visible / cols))
+    const up = lines.length + promptRows - 1
+    const col = visible > 0 && visible % cols === 0 ? cols : (visible % cols) + 1
+    process.stdout.write(`\r\x1b[J${row0}\n${lines.join('\n')}\x1b[${up}A\x1b[${col}G`)
   }
   return new Promise((resolve) => {
     const st = { prompt: spec.prompt, query: '', sel: 0, items: filter(''), chosen: new Set() }
@@ -1905,7 +1919,7 @@ function pickListTTY(spec) {
       if (done) return
       done = true
       cleanup()
-      process.stdout.write(`\r\x1b[J${st.prompt}${st.query}\n`)
+      process.stdout.write(`\r\x1b[J${menuClip(st.prompt + st.query)}\n`)
       resolve(id)
     }
     const onEnd = () => finish(null)
@@ -2615,19 +2629,37 @@ const CLOUD_MODELS = [
 // Модели эмбеддингов в списке для чата не нужны: они не генерируют текст.
 const EMBEDDING_HINTS = ['bge', 'embed', 'gte', 'e5', 'nomic']
 
-/** Локальные модели из Ollama. Молча возвращает пустой список, если Ollama не поднята. */
+/**
+ * Локальные модели: сначала родной протокол Ollama, потом сервисный слой.
+ *
+ * Источника два, потому что адрес один и тот же, а протоколы разные. Прямая Ollama
+ * отвечает на `/api/tags` и ключей не проверяет; сервис (LiteLLM, день 30) отвечает
+ * на `/v1/models` и требует ключ в заголовке. Без второй попытки dsh-term решал бы,
+ * что моделей нет, хотя чат через сервис работает.
+ */
 async function ollamaModels(url = OLLAMA_URL, timeoutMs = 1500) {
+  const native = await fetchModels(`${url}/api/tags`, {}, timeoutMs, (data) =>
+    (data.models ?? []).map((m) => ({
+      name: String(m.name ?? ''),
+      sizeGb: m.size ? Math.round((m.size / 1e9) * 10) / 10 : 0,
+    })))
+  if (native.length) return native
+
+  const serviceKey = process.env.OLLAMA_API_KEY ?? 'ollama'
+  return fetchModels(`${url}/v1/models`, { Authorization: `Bearer ${serviceKey}` }, timeoutMs,
+    (data) => (data.data ?? []).map((m) => ({ name: String(m.id ?? ''), sizeGb: 0 })))
+}
+
+/** Общий разбор ответа со списком моделей: сеть, таймаут и фильтр эмбеддингов в одном месте. */
+async function fetchModels(url, headers, timeoutMs, pick) {
   try {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
-    const response = await fetch(`${url}/api/tags`, { signal: controller.signal })
+    const response = await fetch(url, { headers, signal: controller.signal })
     clearTimeout(timer)
     if (!response.ok) return []
-    const data = await response.json()
-    return (data.models ?? []).map((m) => ({
-      name: String(m.name ?? ''),
-      sizeGb: m.size ? Math.round((m.size / 1e9) * 10) / 10 : 0,
-    })).filter((m) => m.name && !EMBEDDING_HINTS.some((hint) => m.name.toLowerCase().includes(hint)))
+    return pick(await response.json())
+      .filter((m) => m.name && !EMBEDDING_HINTS.some((hint) => m.name.toLowerCase().includes(hint)))
   } catch {
     return []
   }
@@ -2649,8 +2681,12 @@ async function ollamaModels(url = OLLAMA_URL, timeoutMs = 1500) {
  * кладёт в промпт несколько тысяч токенов контекста плюс схемы инструментов —
  * с дефолтом контекст молча обрезался бы.
  */
-function localLlmSettingsYaml(models) {
+function localLlmSettingsYaml(models, root = OLLAMA_URL) {
   const names = models.length ? models.map((m) => m.name) : [LOCAL_MODEL]
+  // Адрес берётся из аргумента, а не из константы: если модель стоит за сервисом
+  // (день 30), маршрут обязан указывать на сервис — иначе ключ уедет не туда,
+  // а харнесс будет ходить мимо лимитов.
+  const base = String(root).replace(/\/+$/, '')
   const lines = [
     `# ${SETTINGS_BEGIN}`,
     'llm-pi-ai:',
@@ -2658,7 +2694,7 @@ function localLlmSettingsYaml(models) {
     `    ${LOCAL_PROVIDER}:`,
     '      displayName: Локальная модель (Ollama)',
     '      api: openai-completions',
-    `      baseURL: ${OLLAMA_URL}/v1`,
+    `      baseURL: ${base}/v1`,
     '      apiKeyEnv: OLLAMA_API_KEY',
     '      models:',
   ]
@@ -2678,9 +2714,9 @@ function localLlmSettingsYaml(models) {
  * YAML правим текстом, а не парсером: в dsh-term нет YAML-зависимостей, а блок
  * ограничен маркерами — так пользовательские настройки вне блока остаются как есть.
  */
-function writeLocalLlmSettings(dshHome, models) {
+function writeLocalLlmSettings(dshHome, models, root = OLLAMA_URL) {
   const path = join(dshHome, 'settings.yaml')
-  const block = localLlmSettingsYaml(models)
+  const block = localLlmSettingsYaml(models, root)
   const existing = readTextIfExists(path) ?? ''
   const start = existing.indexOf(SETTINGS_BEGIN)
   const end = existing.indexOf(SETTINGS_END)
@@ -3656,12 +3692,12 @@ async function main() {
   // по которой харнесс поднимает маршрут, и список моделей, которые видит Ollama.
   if (opts.llmCheck !== undefined) {
     const models = await ollamaModels(opts.ollamaUrl)
-    const yaml = localLlmSettingsYaml(models)
+    const yaml = localLlmSettingsYaml(models, opts.ollamaUrl ?? OLLAMA_URL)
     log.line(`${C.bold}llm-check${C.off} ${opts.ollamaUrl ?? OLLAMA_URL}`)
     log.dim(`  локальные модели: ${models.length ? models.map((m) => `${m.name} (${m.sizeGb} ГБ)`).join(', ') : 'Ollama не отвечает'}`)
     if (opts.dshHome) {
       try {
-        const path = writeLocalLlmSettings(opts.dshHome, models)
+        const path = writeLocalLlmSettings(opts.dshHome, models, opts.ollamaUrl ?? OLLAMA_URL)
         log.dim(`  записано в: ${path}`)
       } catch (e) {
         log.err(`  не удалось записать: ${e.message}`)
@@ -4014,7 +4050,7 @@ async function main() {
   const localModels = await ollamaModels()
   let llmSettingsPath = ''
   try {
-    llmSettingsPath = writeLocalLlmSettings(opts.dshHome, localModels)
+    llmSettingsPath = writeLocalLlmSettings(opts.dshHome, localModels, opts.ollamaUrl ?? OLLAMA_URL)
   } catch (e) {
     log.err(`не удалось записать маршрут локальной модели: ${e.message}`)
   }
