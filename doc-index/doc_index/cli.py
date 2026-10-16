@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 
 from .agent import HarnessAgent
@@ -19,6 +20,7 @@ from . import store
 from .chunk import build_chunks, chunk_stats
 from .collect import collect
 from .config import DEFAULT_OUT, DEFAULT_VAULT, Config
+from .project import context_block, docs_config
 from .embed import OllamaEmbedder
 from .evaluate import evaluate, load_questions, source_skew, write_report as write_eval_report
 from .indexer import build_index
@@ -41,22 +43,45 @@ def _items(value: str) -> list[str]:
 
 
 def _config(args: argparse.Namespace) -> Config:
+    """Настройки прогона: пресет корпуса + явные флаги поверх него.
+
+    `--project-docs` переключает корпус на документацию репозитория (день 31): другой
+    набор исключений, разрешённые скрытые каталоги и свой каталог индекса. Флаги
+    `--exclude`, `--allow`, `--suffix` позволяют уточнить пресет, не правя код.
+    """
+    vault = Path(args.vault).expanduser()
+    explicit_out = Path(args.out).expanduser() if args.out else None
     base = Config()
-    return Config(
-        vault=Path(args.vault).expanduser(),
-        out=Path(args.out).expanduser(),
+    if getattr(args, "project_docs", False):
+        base = docs_config(vault, explicit_out)
+    exclude = tuple(_items(args.exclude)) if args.exclude else base.exclude_dirs
+    allow = base.allow_dirs + tuple(_items(args.allow)) if args.allow else base.allow_dirs
+    suffixes = tuple(_items(args.suffix)) if args.suffix else base.suffixes
+    return replace(
+        base,
+        vault=vault,
+        out=explicit_out or base.out,
         model=args.model,
         fixed_size=args.fixed_size,
         fixed_overlap=args.fixed_overlap,
         structural_max=args.structural_max,
         structural_min=args.structural_min,
         batch_size=args.batch_size,
+        exclude_dirs=exclude,
+        allow_dirs=allow,
+        suffixes=suffixes,
     )
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--vault", default=str(DEFAULT_VAULT), help="каталог корпуса (хранилище Obsidian)")
-    parser.add_argument("--out", default=str(DEFAULT_OUT), help="каталог артефактов индекса")
+    parser.add_argument("--vault", default=str(DEFAULT_VAULT),
+                        help="каталог корпуса: хранилище Obsidian или репозиторий (--project-docs)")
+    parser.add_argument("--out", default="", help="каталог артефактов индекса")
+    parser.add_argument("--project-docs", action="store_true",
+                        help="корпус — документация проекта: README, docs, отчёты (день 31)")
+    parser.add_argument("--exclude", default="", help="каталоги-исключения через запятую (заменяют пресет)")
+    parser.add_argument("--allow", default="", help="скрытые каталоги, которые всё же нужны, через запятую")
+    parser.add_argument("--suffix", default="", help="расширения файлов корпуса через запятую (по умолчанию .md)")
     parser.add_argument("--model", default=Config().model, help="модель эмбеддингов в Ollama")
     parser.add_argument("--batch-size", type=int, default=Config().batch_size)
     parser.add_argument("--fixed-size", type=int, default=Config().fixed_size)
@@ -169,7 +194,10 @@ def _answerer(args: argparse.Namespace):
     работает с локальной моделью без агентского цикла.
     """
     if args.backend == "harness":
-        return HarnessAgent(model=args.llm_model, cwd=Path(args.out).expanduser())
+        # Рабочая папка агента — каталог артефактов: он же место, где лежат отчёты
+        # прогонов. Берём из разобранных настроек, потому что `--out` по умолчанию пуст
+        # (пустое значение означает «каталог по умолчанию или из пресета корпуса»).
+        return HarnessAgent(model=args.llm_model, cwd=_config(args).out)
     if args.backend == "local":
         from .llm import local_client
         return local_client(args.llm_model)
@@ -338,7 +366,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
     with _answerer(args) as agent:
         result = run_verification(questions, searcher, agent, filters=filters,
                                   judge=not args.no_judge, max_chars=args.max_chars,
-                                  min_dense=floor, topics=topics)
+                                  min_dense=floor, topics=topics,
+                                  project_context=context_block(Path(args.repo).expanduser())
+                                  if args.repo else "")
         path = write_verify_report(result, cfg.out, model=agent.model,
                                    strategy=args.strategy)
     summary = summarize_verification(result)
@@ -359,7 +389,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_brief(args: argparse.Namespace) -> int:
-    """Справка по базе: один ответ по шаблону (ответ, источники, цитаты) + проверка."""
+    """Справка по базе: один ответ по шаблону (ответ, источники, цитаты) + проверка.
+
+    С `--repo` в промпт добавляется живой контекст проекта (ветка, изменённые файлы):
+    так работает команда `/help` в dsh-term — вопросы о документации берутся из базы,
+    вопросы о текущем состоянии из git.
+    """
     cfg = _config(args)
     conn = store.connect(cfg.db_path())
     # Абсолютный порог здесь — только гейт отказа (`min_dense`), поэтому в фильтр
@@ -371,11 +406,13 @@ def cmd_brief(args: argparse.Namespace) -> int:
                       search_mode=args.search_mode, margin=margin,
                       min_dense=None, min_score=args.min_score,
                       min_keep=args.min_keep)
+    project_context = context_block(Path(args.repo).expanduser()) if args.repo else ""
     searcher = Searcher(conn, cfg, OllamaEmbedder(cfg), args.strategy)
     with _answerer(args) as agent:
         result = brief(searcher, agent, args.question, filters=filters,
                        max_chars=args.max_chars, min_dense=floor,
-                       topics=args.topics, judge=args.judge)
+                       topics=args.topics, judge=args.judge,
+                       project_context=project_context)
     print(format_brief(result))
     return 0
 
@@ -464,6 +501,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_brief)
     add_rag_flags(p_brief)
     p_brief.add_argument("question")
+    p_brief.add_argument("--repo", default="",
+                         help="путь к репозиторию: добавить в промпт живой контекст проекта (ветка, изменения)")
     p_brief.add_argument("--candidates", type=int, default=20, help="топ-K до фильтрации")
     p_brief.add_argument("--margin", type=float, default=0.04,
                          help="относительный порог фильтрации кандидатов")
@@ -486,6 +525,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_rag_flags(p_verify)
     p_verify.add_argument("--questions",
                           default=str(Path(__file__).resolve().parent.parent / "data" / "control-questions.yaml"))
+    p_verify.add_argument("--repo", default="",
+                          help="путь к репозиторию: добавить живой контекст проекта в каждый промпт (день 31)")
     p_verify.add_argument("--candidates", type=int, default=20, help="топ-K до фильтрации")
     p_verify.add_argument("--margin", type=float, default=0.04,
                           help="относительный порог фильтрации кандидатов")

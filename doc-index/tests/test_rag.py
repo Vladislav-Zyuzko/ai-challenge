@@ -12,14 +12,19 @@ from doc_index.rag import (  # noqa: E402
     RULES,
     WITHOUT_CONTEXT,
     WITH_CONTEXT,
+    answer_question,
     build_context,
     build_prompt,
 )
 
 HITS = [
-    {"source": "20_Понятия/11_Агентный_харнесс.md", "breadcrumb": "Понятия › Харнесс › Определение",
+    {"chunk_id": "structural:20_Понятия/11_Агентный_харнесс.md#0001",
+     "source": "20_Понятия/11_Агентный_харнесс.md", "breadcrumb": "Понятия › Харнесс › Определение",
+     "section": "Определение", "start_line": 7, "end_line": 9,
      "text": "Харнесс организует цикл агента.", "rank": 1},
-    {"source": "20_Понятия/06_Цикл_агента.md", "breadcrumb": "Понятия › Цикл агента › Определение",
+    {"chunk_id": "structural:20_Понятия/06_Цикл_агента.md#0002",
+     "source": "20_Понятия/06_Цикл_агента.md", "breadcrumb": "Понятия › Цикл агента › Определение",
+     "section": "Определение", "start_line": 3, "end_line": 5,
      "text": "Цикл: думай, действуй, наблюдай.", "rank": 2},
 ]
 
@@ -85,6 +90,74 @@ class JudgeTest(unittest.TestCase):
 
     def test_без_оценки_возвращается_none(self) -> None:
         self.assertIsNone(parse_judgement("не могу оценить"))
+
+
+class ProjectContextPromptTest(unittest.TestCase):
+    """Живой контекст проекта (день 31): блок git и правило к нему."""
+
+    CONTEXT = ("КОНТЕКТ ПРОЕКТА (данные git, не из документации):\n"
+               "- ветка: week7/day31 · HEAD abc1234 · последний коммит\n"
+               "- рабочее дерево чистое")
+
+    def test_context_block_goes_into_prompt(self):
+        prompt = build_prompt("какая сейчас ветка?", HITS, strict=True,
+                              project_context=self.CONTEXT)
+        self.assertIn("КОНТЕКТ ПРОЕКТА", prompt)
+        self.assertIn("week7/day31", prompt)
+
+    def test_rule_allows_answering_without_citations(self):
+        """Без этого правила строгий контракт заставляет отвечать «Не знаю» на вопрос
+        о ветке: во фрагментах базы ветки нет."""
+        prompt = build_prompt("какая сейчас ветка?", HITS, strict=True,
+                              project_context=self.CONTEXT)
+        self.assertIn("не документация", prompt)
+        self.assertIn("НЕ добавляй блоки ИСТОЧНИКИ и ЦИТАТЫ", prompt)
+
+    def test_without_context_no_extra_rule(self):
+        prompt = build_prompt("какая сейчас ветка?", HITS, strict=True)
+        self.assertNotIn("КОНТЕКТ ПРОЕКТА", prompt)
+        self.assertNotIn("не документация", prompt)
+
+    def test_context_block_is_last_before_question(self):
+        prompt = build_prompt("вопрос", HITS, strict=True, project_context=self.CONTEXT)
+        self.assertLess(prompt.index("КОНТЕКТ ПРОЕКТА"), prompt.index("ВОПРОС: вопрос"))
+        self.assertGreater(prompt.index("ФРАГМЕНТЫ БАЗЫ ЗНАНИЙ"), 0)
+
+
+class ThresholdGateWithProjectTest(unittest.TestCase):
+    """Гейт отказа и живой контекст проекта."""
+
+    class Agent:
+        model = "заглушка"
+        calls = 0
+
+        def ask(self, prompt):
+            self.calls += 1
+            from doc_index.agent import AgentReply
+            return AgentReply(text="ветка: week7/day31", seconds=0.1, finish_reason="stop")
+
+    def weak_hits(self):
+        return [{"source": "docs/x.md", "breadcrumb": "x", "text": "не по теме",
+                 "rank": 1, "dense_score": 0.1, "chunk_id": "x#0001"}]
+
+    def test_gate_refuses_without_project_context(self):
+        """Слабый поиск без контекста проекта — отказ без вызова модели (день 24)."""
+        agent = self.Agent()
+        answer = answer_question(agent, "вопрос", question_id="q", mode="rag",
+                                 hits=self.weak_hits(), min_dense=0.5)
+        self.assertTrue(answer.refused)
+        self.assertEqual(agent.calls, 0)
+
+    def test_gate_lets_question_through_with_project_context(self):
+        """С контекстом проекта вопрос доходит до модели: «какая сейчас ветка» по
+        документации не ищется, и гейт отказал бы, не спросив модель."""
+        agent = self.Agent()
+        answer = answer_question(agent, "какая сейчас ветка?", question_id="q", mode="rag",
+                                 hits=self.weak_hits(), min_dense=0.5,
+                                 project_context="КОНТЕКТ ПРОЕКТА:\n- ветка: main")
+        self.assertFalse(answer.refused)
+        self.assertEqual(agent.calls, 1)
+        self.assertIn("ветка: week7/day31", answer.answer)
 
 
 class ControlTest(unittest.TestCase):

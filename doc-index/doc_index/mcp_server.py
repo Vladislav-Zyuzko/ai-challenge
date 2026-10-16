@@ -13,6 +13,11 @@
 лучшего результата → фрагменты с источником и строками. Никакой второй логики
 поиска здесь нет — модуль только оборачивает её в MCP.
 
+День 31 добавил вторую группу инструментов — **контекст проекта** (`--repo <путь>`):
+ветка, изменённые файлы, diff и список файлов. Это не то же самое, что удалённый
+репозиторий на GitHub (там видны ветки и PR, но не рабочее дерево): текущую ветку и
+незакоммиченные правки знает только локальный git.
+
 Поток stdout занят протоколом, поэтому все сообщения уходят в stderr.
 """
 from __future__ import annotations
@@ -25,6 +30,12 @@ from pathlib import Path
 
 from .config import Config
 from .embed import OllamaEmbedder
+# Импорты с префиксом: инструменты MCP называются так же (`git_branch`), и без
+# префикса вложенная функция затеняла бы импортированную — получилась бы рекурсия.
+from .project import RepoError, list_files as repo_files
+from .project import git_branch as repo_branch
+from .project import git_diff as repo_diff
+from .project import git_status as repo_status
 from .rerank import threshold_filter
 from .rewrite import expand_abbreviations, multi_query_search
 from .search import Searcher
@@ -67,12 +78,20 @@ class SearchOutcome:
 
 @dataclass
 class KnowledgeBase:
-    """Одна база знаний: каталог doc-index со своим индексом и настройками поиска."""
+    """Одна база знаний: свой индекс и настройки поиска.
+
+    `root` — каталог, рядом с которым лежит индекс (`<root>/out`) и откуда запускается
+    CLI. Для хранилища Obsidian это один и тот же каталог `doc-index`. Для корпуса
+    проекта (день 31) они расходятся: пакет `doc_index` живёт в `doc-index`, а индекс
+    документации проекта — в `project-index/out`. Поэтому каталог индекса можно задать
+    отдельно (`out`), иначе поиск пошёл бы в индекс другого корпуса.
+    """
 
     name: str
     root: Path
     title: str = ""
     what: str = ""
+    out: Path | None = None
     strategy: str = DEFAULT_STRATEGY
     margin: float | None = DEFAULT_MARGIN
     min_keep: int = DEFAULT_MIN_KEEP
@@ -84,7 +103,7 @@ class KnowledgeBase:
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def config(self) -> Config:
-        return Config(out=self.root / "out")
+        return Config(out=self.out or (self.root / "out"))
 
     @property
     def search_ready(self) -> bool:
@@ -210,8 +229,14 @@ def new_server():
         return FastMCP(name="rag", instructions=INSTRUCTIONS)
 
 
-def build_server(bases: list[KnowledgeBase], *, default_k: int = DEFAULT_K):
-    """MCP-сервер с инструментами поиска. Импорт SDK внутри: модуль не обязателен."""
+def build_server(bases: list[KnowledgeBase], *, default_k: int = DEFAULT_K,
+                 repo: Path | None = None):
+    """MCP-сервер с инструментами поиска и (если задан `--repo`) контекста проекта.
+
+    Импорт SDK внутри: модуль не обязателен. Инструменты проекта регистрируются только
+    при `--repo`, чтобы в обычной сессии с базой знаний не появлялось лишних описаний,
+    которые занимают контекст (цена инструментов измерена в дне 16).
+    """
     server = new_server()
     by_name = {base.name: base for base in bases}
     listing = "; ".join(base.name for base in bases) or "нет баз"
@@ -248,6 +273,59 @@ def build_server(bases: list[KnowledgeBase], *, default_k: int = DEFAULT_K):
             return "Базы знаний не подключены: сессия запущена без --rag."
         return "\n".join(f"- {base.describe()}" for base in bases)
 
+    if repo is not None:
+        project = Path(repo).expanduser().resolve()
+
+        def _fail(exc: RepoError) -> str:
+            return f"Контекст проекта недоступен: {exc}"
+
+        @server.tool(description="Текущая ветка и последний коммит локального репозитория проекта")
+        def git_branch() -> str:
+            """Где сейчас работает проект: ветка, HEAD и тема последнего коммита."""
+            try:
+                got = repo_branch(project)
+            except RepoError as exc:
+                return _fail(exc)
+            where = "отделённый HEAD" if got["detached"] else got["branch"]
+            return (f"ветка: {where} · HEAD {got['head']}\n"
+                    f"последний коммит: {got['subject']} ({got['committed_at']})")
+
+        @server.tool(description="Изменённые, новые и удалённые файлы в рабочем дереве проекта")
+        def git_status() -> str:
+            """Что не закоммичено прямо сейчас."""
+            try:
+                got = repo_status(project)
+            except RepoError as exc:
+                return _fail(exc)
+            if not got["count"]:
+                return "рабочее дерево чистое: незакоммиченных изменений нет"
+            lines = [f"изменено файлов: {got['count']}"]
+            lines += [f"- {item['code'] or '??'} {item['path']}" for item in got["changed"][:40]]
+            if got["count"] > 40:
+                lines.append(f"- … ещё {got['count'] - 40}")
+            return "\n".join(lines)
+
+        @server.tool(description="Статистика изменений в проекте (файлы и строки), без полного diff")
+        def git_diff() -> str:
+            """Что именно затронуто — по файлам, а не построчно."""
+            try:
+                got = repo_diff(project, stat_only=True)
+            except RepoError as exc:
+                return _fail(exc)
+            return got["text"] or "изменений нет"
+
+        @server.tool(description="Список файлов проекта под контролем git (можно фильтровать подстрокой)")
+        def project_files(pattern: str = "", limit: int = 60) -> str:
+            """Где что лежит: список файлов без мусора из .gitignore."""
+            try:
+                got = repo_files(project, pattern=pattern, limit=max(1, min(limit, 200)))
+            except RepoError as exc:
+                return _fail(exc)
+            if not got["files"]:
+                return f"файлы не найдены (фильтр: {pattern!r})" if pattern else "файлов нет"
+            head = f"файлов по фильтру {pattern!r}: {got['total']}" if pattern else f"файлов в проекте: {got['total']}"
+            return "\n".join([head, *[f"- {path}" for path in got["files"]]])
+
     return server
 
 
@@ -256,6 +334,9 @@ def main(argv: list[str] | None = None) -> int:
                                      description="MCP-сервер поиска по базам знаний")
     parser.add_argument("--base", action="append", default=[], type=parse_base,
                         metavar="ИМЯ=ПУТЬ", help="каталог doc-index (повторяемый)")
+    parser.add_argument("--base-out", action="append", default=[],
+                        metavar="ИМЯ=ПУТЬ",
+                        help="каталог индекса базы, если он не <путь>/out (повторяемый)")
     parser.add_argument("--title", action="append", default=[],
                         help="название базы в формате имя=заголовок (необязательно)")
     parser.add_argument("--what", action="append", default=[],
@@ -273,6 +354,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="не раскрывать аббревиатуры словарём перед поиском")
     parser.add_argument("--candidates", type=int, default=DEFAULT_CANDIDATES,
                         help="сколько кандидатов брать до фильтрации")
+    parser.add_argument("--repo", default="",
+                        help="путь к локальному репозиторию: включить инструменты контекста проекта")
     args = parser.parse_args(argv)
 
     def pairs(values: list[str]) -> dict[str, str]:
@@ -284,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
         return out
 
     titles, whats = pairs(args.title), pairs(args.what)
+    outs = {name: Path(path).expanduser() for name, path in pairs(args.base_out).items()}
     # `--no-filter` и «0» дают одно и то же — фильтра нет. Ноль здесь не «порог ноль»
     # (маржа 0 оставила бы только лучший фрагмент), а именно выключенный порог:
     # так удобнее сравнивать режимы одной командой.
@@ -295,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         min_keep = args.min_keep
     bases = [
         KnowledgeBase(name=name, root=root, title=titles.get(name, ""), what=whats.get(name, ""),
-                      strategy=args.strategy, margin=margin,
+                      out=outs.get(name), strategy=args.strategy, margin=margin,
                       min_dense=min_dense, expand=not args.no_expand,
                       min_keep=min_keep, candidates=args.candidates)
         for name, root in args.base
@@ -305,11 +389,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(f"rag: базы {', '.join(b.name for b in bases)} · стратегия {args.strategy} · "
           f"маржа {margin} · пол {min_dense} · мин.фрагментов {min_keep} · "
-          f"раскрытие {'выкл' if args.no_expand else 'вкл'}", file=sys.stderr, flush=True)
+          f"раскрытие {'выкл' if args.no_expand else 'вкл'}"
+          + (f" · проект {Path(args.repo).expanduser()}" if args.repo else ""),
+          file=sys.stderr, flush=True)
     # Интерпретатор печатаем намеренно: сервер запускает харнесс, а не пользователь,
     # и при расхождении версий или путей именно эта строка показывает, кто запущен.
     print(f"rag: python {sys.executable} · {sys.version.split()[0]}", file=sys.stderr, flush=True)
-    build_server(bases).run("stdio")
+    build_server(bases, repo=Path(args.repo) if args.repo else None).run("stdio")
     return 0
 
 

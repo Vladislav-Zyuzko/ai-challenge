@@ -199,6 +199,44 @@ python -m doc_index.chat_scenarios out/chat-*.json --no-judge    # только 
 
 Отчёт: `out/chat-scenarios.md` + `out/chat-scenarios.json`.
 
+## Документация проекта как корпус (день 31)
+
+Тот же пайплайн работает не только на хранилище Obsidian: корпусом может быть репозиторий.
+Для этого в настройках корпуса появились исключения, фильтр расширений и разрешённые скрытые
+каталоги, а индекс кладётся отдельно от индекса хранилища.
+
+```powershell
+# индекс документации проекта: README, docs, отчёты по дням, правила и скиллы
+python -m doc_index index --project-docs --vault . --strategy structural,fixed
+python -m doc_index search "как собрать индекс" --project-docs --vault . --strategy structural
+
+# справка с живым контекстом проекта: к документации добавляются данные git
+python -m doc_index brief "какая сейчас ветка?" --strategy structural --repo . `
+  --out project-index/out --backend local --llm-model qwen3:8b
+
+# проверка набора вопросов о проекте
+python -m doc_index verify --questions data/project-questions.yaml --strategy structural `
+  --out project-index/out --no-judge
+```
+
+Что попадает в корпус, задаётся явно: `--exclude` (например `node_modules`, `.venv`, `models`),
+`--allow` для скрытых каталогов-документации (`.dsh/SKILLS`, `.dsh/.harness`) и `--suffix`
+(по умолчанию только `.md`). Код в корпус не входит намеренно: отчёты и README описывают
+проект словами, а поиск по исходникам отвечает на другие вопросы и добавляет шума.
+
+MCP-сервер умеет отдавать не только поиск, но и контекст проекта — при запуске с `--repo`:
+
+| Инструмент | Что отдаёт |
+|---|---|
+| `git_branch` | текущая ветка, HEAD, тема последнего коммита |
+| `git_status` | изменённые, новые и удалённые файлы рабочего дерева |
+| `git_diff` | статистика изменений (read-only, вывод обрезается) |
+| `project_files` | список файлов под контролем git, с фильтром по подстроке |
+
+Git читается локально, а не через GitHub: удалённый сервер знает ветки и PR на GitHub, но не
+рабочее дерево — какая ветка выкачана сейчас и что не закоммичено, знает только локальный git.
+Разрешены только read-only подкоманды из белого списка.
+
 ## Тесты
 
 ```powershell

@@ -1,4 +1,4 @@
-"""Сбор корпуса: обход хранилища Obsidian, frontmatter, чистка разметки.
+"""Сбор корпуса: обход каталога, frontmatter, чистка разметки.
 
 Две вещи, которые здесь важны:
 
@@ -8,6 +8,10 @@
 2. **Чистится только то, что мешает эмбеддингу.** Wikilinks и вложения Obsidian
    в векторе бесполезны (это синтаксис, а не смысл), а callout'ы — обычный текст
    с украшением. Код-блоки и таблицы остаются как есть.
+
+Корпусом может быть не только хранилище Obsidian: для корпуса проекта (день 31) те же
+правила работают внутри репозитория — какие каталоги и расширения брать, задаётся
+настройками `Config`.
 """
 from __future__ import annotations
 
@@ -17,7 +21,7 @@ from pathlib import Path
 
 import yaml
 
-from .config import Config, EXCLUDE_DIRS, folder_label
+from .config import Config, folder_label
 
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.S)
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -141,19 +145,39 @@ def parse_note(path: Path, root: Path) -> Note:
 
 
 def collect(cfg: Config) -> tuple[list[Note], list[str]]:
-    """Все заметки хранилища. Возвращает (заметки, пропущенные пути)."""
+    """Все заметки корпуса. Возвращает (заметки, пропущенные пути).
+
+    Что попадает в корпус, задаётся настройками (`suffixes`, `exclude_dirs`,
+    `allow_dirs`, `max_file_bytes`): хранилище Obsidian — это только markdown без
+    служебных папок, а корпус проекта — это README, docs и отчёты внутри репозитория,
+    где рядом лежат `node_modules`, `.venv` и артефакты моделей.
+    """
     root = cfg.vault
     if not root.is_dir():
         raise FileNotFoundError(f"нет каталога корпуса: {root}")
     notes: list[Note] = []
     skipped: list[str] = []
-    for path in sorted(root.rglob("*.md")):
-        rel_parts = path.relative_to(root).parts
-        if any(part in EXCLUDE_DIRS or part.startswith(".") for part in rel_parts):
-            skipped.append(path.relative_to(root).as_posix())
+    paths: set[Path] = set()
+    for suffix in cfg.suffixes:
+        paths.update(root.rglob(f"*{suffix}"))
+    for path in sorted(paths):
+        rel = path.relative_to(root)
+        rel_posix = rel.as_posix()
+        parts = rel.parts
+        allowed = any(rel_posix.startswith(prefix) for prefix in cfg.allow_dirs)
+        if any(part in cfg.exclude_dirs for part in parts):
+            skipped.append(rel_posix)
             continue
-        if path.stat().st_size == 0:
-            skipped.append(path.relative_to(root).as_posix())
+        # Скрытые каталоги — почти всегда служебные (`.git`, `.venv`, `.pytest_cache`),
+        # но документацию проекта можно вернуть явно через `allow_dirs`.
+        if not allowed and any(part.startswith(".") for part in parts[:-1]):
+            skipped.append(rel_posix)
+            continue
+        size = path.stat().st_size
+        # Пустые файлы бесполезны, а гиганты (например `tokenizer.json` на 16 МБ)
+        # съели бы бюджет эмбеддингов целиком.
+        if size == 0 or size > cfg.max_file_bytes:
+            skipped.append(rel_posix)
             continue
         notes.append(parse_note(path, root))
     return notes, skipped

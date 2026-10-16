@@ -58,8 +58,13 @@ class VerifyRow:
 def run_verification(questions: list[dict], searcher: Searcher, agent: Answerer, *,
                      filters: Filters | None = None, judge: bool = True,
                      max_chars: int = 6000, min_dense: float | None = 0.5,
-                     topics: str = "", verbose: bool = True) -> dict:
-    """Прогон набора в строгом режиме со всеми проверками дня 24."""
+                     topics: str = "", verbose: bool = True,
+                     project_context: str = "") -> dict:
+    """Прогон набора в строгом режиме со всеми проверками дня 24.
+
+    `project_context` (день 31) добавляет в каждый промпт живой контекст проекта:
+    так проверяется не только база документации, но и команда `/help` с её данными git.
+    """
     filters = filters or Filters()
     entries: list[dict] = []
     for item in questions:
@@ -71,7 +76,7 @@ def run_verification(questions: list[dict], searcher: Searcher, agent: Answerer,
         reply = answer_question(
             agent, item["question"], question_id=item["id"], mode="rag",
             hits=got.context_hits, max_chars=max_chars, strict=True,
-            min_dense=min_dense, topics=topics,
+            min_dense=min_dense, topics=topics, project_context=project_context,
         )
         after = _usage(agent)
         parsed: ParsedAnswer = parse_answer(reply.answer)
@@ -196,19 +201,24 @@ def summarize(result: dict) -> dict:
 
 def brief(searcher: Searcher, agent: Answerer, question: str, *, filters: Filters | None = None,
           max_chars: int = 6000, min_dense: float | None = 0.5, topics: str = "",
-          judge: bool = False) -> dict:
+          judge: bool = False, project_context: str = "") -> dict:
     """Справка по базе для одного вопроса: строгий ответ + машинная проверка.
 
     Это тот же путь, что в `verify`, но без набора и без статистики: нужен один
     ответ фиксированной формы и вердикт, не выдуманы ли источники и цитаты.
     Судья по умолчанию выключен — в интерактивной команде важнее скорость, а
     дословность и реальность источников проверяются кодом.
+
+    `project_context` — блок живого контекста проекта (ветка, изменения) для команды
+    `/help`: он идёт в промпт отдельным блоком и помечается как данные git, чтобы
+    модель не искала ветку в документации и не путала её с фрагментами базы.
     """
     filters = filters or Filters()
     got = retrieve(searcher, question, pipeline="threshold", filters=filters)
     reply = answer_question(agent, question, question_id="brief", mode="rag",
                             hits=got.context_hits, max_chars=max_chars, strict=True,
-                            min_dense=min_dense, topics=topics)
+                            min_dense=min_dense, topics=topics,
+                            project_context=project_context)
     parsed = parse_answer(reply.answer)
     refused = reply.refused or parsed.refusal
     check = QuoteCheck() if refused else check_citations(parsed, got.context_hits)
@@ -233,6 +243,7 @@ def brief(searcher: Searcher, agent: Answerer, question: str, *, filters: Filter
         "context_fragments": len(got.context_hits),
         "sources": [hit["source"] for hit in got.hits],
         "seconds": round(reply.seconds, 2),
+        "project_context": project_context,
     }
 
 
@@ -245,7 +256,12 @@ def format_brief(result: dict) -> str:
     """
     parsed: ParsedAnswer = result["parsed"]
     check: QuoteCheck = result["check"]
-    lines: list[str] = ["## ОТВЕТ", ""]
+    lines: list[str] = []
+    # Контекст проекта печатаем до ответа: видно, какие данные git ушли в промпт,
+    # и понятно, почему на вопрос про ветку в ответе нет ссылок на документацию.
+    if result.get("project_context"):
+        lines.extend(["## КОНТЕКСТ ПРОЕКТА", "", "```", result["project_context"], "```", ""])
+    lines.extend(["## ОТВЕТ", ""])
     lines.append((parsed.answer or result["answer"]).strip())
     lines.append("")
 
