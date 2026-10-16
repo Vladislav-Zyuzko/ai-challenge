@@ -30,7 +30,7 @@ from .config import Config
 PROJECT_EXCLUDES = (
     ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
     "out", "models", ".dsh-scratch", "dist", "build", ".mypy_cache", ".ruff_cache",
-    "project-index",
+    "project-index", "project-code-index",
 )
 # Документация проекта, которая лежит в скрытых каталогах.
 PROJECT_ALLOW = (".dsh/SKILLS", ".dsh/.harness")
@@ -38,6 +38,12 @@ PROJECT_ALLOW = (".dsh/SKILLS", ".dsh/.harness")
 # Что считаем документацией. Код в корпус не идёт: отчёты и README описывают проект
 # словами, а поиск по исходникам отвечает на другие вопросы и добавляет шума.
 PROJECT_SUFFIXES = (".md",)
+
+# Корпус кода (день 32) нужен ревьюверу: он ищет похожие места и конвенции там, где
+# документация молчит. Это отдельная база, а не расширение документации: смешивать
+# README с исходниками в одном индексе значит размывать обе выдачи.
+PROJECT_CODE_SUFFIXES = (".py", ".mjs", ".cjs", ".js", ".ts", ".ps1", ".yaml", ".yml")
+PROJECT_CODE_NAMES = ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock")
 
 
 def docs_config(repo: Path, out: Path | None = None) -> Config:
@@ -47,8 +53,22 @@ def docs_config(repo: Path, out: Path | None = None) -> Config:
         vault=repo,
         out=(Path(out) if out else repo / "project-index" / "out").expanduser(),
         exclude_dirs=PROJECT_EXCLUDES,
+        exclude_names=PROJECT_CODE_NAMES,
         allow_dirs=PROJECT_ALLOW,
         suffixes=PROJECT_SUFFIXES,
+    )
+
+
+def code_config(repo: Path, out: Path | None = None) -> Config:
+    """Настройки корпуса «код проекта»: исходники, конфиги и правила харнесса."""
+    repo = Path(repo).expanduser().resolve()
+    return Config(
+        vault=repo,
+        out=(Path(out) if out else repo / "project-code-index" / "out").expanduser(),
+        exclude_dirs=PROJECT_EXCLUDES,
+        exclude_names=PROJECT_CODE_NAMES,
+        allow_dirs=PROJECT_ALLOW,
+        suffixes=PROJECT_CODE_SUFFIXES,
     )
 
 

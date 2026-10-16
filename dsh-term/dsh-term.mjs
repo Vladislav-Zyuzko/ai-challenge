@@ -21,6 +21,24 @@ import { request as httpsRequest } from 'node:https'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+// Детерминированная часть ревью PR (день 32) живёт в модуле: её проверяют тесты без
+// модели и без GitHub, а работа с gh приходит туда адаптером.
+import {
+  REVIEW_AGENT,
+  REVIEW_BASES,
+  REVIEW_BEGIN,
+  REVIEW_END,
+  REVIEW_MARK,
+  alreadyReviewed,
+  buildReviewPrompt,
+  countBySeverity,
+  extractBetween,
+  parseFindings,
+  parseGhJson,
+  postReviewComments,
+  resolveReviewTarget,
+  reviewPaths,
+} from './lib/review.mjs'
 
 // ---------- ANSI ----------
 // Режим цвета определяется ДО первого использования палитр: `--color <auto|always|never>`
@@ -1413,7 +1431,8 @@ const COMMANDS = [
   { name: 'resume', usage: '/resume [id]', desc: 'продолжить сессию: по id или выбором из списка' },
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
   { name: 'token', usage: '/token', desc: 'сменить сохранённый DEEPSEEK API ключ' },
-  { name: 'publish-day', usage: '/publish-day', desc: 'git+gh: коммит → push → PR day→week (по SKILLS)' },
+  { name: 'publish-day', usage: '/publish-day [--no-review]', desc: 'git+gh: коммит → push → PR day→week → ревью (по SKILLS)' },
+  { name: 'review-pr', usage: '/review-pr [<номер|ссылка|ветка>] [--force] [--dry-run]', desc: 'ревью PR локальным агентом: комментарии с тегом в самом PR' },
   { name: 'create-project', usage: '/create-project [что строим] [--check <path>]', desc: 'сессия архитектора проекта: опросник → .project-harness → инструменты → ноды' },
   { name: 'task-from-figma', usage: '/task-from-figma <ОЧЕРЕДЬ> <ссылка|текст>', desc: 'скилл: задача в указанной очереди по кадру Figma (нужны --mcp figma --mcp sltracker)' },
   { name: 'exit', usage: '/exit', desc: 'завершить dsh-term (или Ctrl+C)' },
@@ -3614,7 +3633,7 @@ async function taskFromFigma(opts, parts, promptTurnFn, state) {
  * /publish-day — публикация дня по SKILLS: коммит на ветке дня → push → PR в
  * ветку недели с описанием. Детерминированный клиентский макрос (git/gh).
  */
-async function publishDay(workspace) {
+async function publishDay(workspace, opts = {}) {
   log.line(`${C.bold}/publish-day${C.off}: коммит → push → PR (${C.cyan}day → week${C.off}), по ${C.bold}.dsh/SKILLS${C.off}`)
   const repo = runGit(['-C', workspace, 'rev-parse', '--is-inside-work-tree'])
   if (!repo.ok || repo.out !== 'true') {
@@ -3689,6 +3708,119 @@ async function publishDay(workspace) {
     return
   }
   log.ok(`PR: ${pr.out}`)
+
+  // Завершающая фаза публикации — ревью (день 32): после открытия PR поднимается
+  // локальный агент-ревьювер и оставляет комментарии в том же PR. Ошибка ревью PR
+  // не отменяет: публикация уже состоялась.
+  const created = /\/pull\/(\d+)/.exec(pr.out || '')
+  if (created && !opts?.noReview) {
+    log.line('')
+    await runReviewPr(opts, created[1], {})
+  }
+}
+
+// ---------- Ревью PR (день 32) ------------------------------------------------
+// Агент-ревьювер работает локально: PR открывает наш же макрос публикации, после чего
+// поднимается отдельная сессия dsh-term (`-p`) с чистым контекстом — она читает diff,
+// ищет по базам RAG (документация и код) и возвращает текст ревью.
+//
+// Почему не GitHub Action: у агента локальный харнесс, локальные базы RAG и доступ к
+// Ollama — раннер GitHub до них не дотянется. Триггером служит наша публикация.
+//
+// Здесь остаётся только оркестрация: разбор PR, сборка промпта, разбор ответа агента и
+// раскладка комментариев живут в `lib/review.mjs` — их можно проверить тестами без
+// модели и без GitHub (gh туда приходит адаптером).
+const REVIEW_MODEL = process.env.DSH_TERM_REVIEW_MODEL || 'deepseek-v4-flash'
+const REVIEW_TIMEOUT_MS = 20 * 60 * 1000
+
+/** Адаптер gh для модуля ревью: та же обёртка, что использует публикация. */
+function ghAdapter(workspace) {
+  return (args) => runGh(args, workspace)
+}
+
+/** Полный цикл ревью: найти PR → собрать данные → локальный агент → комментарии. */
+async function runReviewPr(opts, arg, { force = false, dryRun = false } = {}) {
+  const workspace = opts.workspace
+  const gh = ghAdapter(workspace)
+  log.line(`${C.bold}/review-pr${C.off}: ревью агентом ${C.cyan}${REVIEW_AGENT}${C.off} (локально, ${REVIEW_MODEL})`)
+  const branch = runGit(['-C', workspace, 'branch', '--show-current']).out
+  const target = resolveReviewTarget({ arg, branch, gh })
+  if (target.error) {
+    log.err(`review-pr: ${target.error}`)
+    return
+  }
+  const pr = target.pr
+  log.dim(`PR #${pr.number}: ${pr.title}`)
+  log.dim(`ветки: ${pr.headRefName} → ${pr.baseRefName} · файлов ${(pr.files ?? []).length} · +${pr.additions}/-${pr.deletions}`)
+  if (!force && alreadyReviewed({ number: pr.number, gh })) {
+    log.line(`ревью уже опубликовано (${REVIEW_MARK}) — повтор: /review-pr ${pr.number} --force`)
+    return
+  }
+
+  const paths = reviewPaths(workspace, pr.number, join)
+  mkdirSync(paths.dir, { recursive: true })
+  const diffRun = runGh(['pr', 'diff', String(pr.number)], workspace)
+  if (!diffRun.ok) {
+    log.err(`review-pr: gh pr diff — ${diffRun.err}`)
+    return
+  }
+  writeFileSync(paths.diff, diffRun.out, 'utf8')
+  writeFileSync(paths.files, JSON.stringify(pr.files ?? [], null, 1), 'utf8')
+  const prompt = buildReviewPrompt({ workspace, pr, diff: diffRun.out, paths })
+  writeFileSync(paths.prompt, prompt, 'utf8')
+  log.dim(`данные: ${paths.dir} (diff ${diffRun.out.length} символов)`)
+
+  if (dryRun) {
+    log.line('dry-run: агент не запускается, комментарии не публикуются')
+    log.dim(`промпт: ${paths.prompt}`)
+    return
+  }
+
+  log.line('запускаю локального ревьювера (отдельная сессия с чистым контекстом)…')
+  const started = Date.now()
+  const run = spawnSync(process.execPath, [process.argv[1], '-p', prompt,
+    '--rag', REVIEW_BASES[0], '--rag', REVIEW_BASES[1],
+    '--provider', 'deepseek-official', '--model', REVIEW_MODEL,
+    '--auto-approve', '--workspace', workspace], {
+    cwd: workspace,
+    encoding: 'utf8',
+    timeout: REVIEW_TIMEOUT_MS,
+    maxBuffer: 32 * 1024 * 1024,
+    env: { ...process.env, NO_COLOR: '1' },
+  })
+  const raw = `${run.stdout ?? ''}\n${run.stderr ?? ''}`
+  writeFileSync(paths.raw, raw, 'utf8')
+  const seconds = Math.round((Date.now() - started) / 1000)
+  if (run.error) {
+    log.err(`review-pr: ревьювер не запустился — ${run.error.message}`)
+    return
+  }
+  const reviewText = extractBetween(raw, REVIEW_BEGIN, REVIEW_END)
+  if (!reviewText) {
+    log.err('review-pr: агент не вернул текст между маркерами — ревью не опубликовано')
+    log.dim(`сырой вывод сохранён: ${paths.raw}`)
+    return
+  }
+  writeFileSync(paths.review, `${reviewText}\n`, 'utf8')
+  const parsed = parseFindings(raw)
+  if (parsed.error) log.dim(`замечания не разобраны (${parsed.error}) — останутся в сводке`)
+
+  const repo = parseGhJson(gh(['repo', 'view', '--json', 'nameWithOwner']))
+  const slug = repo.ok ? repo.data.nameWithOwner : ''
+  const result = postReviewComments({
+    number: pr.number, reviewText, findings: parsed.findings, paths, gh, slug,
+    write: (target, text) => writeFileSync(target, text, 'utf8'),
+  })
+  if (!result.posted) {
+    log.err(`review-pr: комментарий не опубликован — ${result.error ?? 'gh ответил ошибкой'}`)
+    log.dim(`готовый текст: ${paths.comment}`)
+    return
+  }
+  const counts = countBySeverity(parsed.findings)
+  log.ok(`ревью опубликовано: ${pr.url} (${seconds} с)`)
+  log.dim(`замечаний: blocker ${counts.blocker} · major ${counts.major} · minor ${counts.minor}`
+    + ` · построчно ${result.inline} из ${result.planned}`)
+  log.dim(`артефакты: ${paths.dir}`)
 }
 
 // ---------- main ----------
@@ -3755,7 +3887,10 @@ async function main() {
     log.line('  /rag-brief <вопрос>  справка по базе по шаблону: ОТВЕТ + ИСТОЧНИКИ + ЦИТАТЫ')
     log.line('                идёт мимо агента, формат и проверка цитат гарантированы кодом')
     log.line('  /model [имя|show]  модель сессии: облачные DeepSeek и локальная LLM (Ollama)')
-    log.line('  /publish-day  git+gh: коммит → push → PR day→week (по .dsh/SKILLS)')
+    log.line('  /publish-day [--no-review]  git+gh: коммит → push → PR day→week → ревью агентом (по .dsh/SKILLS)')
+    log.line('  /review-pr [<номер|ссылка|ветка>] [--force] [--dry-run]')
+    log.line('                ревью PR локальным агентом: diff + RAG (документация и код),')
+    log.line('                комментарии с тегом агента прямо в PR (--dry-run — без агента и публикации)')
     log.line('  /create-project [что строим]  сессия архитектора проекта: опросник → .project-harness')
     log.line('                → гейт инструментов → ноды (по .dsh/SKILLS/create-project.md)')
     log.line('                --check <path> — только диагностика: состояние отчётов по пути')
@@ -5438,7 +5573,16 @@ async function main() {
         break
       }
       case 'publish-day': {
-        await publishDay(opts.workspace)
+        await publishDay(opts.workspace, { ...opts, noReview: parts.includes('--no-review') })
+        break
+      }
+      case 'review-pr': {
+        // Ревью PR локальным агентом: /review-pr [<номер|ссылка|ветка>] [--force] [--dry-run]
+        const tail = parts.slice(1)
+        const force = tail.includes('--force')
+        const dryRun = tail.includes('--dry-run')
+        const ref = tail.filter((t) => !t.startsWith('--')).join(' ').trim()
+        await runReviewPr(opts, ref, { force, dryRun })
         break
       }
       case 'create-project': {
