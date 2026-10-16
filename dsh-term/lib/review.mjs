@@ -220,7 +220,11 @@ export function patchPositions(patchText) {
       continue
     }
     if (line.startsWith('+++ b/')) {
-      path = line.slice(6).trim()
+      // git берёт путь в кавычки, если в нём есть пробелы или не-ASCII: `+++ b/"мой файл.py"`.
+      // Без снятия кавычек такой путь не совпадёт с путём из замечания ревьювера.
+      let raw = line.slice(6).trim()
+      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1)
+      path = raw
       table[path] = {}
       position = 0
       continue

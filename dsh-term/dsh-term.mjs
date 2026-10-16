@@ -3743,7 +3743,14 @@ async function publishDay(workspace, opts = {}) {
   const created = /\/pull\/(\d+)/.exec(pr.out || '')
   if (created && !opts?.noReview) {
     log.line('')
-    await runReviewPr(opts, created[1], {})
+    // Фаза ревью обёрнута: PR уже открыт, и падение агента (модель недоступна, сеть,
+    // таймаут) не должно выглядеть как провал публикации — ревью можно повторить.
+    try {
+      await runReviewPr(opts, created[1], {})
+    } catch (e) {
+      log.err(`ревью не состоялось: ${e.message}`)
+      log.dim(`повторить отдельно: /review-pr ${created[1]}`)
+    }
   }
 }
 
@@ -5654,7 +5661,11 @@ async function main() {
           }
           rest.push(token)
         }
-        await runReviewPr(opts, rest.join(' ').trim(), { force, dryRun, model })
+        try {
+          await runReviewPr(opts, rest.join(' ').trim(), { force, dryRun, model })
+        } catch (e) {
+          log.err(`review-pr: неожиданная ошибка — ${e.message}`)
+        }
         break
       }
       case 'create-project': {
