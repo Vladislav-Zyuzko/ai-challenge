@@ -79,12 +79,18 @@ const PR = {
   })
   check('ссылка разбирается в номер PR', byUrl.pr?.number === 42, byUrl.error ?? '')
 
-  const ghNumber = fakeGh([['pr view 7', okJson({ ...PR, number: 7 })]])
+  const ghNumber = fakeGh([['pr view 7', okJson({ ...PR, number: 7, headRefOid: 'abc1234' })]])
 
   const byNumber = resolveReviewTarget({ arg: '7', gh: ghNumber })
   check('номер PR принимается как есть', byNumber.pr?.number === 7, byNumber.error ?? '')
   check('номер уходит в gh без лишних запросов',
     ghNumber.calls.length === 1 && ghNumber.calls[0][0] === 'pr', ghNumber.calls.flat().join(' '))
+  // Без SHA головы PR построчные комментарии привязать не к чему — их молча пропустит
+  // проверка `headSha`; поэтому поле обязано запрашиваться у gh.
+  check('у gh запрашивается SHA головы PR',
+    ghNumber.calls[0].join(' ').includes('headRefOid'), ghNumber.calls[0].join(' '))
+  check('SHA головы доходит до результата', byNumber.pr?.headRefOid === 'abc1234',
+    String(byNumber.pr?.headRefOid))
 
   const ghBranch = fakeGh([
     ['pr list --head week7/day32', okJson([{ number: 42 }])],
@@ -291,6 +297,19 @@ const PATCH = [
     && !apiCall.includes('side=RIGHT'), apiCall ? apiCall.join(' ') : 'нет вызова')
   check('в построчном комментарии есть тег',
     apiCall.some((a) => a.includes(REVIEW_MARK)) || apiCall.some((a) => a.includes('AI-РЕВЬЮ')))
+
+  // Провал построчного комментария виден: молчаливый пропуск уже случался.
+  const inlineFails = fakeGh([
+    ['pr review 42', { ok: true, out: '' }],
+    ['pulls/42/comments', { ok: false, err: 'Invalid request' }],
+  ])
+  const failedInline = postReviewComments({
+    number: 42, reviewText: 'т', findings: [findings[0]], paths, gh: inlineFails, slug: 'o/r',
+    headSha: 'abc1234', patch: PATCH, write: () => {},
+  })
+  check('ошибка построчного комментария попадает в отчёт',
+    failedInline.inline === 0 && failedInline.failures.length === 1
+    && /Invalid request/.test(failedInline.failures[0]), JSON.stringify(failedInline.failures))
 
   // Нет sha — построчные пропускаются, сводка всё равно публикуется.
   const noSha = fakeGh([['pr review 42', { ok: true, out: '' }], ['pulls/42/comments', { ok: true, out: '' }]])

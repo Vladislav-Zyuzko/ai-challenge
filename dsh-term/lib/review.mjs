@@ -81,8 +81,10 @@ export function resolveReviewTarget({ arg, branch, gh }) {
     if (!list.data.length) return { error: `для ветки ${branch} нет открытого PR — укажите номер или ссылку` }
     ref = String(list.data[0].number)
   }
+  // `headRefOid` нужен обязательно: без SHA головы PR построчные комментарии привязать
+  // не к чему, и они молча пропускаются (на этом уже спотыкались).
   const view = parseGhJson(gh(['pr', 'view', ref, '--json',
-    'number,url,title,body,headRefName,baseRefName,author,additions,deletions,files,state']))
+    'number,url,title,body,headRefName,baseRefName,author,additions,deletions,files,state,headRefOid']))
   if (!view.ok) return { error: `PR ${ref}: ${view.err}` }
   if (view.data.state !== 'OPEN') {
     return { error: `PR #${view.data.number} в состоянии ${view.data.state} — ревью не требуется` }
@@ -268,6 +270,7 @@ export function postReviewComments({ number, reviewText, findings, paths, gh, sl
   }
   let inline = 0
   let skipped = 0
+  const failures = []
   if (posted && slug && headSha) {
     const positions = patchPositions(patch)
     for (const f of findings) {
@@ -282,10 +285,14 @@ export function postReviewComments({ number, reviewText, findings, paths, gh, sl
         '-f', `body=${body}`, '-f', `commit_id=${headSha}`, '-f', `path=${f.file}`,
         '-F', `position=${position}`])
       if (r && r.ok) inline += 1
-      else skipped += 1
+      else {
+        skipped += 1
+        // Ошибку не глотаем: молчаливый пропуск построчных комментариев уже случался.
+        failures.push(`${f.file}:${f.line} — ${((r && r.err) || 'gh ответил ошибкой').slice(0, 120)}`)
+      }
     }
   }
-  return { posted, inline, skipped, planned: findings.length, error }
+  return { posted, inline, skipped, planned: findings.length, error, failures }
 }
 
 /** Замечания по severity — для строки отчёта. */

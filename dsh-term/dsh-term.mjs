@@ -3864,6 +3864,7 @@ async function runReviewPr(opts, arg, { force = false, dryRun = false, model = '
   log.dim(`замечаний: blocker ${counts.blocker} · major ${counts.major} · minor ${counts.minor}`
     + ` · построчно ${result.inline} из ${result.planned}`
     + (result.skipped ? ` (${result.skipped} без строки в diff — остались в сводке)` : ''))
+  for (const failure of result.failures ?? []) log.dim(`  построчный не ушёл: ${failure}`)
   log.dim(`артефакты: ${paths.dir}`)
 }
 
