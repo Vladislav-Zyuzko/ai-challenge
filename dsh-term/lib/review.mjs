@@ -196,19 +196,66 @@ export function reviewCommentBody(title, text) {
 }
 
 /**
- * Раскладка комментариев: сводный — целиком ревью, построчные — по замечаниям с файлом
- * и строкой. GitHub принимает построчный комментарий только к строке из diff и требует
- * `commit_id` вместе с `line`/`side`: не вышло — замечание остаётся в сводке, и это не ошибка.
+ * Позиции строк в патче: `файл` → { номер строки новой версии → позиция в патче }.
  *
- * `gh` — адаптер; `headSha` — коммит, к которому привязываются построчные комментарии;
+ * Зачем это нужно. Построчный комментарий в GitHub API можно привязать двумя способами:
+ * `line` + `side` (новая схема) или `position` — номер строки внутри самого патча
+ * (старая). Наш аккаунт валидирует запрос по старой схеме: `line` в теле отвечает
+ * «line is not a permitted key», а `position` принимается. Поэтому позицию считаем сами:
+ * идём по патчу, считаем все строки файла (заголовки ханков, удалённые и контекстные),
+ * и для каждой строки новой версии запоминаем её позицию.
+ */
+export function patchPositions(patchText) {
+  const table = {}
+  let path = null
+  let newLine = 0
+  let position = 0
+  for (const line of String(patchText ?? '').split('\n')) {
+    if (line.startsWith('diff --git')) {
+      path = null
+      newLine = 0
+      position = 0
+      continue
+    }
+    if (line.startsWith('+++ b/')) {
+      path = line.slice(6).trim()
+      table[path] = {}
+      position = 0
+      continue
+    }
+    if (line.startsWith('@@')) {
+      const match = /\+(\d+)/.exec(line)
+      newLine = match ? Number(match[1]) : 0
+      position += 1
+      continue
+    }
+    if (path === null) continue
+    if (line.startsWith('\\')) continue
+    if (line.startsWith('-')) {
+      position += 1
+      continue
+    }
+    position += 1
+    table[path][newLine] = position
+    newLine += 1
+  }
+  return table
+}
+
+/**
+ * Раскладка комментариев: сводный — целиком ревью, построчные — по замечаниям с файлом
+ * и строкой. Строка обязана быть в патче: комментарий привязывается к позиции в diff,
+ * иначе GitHub отвечает ошибкой. Не вышло — замечание остаётся в сводке, и это не ошибка.
+ *
+ * `gh` — адаптер; `headSha` — коммит PR; `patch` — текст diff для расчёта позиций;
  * `write` — функция записи файла (в тестах не нужна файловая система). `dryRun` вызывается
  * из `runReviewPr` в режиме `--dry-run`, поэтому проверяемое тестами поведение совпадает
  * с рабочим.
  */
 export function postReviewComments({ number, reviewText, findings, paths, gh, slug, headSha,
-                                     write, dryRun = false }) {
+                                     patch = '', write, dryRun = false }) {
   if (write) write(paths.comment, reviewCommentBody('', reviewText))
-  if (dryRun) return { posted: false, inline: 0, planned: findings.length, dryRun: true }
+  if (dryRun) return { posted: false, inline: 0, skipped: 0, planned: findings.length, dryRun: true }
   let posted = false
   let error = ''
   const review = gh(['pr', 'review', String(number), '--comment', '--body-file', paths.comment])
@@ -220,17 +267,25 @@ export function postReviewComments({ number, reviewText, findings, paths, gh, sl
     if (!posted) error = (plain && plain.err) || (review && review.err) || 'gh ответил ошибкой'
   }
   let inline = 0
+  let skipped = 0
   if (posted && slug && headSha) {
+    const positions = patchPositions(patch)
     for (const f of findings) {
-      if (!f.file || !f.line) continue
+      const position = f.line ? positions[f.file]?.[f.line] : undefined
+      if (!position) {
+        skipped += 1
+        continue
+      }
       const body = reviewCommentBody(`[${f.severity}] ${f.title}`, `${f.why}\n\n**Что сделать:** ${f.fix}`)
-      const r = gh(['api', `repos/${slug}/pulls/${number}/comments`,
-        '-f', `body=${body}`, '-f', `path=${f.file}`, '-F', `line=${f.line}`,
-        '-f', 'side=RIGHT', '-f', `commit_id=${headSha}`, '-f', 'subject_type=line'])
+      const r = gh(['api', '--method', 'POST',
+        `repos/${slug}/pulls/${number}/comments`,
+        '-f', `body=${body}`, '-f', `commit_id=${headSha}`, '-f', `path=${f.file}`,
+        '-F', `position=${position}`])
       if (r && r.ok) inline += 1
+      else skipped += 1
     }
   }
-  return { posted, inline, planned: findings.length, error }
+  return { posted, inline, skipped, planned: findings.length, error }
 }
 
 /** Замечания по severity — для строки отчёта. */

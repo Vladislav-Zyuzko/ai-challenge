@@ -23,6 +23,7 @@ import {
   buildReviewPrompt,
   countBySeverity,
   extractBetween,
+  patchPositions,
   parseFindings,
   postReviewComments,
   resolveReviewTarget,
@@ -232,10 +233,37 @@ const PR = {
 }
 
 // 6. Раскладка комментариев.
+// Построчный комментарий привязывается к позиции строки в патче: наш аккаунт валидирует
+// запрос по старой схеме, где `line` не разрешён, а `position` — да.
+const PATCH = [
+  'diff --git a/a.py b/a.py',
+  'index 111..222 100644',
+  '--- a/a.py',
+  '+++ b/a.py',
+  '@@ -1,3 +1,4 @@',
+  ' первая строка',
+  '-удалённая строка',
+  '+добавленная строка',
+  '+ещё одна',
+  ' последняя',
+].join('\n')
+
+{
+  const positions = patchPositions(PATCH)
+  check('позиции считаются по файлу',
+    positions['a.py'] && Object.keys(positions['a.py']).length === 4, JSON.stringify(positions))
+  // Позиция — номер строки внутри патча файла: первая строка после `+++` (заголовок ханка)
+  // это 1, значит первая строка содержимого — 2. Именно такую нумерацию принимает GitHub.
+  check('первая строка содержимого — позиция 2', positions['a.py'][1] === 2, String(positions['a.py'][1]))
+  check('удалённая строка не занимает номер новой версии',
+    positions['a.py'][2] === 4, String(positions['a.py'][2]))
+  check('строки, которых нет в патче, отсутствуют', positions['a.py'][99] === undefined)
+}
+
 {
   const paths = reviewPaths('C:/repo', 42, (...parts) => parts.join('/'))
   const findings = [
-    { severity: 'blocker', title: 'b', file: 'a.py', line: 10, why: 'w', fix: 'f' },
+    { severity: 'blocker', title: 'b', file: 'a.py', line: 1, why: 'w', fix: 'f' },
     { severity: 'minor', title: 'm', file: 'b.py', line: null, why: 'w', fix: 'f' },
   ]
   const written = []
@@ -246,27 +274,29 @@ const PR = {
   ])
   const result = postReviewComments({
     number: 42, reviewText: '## Итог', findings, paths, gh, slug: 'o/r', headSha: 'abc1234',
+    patch: PATCH,
     write: (target, text) => written.push([target, text]),
   })
   check('сводный комментарий опубликован', result.posted === true && result.planned === 2)
   check('сводка пишется файлом и с тегом',
     written.length === 1 && written[0][1].startsWith(REVIEW_MARK), JSON.stringify(written[0]?.[0] ?? ''))
-  check('построчно ушло только замечание со строкой', result.inline === 1, String(result.inline))
+  check('построчно ушёл один комментарий', result.inline === 1, String(result.inline))
+  check('без строки в патче замечание пропущено, а не потеряно',
+    result.skipped === 1 && result.planned === 2, String(result.skipped))
   const apiCall = gh.calls.find((c) => c[0] === 'api')
-  check('построчный комментарий идёт через api с path/line/side',
-    Boolean(apiCall) && apiCall.includes('path=a.py') && apiCall.includes('line=10')
-    && apiCall.includes('side=RIGHT'), apiCall ? apiCall.join(' ') : 'нет вызова')
-  // Без commit_id GitHub отклоняет построчный комментарий: «line is not a permitted key».
-  check('в построчном комментарии есть commit_id и subject_type',
-    Boolean(apiCall) && apiCall.includes('commit_id=abc1234')
-    && apiCall.includes('subject_type=line'), apiCall ? apiCall.join(' ') : 'нет вызова')
+  // Строка 1 патча — позиция 2; `line`/`side` не годятся: GitHub отвечает
+  // «line is not a permitted key» и требует позицию внутри diff.
+  check('построчный комментарий идёт через api с position и commit_id',
+    Boolean(apiCall) && apiCall.includes('position=2') && apiCall.includes('commit_id=abc1234')
+    && !apiCall.includes('side=RIGHT'), apiCall ? apiCall.join(' ') : 'нет вызова')
   check('в построчном комментарии есть тег',
     apiCall.some((a) => a.includes(REVIEW_MARK)) || apiCall.some((a) => a.includes('AI-РЕВЬЮ')))
 
-  // Нет sha или репозитория — построчные пропускаются, сводка всё равно публикуется.
+  // Нет sha — построчные пропускаются, сводка всё равно публикуется.
   const noSha = fakeGh([['pr review 42', { ok: true, out: '' }], ['pulls/42/comments', { ok: true, out: '' }]])
   const noShaResult = postReviewComments({
-    number: 42, reviewText: 'т', findings, paths, gh: noSha, slug: 'o/r', headSha: '', write: () => {},
+    number: 42, reviewText: 'т', findings, paths, gh: noSha, slug: 'o/r', headSha: '',
+    patch: PATCH, write: () => {},
   })
   check('без commit_id построчные не отправляются, сводка публикуется',
     noShaResult.posted === true && noShaResult.inline === 0

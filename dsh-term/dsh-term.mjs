@@ -3851,7 +3851,7 @@ async function runReviewPr(opts, arg, { force = false, dryRun = false, model = '
   const slug = repo.ok ? repo.data.nameWithOwner : ''
   const result = postReviewComments({
     number: pr.number, reviewText, findings: parsed.findings, paths, gh, slug,
-    headSha: pr.headRefOid ?? '',
+    headSha: pr.headRefOid ?? '', patch: diffRun.out,
     write: (target, text) => writeFileSync(target, text, 'utf8'),
   })
   if (!result.posted) {
@@ -3862,7 +3862,8 @@ async function runReviewPr(opts, arg, { force = false, dryRun = false, model = '
   const counts = countBySeverity(parsed.findings)
   log.ok(`ревью опубликовано: ${pr.url} (${seconds} с)`)
   log.dim(`замечаний: blocker ${counts.blocker} · major ${counts.major} · minor ${counts.minor}`
-    + ` · построчно ${result.inline} из ${result.planned}`)
+    + ` · построчно ${result.inline} из ${result.planned}`
+    + (result.skipped ? ` (${result.skipped} без строки в diff — остались в сводке)` : ''))
   log.dim(`артефакты: ${paths.dir}`)
 }
 
