@@ -2031,14 +2031,35 @@ function runGh(args, cwd) {
 function buildPrBody({ dayBranch, weekBranch, subject, body, statOut, porcelainOut }) {
   const lines = ['## Что сделано']
   const src = (statOut || porcelainOut || '').split('\n').filter(Boolean)
+  const files = []
   if (src.length) {
     for (const row of src) {
       const f = row.split('|')[0].trim()
-      if (f) lines.push(`- ${f}`)
+      if (f) { files.push(f); lines.push(`- ${f}`) }
     }
   } else lines.push('- изменения')
   lines.push('', '## Коммит', subject)
   if (body) lines.push('', body)
+
+  // «Как проверить» собирается по составу изменений: общие команды проекта бесполезны,
+  // если день их не касался, а ревьювер справедливо ругался на отсутствие раздела.
+  const checks = []
+  if (files.some((f) => f.startsWith('doc-index/') || f.startsWith('project-index/'))) {
+    checks.push('`cd doc-index && python -m unittest discover -s tests` — тесты индекса, RAG и корпусов')
+  }
+  if (files.some((f) => f.startsWith('dsh-term/'))) {
+    checks.push('`node dsh-term/tests/review.test.mjs` (и остальные наборы `dsh-term/tests/*.test.mjs`)')
+  }
+  if (files.some((f) => f.startsWith('.dsh/'))) {
+    checks.push('`.dsh/SKILLS/README.md` — реестр скиллов: новая команда описана там же')
+  }
+  const report = files.find((f) => /^week\d+\/day.+\.md$/.test(f))
+  if (report) checks.push(`\`${report}\` — отчёт дня: что сделано, замеры и ограничения`)
+  if (checks.length) {
+    lines.push('', '## Как проверить')
+    for (const c of checks) lines.push(`- ${c}`)
+  }
+
   lines.push('', `Ветки: \`${dayBranch}\` → \`${weekBranch}\``, '', '_Сгенерировано `dsh-term /publish-day` (см. .dsh/SKILLS)._')
   return lines.join('\n')
 }
@@ -3671,6 +3692,9 @@ async function publishDay(workspace, opts = {}) {
 
   const add = runGit(['-C', workspace, 'add', '-A'])
   if (!add.ok) { log.err(`git add failed: ${add.err}`); return }
+  // Статистику для описания PR берём ПОСЛЕ `git add`: `git diff --stat HEAD` не видит
+  // новые файлы, и раньше в описании PR не хватало ровно того, что добавлено впервые.
+  const statStaged = runGit(['-C', workspace, 'diff', '--cached', '--stat'])
   const cargs = ['-C', workspace, 'commit', '-m', subject]
   if (cbody) cargs.push('-m', cbody)
   const c = runGit(cargs)
@@ -3699,7 +3723,11 @@ async function publishDay(workspace, opts = {}) {
     }
   }
 
-  const body = buildPrBody({ dayBranch, weekBranch, subject, body: cbody, statOut: stat.ok ? stat.out : '', porcelainOut: st.out })
+  const body = buildPrBody({
+    dayBranch, weekBranch, subject, body: cbody,
+    statOut: statStaged.ok ? statStaged.out : (stat.ok ? stat.out : ''),
+    porcelainOut: st.out,
+  })
   const pr = runGh(['pr', 'create', '--base', weekBranch, '--head', dayBranch, '--title', subject, '--body', body], workspace)
   if (!pr.ok) {
     log.err(`gh pr create failed: ${pr.err}`)
@@ -3739,10 +3767,11 @@ function ghAdapter(workspace) {
 }
 
 /** Полный цикл ревью: найти PR → собрать данные → локальный агент → комментарии. */
-async function runReviewPr(opts, arg, { force = false, dryRun = false } = {}) {
+async function runReviewPr(opts, arg, { force = false, dryRun = false, model = '' } = {}) {
   const workspace = opts.workspace
   const gh = ghAdapter(workspace)
-  log.line(`${C.bold}/review-pr${C.off}: ревью агентом ${C.cyan}${REVIEW_AGENT}${C.off} (локально, ${REVIEW_MODEL})`)
+  const reviewModel = model || REVIEW_MODEL
+  log.line(`${C.bold}/review-pr${C.off}: ревью агентом ${C.cyan}${REVIEW_AGENT}${C.off} (локально, ${reviewModel})`)
   const branch = runGit(['-C', workspace, 'branch', '--show-current']).out
   const target = resolveReviewTarget({ arg, branch, gh })
   if (target.error) {
@@ -3768,9 +3797,21 @@ async function runReviewPr(opts, arg, { force = false, dryRun = false } = {}) {
   writeFileSync(paths.files, JSON.stringify(pr.files ?? [], null, 1), 'utf8')
   const prompt = buildReviewPrompt({ workspace, pr, diff: diffRun.out, paths })
   writeFileSync(paths.prompt, prompt, 'utf8')
-  log.dim(`данные: ${paths.dir} (diff ${diffRun.out.length} символов)`)
+  // Промпт уезжает аргументом процесса, поэтому в нём всё ограничено (diff, описание,
+  // список файлов). Если даже после этого он неправдоподобно велик — лучше сказать прямо.
+  log.dim(`данные: ${paths.dir} (diff ${diffRun.out.length} символов, промпт ${prompt.length})`)
+  if (prompt.length > 24000) {
+    log.dim('промпт длинный: если запуск сорвётся, сократите описание PR или список файлов')
+  }
 
   if (dryRun) {
+    // Сухой прогон идёт через ту же функцию публикации, что рабочий: иначе тесты
+    // проверяли бы ветку, которой в проде нет.
+    postReviewComments({
+      number: pr.number, reviewText: '(dry-run: ревью не собиралось)', findings: [], paths, gh,
+      slug: '', headSha: pr.headRefOid ?? '',
+      write: (file, text) => writeFileSync(file, text, 'utf8'), dryRun: true,
+    })
     log.line('dry-run: агент не запускается, комментарии не публикуются')
     log.dim(`промпт: ${paths.prompt}`)
     return
@@ -3780,7 +3821,7 @@ async function runReviewPr(opts, arg, { force = false, dryRun = false } = {}) {
   const started = Date.now()
   const run = spawnSync(process.execPath, [process.argv[1], '-p', prompt,
     '--rag', REVIEW_BASES[0], '--rag', REVIEW_BASES[1],
-    '--provider', 'deepseek-official', '--model', REVIEW_MODEL,
+    '--provider', 'deepseek-official', '--model', reviewModel,
     '--auto-approve', '--workspace', workspace], {
     cwd: workspace,
     encoding: 'utf8',
@@ -3804,11 +3845,13 @@ async function runReviewPr(opts, arg, { force = false, dryRun = false } = {}) {
   writeFileSync(paths.review, `${reviewText}\n`, 'utf8')
   const parsed = parseFindings(raw)
   if (parsed.error) log.dim(`замечания не разобраны (${parsed.error}) — останутся в сводке`)
+  if (parsed.dropped) log.dim(`замечаний больше предела: отброшено ${parsed.dropped}`)
 
   const repo = parseGhJson(gh(['repo', 'view', '--json', 'nameWithOwner']))
   const slug = repo.ok ? repo.data.nameWithOwner : ''
   const result = postReviewComments({
     number: pr.number, reviewText, findings: parsed.findings, paths, gh, slug,
+    headSha: pr.headRefOid ?? '',
     write: (target, text) => writeFileSync(target, text, 'utf8'),
   })
   if (!result.posted) {
@@ -5577,12 +5620,39 @@ async function main() {
         break
       }
       case 'review-pr': {
-        // Ревью PR локальным агентом: /review-pr [<номер|ссылка|ветка>] [--force] [--dry-run]
+        // Ревью PR локальным агентом:
+        //   /review-pr [<номер|ссылка|ветка>] [--model <имя>] [--force] [--dry-run]
+        // Флаги разбираются вместе со своими значениями: `--model` без этого оставлял бы
+        // в ссылке на PR имя модели (`/review-pr 42 --model x` → «PR 42 x»).
         const tail = parts.slice(1)
         const force = tail.includes('--force')
         const dryRun = tail.includes('--dry-run')
-        const ref = tail.filter((t) => !t.startsWith('--')).join(' ').trim()
-        await runReviewPr(opts, ref, { force, dryRun })
+        let model = ''
+        const rest = []
+        for (let i = 0; i < tail.length; i += 1) {
+          const token = tail[i]
+          if (token === '--force' || token === '--dry-run') continue
+          if (token === '--model') {
+            model = tail[i + 1] ?? ''
+            if (!model || model.startsWith('--')) {
+              log.err('review-pr: после --model нужно имя модели')
+              return
+            }
+            i += 1
+            continue
+          }
+          if (token.startsWith('--model=')) {
+            model = token.slice('--model='.length)
+            continue
+          }
+          if (token.startsWith('--')) {
+            log.err(`review-pr: неизвестный флаг ${token}`)
+            log.dim('доступно: --model <имя>, --force, --dry-run')
+            return
+          }
+          rest.push(token)
+        }
+        await runReviewPr(opts, rest.join(' ').trim(), { force, dryRun, model })
         break
       }
       case 'create-project': {

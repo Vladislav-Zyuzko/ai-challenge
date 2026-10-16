@@ -42,7 +42,11 @@ PROJECT_SUFFIXES = (".md",)
 # Корпус кода (день 32) нужен ревьюверу: он ищет похожие места и конвенции там, где
 # документация молчит. Это отдельная база, а не расширение документации: смешивать
 # README с исходниками в одном индексе значит размывать обе выдачи.
-PROJECT_CODE_SUFFIXES = (".py", ".mjs", ".cjs", ".js", ".ts", ".ps1", ".yaml", ".yml")
+#
+# `.json` здесь не для красоты: без него lock-файлы вообще не доходили до проверки имён
+# (их отсекало расширение), и настройка `exclude_names` была мёртвой. С `.json` в корпус
+# попадают конфиги (`package.json`, `tsconfig.json`), а lock-файлы отсекаются по имени.
+PROJECT_CODE_SUFFIXES = (".py", ".mjs", ".cjs", ".js", ".ts", ".ps1", ".yaml", ".yml", ".json")
 PROJECT_CODE_NAMES = ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock")
 
 
@@ -53,7 +57,6 @@ def docs_config(repo: Path, out: Path | None = None) -> Config:
         vault=repo,
         out=(Path(out) if out else repo / "project-index" / "out").expanduser(),
         exclude_dirs=PROJECT_EXCLUDES,
-        exclude_names=PROJECT_CODE_NAMES,
         allow_dirs=PROJECT_ALLOW,
         suffixes=PROJECT_SUFFIXES,
     )

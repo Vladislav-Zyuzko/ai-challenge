@@ -146,6 +146,23 @@ const PR = {
   check('длинный diff обрезан и об этом сказано', prompt.includes('diff длиннее'))
   check('в промпт не уехал весь diff', !prompt.includes('x'.repeat(5000)))
   check('запрет на правки в промпте есть', prompt.includes('Ничего не меняй'))
+
+  // Промпт уезжает аргументом процесса: у Windows предел ~32k символов, поэтому
+  // ограничены не только diff, но и описание PR с списком файлов.
+  const hugeBody = 'о'.repeat(40000)
+  const manyFiles = Array.from({ length: 900 }, (_, i) => ({ path: `f${i}.py`, additions: 1, deletions: 0 }))
+  const bigPrompt = buildReviewPrompt({
+    workspace: 'C:/repo',
+    pr: { ...PR, body: hugeBody, files: manyFiles },
+    diff: 'diff --git a/x b/x',
+    paths,
+  })
+  check('описание PR обрезано', bigPrompt.includes('…') && !bigPrompt.includes('о'.repeat(20000)),
+    `длина ${bigPrompt.length}`)
+  check('список файлов обрезан и указан полный список файлом',
+    bigPrompt.includes('ещё 600 файлов') && bigPrompt.includes(paths.files))
+  check('промпт остаётся в пределах argv', bigPrompt.length < 24000, `длина ${bigPrompt.length}`)
+  check('в промпте назван предел замечаний', prompt.includes('не больше 12'))
 }
 
 // 4. Разбор ответа агента.
@@ -188,6 +205,17 @@ const PR = {
   const empty = parseFindings(`${REVIEW_FINDINGS_BEGIN}\n[]\n${REVIEW_FINDINGS_END}`)
   check('пустой массив — это «замечаний нет» без ошибки',
     empty.findings.length === 0 && empty.error === '', JSON.stringify(empty))
+
+  // Предел замечаний держит код: ответ с полусотней находок иначе дал бы полсотни вызовов gh.
+  const many = JSON.stringify(Array.from({ length: 30 }, (_, i) => ({
+    severity: i < 5 ? 'minor' : (i < 10 ? 'major' : 'blocker'),
+    title: `t${i}`, file: 'a.py', line: i + 1, why: 'w', fix: 'f',
+  })))
+  const capped = parseFindings(`${REVIEW_FINDINGS_BEGIN}\n${many}\n${REVIEW_FINDINGS_END}`)
+  check('замечаний не больше предела', capped.findings.length === 12, String(capped.findings.length))
+  check('об отброшенных сообщается', capped.dropped === 18, String(capped.dropped))
+  check('в первых строках — самые важные (blocker вперёд)',
+    capped.findings[0].severity === 'blocker', capped.findings[0].severity)
 }
 
 // 5. Тег комментария — сверху и всегда.
@@ -217,7 +245,7 @@ const PR = {
     ['pulls/42/comments', { ok: true, out: '' }],
   ])
   const result = postReviewComments({
-    number: 42, reviewText: '## Итог', findings, paths, gh, slug: 'o/r',
+    number: 42, reviewText: '## Итог', findings, paths, gh, slug: 'o/r', headSha: 'abc1234',
     write: (target, text) => written.push([target, text]),
   })
   check('сводный комментарий опубликован', result.posted === true && result.planned === 2)
@@ -228,8 +256,21 @@ const PR = {
   check('построчный комментарий идёт через api с path/line/side',
     Boolean(apiCall) && apiCall.includes('path=a.py') && apiCall.includes('line=10')
     && apiCall.includes('side=RIGHT'), apiCall ? apiCall.join(' ') : 'нет вызова')
+  // Без commit_id GitHub отклоняет построчный комментарий: «line is not a permitted key».
+  check('в построчном комментарии есть commit_id и subject_type',
+    Boolean(apiCall) && apiCall.includes('commit_id=abc1234')
+    && apiCall.includes('subject_type=line'), apiCall ? apiCall.join(' ') : 'нет вызова')
   check('в построчном комментарии есть тег',
     apiCall.some((a) => a.includes(REVIEW_MARK)) || apiCall.some((a) => a.includes('AI-РЕВЬЮ')))
+
+  // Нет sha или репозитория — построчные пропускаются, сводка всё равно публикуется.
+  const noSha = fakeGh([['pr review 42', { ok: true, out: '' }], ['pulls/42/comments', { ok: true, out: '' }]])
+  const noShaResult = postReviewComments({
+    number: 42, reviewText: 'т', findings, paths, gh: noSha, slug: 'o/r', headSha: '', write: () => {},
+  })
+  check('без commit_id построчные не отправляются, сводка публикуется',
+    noShaResult.posted === true && noShaResult.inline === 0
+    && !noSha.calls.some((c) => c[0] === 'api'), JSON.stringify(noSha.calls))
 
   // Если `pr review` не сработал — публикуем обычным комментарием.
   const fallback = fakeGh([

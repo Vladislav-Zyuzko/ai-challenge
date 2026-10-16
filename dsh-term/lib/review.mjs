@@ -29,6 +29,15 @@ export const REVIEW_SKILL_PATH = '.dsh/SKILLS/review-pr.md'
 export const REVIEW_BASES = ['project', 'project-code']
 /** Сколько символов diff идёт прямо в промпт: остальное агент читает файлом. */
 export const REVIEW_DIFF_INLINE = 4000
+/** Сколько символов описания PR попадает в промпт: длинное тело не влезает в argv. */
+export const REVIEW_BODY_LIMIT = 6000
+/** Сколько файлов перечисляем: у огромного PR список тоже упирается в предел argv. */
+export const REVIEW_FILES_LIMIT = 300
+/**
+ * Предел числа замечаний (как в роли ревьювера): перебор залил бы PR шумом и превратился
+ * бы в сотню вызовов gh. Лишние отбрасываются с приоритетом по severity.
+ */
+export const REVIEW_FINDINGS_LIMIT = 12
 
 /** Куда складываются данные ревью: diff, промпт, ответ агента, готовый комментарий. */
 export function reviewPaths(workspace, number, joinPath) {
@@ -91,11 +100,20 @@ export function alreadyReviewed({ number, gh }) {
 
 /** Промпт ревьюверу: роль берётся из спецификации агента, данные PR — из gh. */
 export function buildReviewPrompt({ workspace, pr, diff, paths }) {
-  const files = (pr.files ?? [])
+  const all = pr.files ?? []
+  const shown = all.slice(0, REVIEW_FILES_LIMIT)
+  const files = shown
     .map((f) => `- ${f.path} (+${f.additions}/-${f.deletions})`)
     .join('\n') || '(список файлов пуст)'
+  const moreFiles = all.length > shown.length
+    ? `\n… ещё ${all.length - shown.length} файлов (полный список — в ${paths.files})`
+    : ''
+  // И diff, и описание PR ограничены: промпт уезжает аргументом процесса, а у Windows
+  // предел командной строки ~32 000 символов. Полные данные лежат файлами рядом.
   const clipped = diff.length > REVIEW_DIFF_INLINE
   const excerpt = clipped ? diff.slice(0, REVIEW_DIFF_INLINE) : diff
+  const body = (pr.body ?? '').trim()
+  const bodyShown = body.length > REVIEW_BODY_LIMIT ? `${body.slice(0, REVIEW_BODY_LIMIT)}…` : body
   return [
     `Ты — агент-ревьювер \`${REVIEW_AGENT}\`. Проведи ревью pull request и верни результат строго в заданном формате.`,
     '',
@@ -105,13 +123,13 @@ export function buildReviewPrompt({ workspace, pr, diff, paths }) {
     `Репозиторий (рабочая папка): ${workspace}`,
     `PR #${pr.number}: ${pr.title}`,
     `Ветки: ${pr.headRefName} → ${pr.baseRefName}`,
-    `Объём: файлов ${(pr.files ?? []).length}, +${pr.additions}/-${pr.deletions}`,
+    `Объём: файлов ${all.length}, +${pr.additions}/-${pr.deletions}`,
     '',
     'Изменённые файлы:',
-    files,
+    files + moreFiles,
     '',
     'Описание PR:',
-    (pr.body ?? '').trim() || '(пусто)',
+    bodyShown || '(пусто)',
     '',
     `Полный diff лежит в файле: ${paths.diff} — читай его инструментом (в промпт вошло только начало${clipped ? ', diff длиннее' : ''}).`,
     '',
@@ -127,6 +145,7 @@ export function buildReviewPrompt({ workspace, pr, diff, paths }) {
     'Формат ответа — ровно две части:',
     `1) текст ревью, обёрнутый в ${REVIEW_BEGIN} … ${REVIEW_END}`,
     `2) массив замечаний между ${REVIEW_FINDINGS_BEGIN} … ${REVIEW_FINDINGS_END} (JSON, поля severity/title/file/line/why/fix;`,
+    `   не больше ${REVIEW_FINDINGS_LIMIT} замечаний;`,
     '   если замечаний нет — пустой массив и явная фраза «замечаний нет» в тексте ревью).',
   ].join('\n')
 }
@@ -142,15 +161,18 @@ export function extractBetween(text, begin, end) {
 /** Разобрать машиночитаемый блок замечаний. Ошибка разбора не роняет ревью. */
 export function parseFindings(text) {
   const block = extractBetween(text, REVIEW_FINDINGS_BEGIN, REVIEW_FINDINGS_END)
-  if (!block) return { findings: [], error: 'блок findings отсутствует' }
+  if (!block) return { findings: [], error: 'блок findings отсутствует', dropped: 0 }
   const cleaned = block.replace(/^\s*```(?:json)?/i, '').replace(/```\s*$/, '').trim()
   let data
   try {
     data = JSON.parse(cleaned)
   } catch (e) {
-    return { findings: [], error: `JSON не разобран: ${e.message}` }
+    return { findings: [], error: `JSON не разобран: ${e.message}`, dropped: 0 }
   }
-  if (!Array.isArray(data)) return { findings: [], error: 'в блоке findings не массив' }
+  if (!Array.isArray(data)) {
+    return { findings: [], error: 'в блоке findings не массив', dropped: 0 }
+  }
+  const weight = { blocker: 0, major: 1, minor: 2 }
   const findings = data
     .filter((f) => f && typeof f === 'object' && REVIEW_SEVERITIES.includes(String(f.severity)))
     .map((f) => ({
@@ -161,7 +183,11 @@ export function parseFindings(text) {
       why: String(f.why ?? '').trim(),
       fix: String(f.fix ?? '').trim(),
     }))
-  return { findings, error: '' }
+    .sort((a, b) => weight[a.severity] - weight[b.severity])
+  // Предел из роли ревьювера держит код, а не только просьба в промпте: иначе ответ
+  // с полусотней замечаний превратится в полсотни вызовов gh и зальёт PR шумом.
+  const kept = findings.slice(0, REVIEW_FINDINGS_LIMIT)
+  return { findings: kept, error: '', dropped: findings.length - kept.length }
 }
 
 /** Тело комментария: тег агента сверху — иначе его не отличить от комментария человека. */
@@ -171,12 +197,16 @@ export function reviewCommentBody(title, text) {
 
 /**
  * Раскладка комментариев: сводный — целиком ревью, построчные — по замечаниям с файлом
- * и строкой. GitHub принимает построчный комментарий только к строке из diff: не вышло —
- * замечание остаётся в сводке, и это не ошибка.
+ * и строкой. GitHub принимает построчный комментарий только к строке из diff и требует
+ * `commit_id` вместе с `line`/`side`: не вышло — замечание остаётся в сводке, и это не ошибка.
  *
- * `gh` — адаптер; `write` — функция записи файла (в тестах не нужна файловая система).
+ * `gh` — адаптер; `headSha` — коммит, к которому привязываются построчные комментарии;
+ * `write` — функция записи файла (в тестах не нужна файловая система). `dryRun` вызывается
+ * из `runReviewPr` в режиме `--dry-run`, поэтому проверяемое тестами поведение совпадает
+ * с рабочим.
  */
-export function postReviewComments({ number, reviewText, findings, paths, gh, slug, write, dryRun = false }) {
+export function postReviewComments({ number, reviewText, findings, paths, gh, slug, headSha,
+                                     write, dryRun = false }) {
   if (write) write(paths.comment, reviewCommentBody('', reviewText))
   if (dryRun) return { posted: false, inline: 0, planned: findings.length, dryRun: true }
   let posted = false
@@ -190,12 +220,13 @@ export function postReviewComments({ number, reviewText, findings, paths, gh, sl
     if (!posted) error = (plain && plain.err) || (review && review.err) || 'gh ответил ошибкой'
   }
   let inline = 0
-  if (posted && slug) {
+  if (posted && slug && headSha) {
     for (const f of findings) {
       if (!f.file || !f.line) continue
       const body = reviewCommentBody(`[${f.severity}] ${f.title}`, `${f.why}\n\n**Что сделать:** ${f.fix}`)
       const r = gh(['api', `repos/${slug}/pulls/${number}/comments`,
-        '-f', `body=${body}`, '-f', `path=${f.file}`, '-F', `line=${f.line}`, '-f', 'side=RIGHT'])
+        '-f', `body=${body}`, '-f', `path=${f.file}`, '-F', `line=${f.line}`,
+        '-f', 'side=RIGHT', '-f', `commit_id=${headSha}`, '-f', 'subject_type=line'])
       if (r && r.ok) inline += 1
     }
   }
