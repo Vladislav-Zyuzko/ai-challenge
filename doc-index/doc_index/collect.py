@@ -144,6 +144,19 @@ def parse_note(path: Path, root: Path) -> Note:
     )
 
 
+def path_in_dirs(rel_posix: str, dirs: tuple[str, ...]) -> bool:
+    """Лежит ли путь в одном из каталогов — по СЕГМЕНТАМ пути, а не по префиксу строки.
+
+    `support` и `support-mcp` — разные каталоги, и префиксная проверка затянула бы
+    README чужого проекта в корпус FAQ (нашёл ревьювер на PR #31).
+    """
+    for raw in dirs:
+        prefix = raw.strip("/")
+        if prefix and (rel_posix == prefix or rel_posix.startswith(prefix + "/")):
+            return True
+    return False
+
+
 def collect(cfg: Config) -> tuple[list[Note], list[str]]:
     """Все заметки корпуса. Возвращает (заметки, пропущенные пути).
 
@@ -165,6 +178,11 @@ def collect(cfg: Config) -> tuple[list[Note], list[str]]:
         rel_posix = rel.as_posix()
         parts = rel.parts
         allowed = any(rel_posix.startswith(prefix) for prefix in cfg.allow_dirs)
+        # Корпус «только эти каталоги»: для базы поддержки нужен FAQ продукта и его
+        # README, а не весь репозиторий.
+        if cfg.only_dirs and not path_in_dirs(rel_posix, cfg.only_dirs):
+            skipped.append(rel_posix)
+            continue
         if any(part in cfg.exclude_dirs for part in parts) or rel.name in cfg.exclude_names:
             skipped.append(rel_posix)
             continue

@@ -75,6 +75,23 @@ def code_config(repo: Path, out: Path | None = None) -> Config:
     )
 
 
+# Корпус поддержки (день 33): FAQ продукта и README продукта. Это не «документация
+# проекта» и не «код», а то, по чему поддержка отвечает пользователю.
+SUPPORT_DIRS = ("support", "dsh-term")
+
+
+def support_config(repo: Path, out: Path | None = None) -> Config:
+    """Настройки корпуса поддержки: FAQ и README продукта."""
+    repo = Path(repo).expanduser().resolve()
+    return Config(
+        vault=repo,
+        out=(Path(out) if out else repo / "support-index" / "out").expanduser(),
+        exclude_dirs=PROJECT_EXCLUDES,
+        only_dirs=SUPPORT_DIRS,
+        suffixes=(".md",),
+    )
+
+
 class RepoError(RuntimeError):
     """Понятная ошибка вместо стектрейса из subprocess."""
 

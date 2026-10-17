@@ -20,7 +20,7 @@ from . import store
 from .chunk import build_chunks, chunk_stats
 from .collect import collect
 from .config import DEFAULT_OUT, DEFAULT_VAULT, Config
-from .project import code_config, context_block, docs_config
+from .project import code_config, context_block, docs_config, support_config
 from .embed import OllamaEmbedder
 from .evaluate import evaluate, load_questions, source_skew, write_report as write_eval_report
 from .indexer import build_index
@@ -57,8 +57,11 @@ def _config(args: argparse.Namespace) -> Config:
         base = docs_config(vault, explicit_out)
     elif getattr(args, "project_code", False):
         base = code_config(vault, explicit_out)
+    elif getattr(args, "support_docs", False):
+        base = support_config(vault, explicit_out)
     exclude = tuple(_items(args.exclude)) if args.exclude else base.exclude_dirs
     allow = base.allow_dirs + tuple(_items(args.allow)) if args.allow else base.allow_dirs
+    only = tuple(_items(args.only)) if args.only else base.only_dirs
     suffixes = tuple(_items(args.suffix)) if args.suffix else base.suffixes
     names = (base.exclude_names + tuple(_items(args.exclude_names))
              if args.exclude_names else base.exclude_names)
@@ -74,6 +77,7 @@ def _config(args: argparse.Namespace) -> Config:
         batch_size=args.batch_size,
         exclude_dirs=exclude,
         allow_dirs=allow,
+        only_dirs=only,
         suffixes=suffixes,
         exclude_names=names,
     )
@@ -87,6 +91,9 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
                         help="корпус — документация проекта: README, docs, отчёты (день 31)")
     parser.add_argument("--project-code", action="store_true",
                         help="корпус — исходники проекта: база для ревьювера (день 32)")
+    parser.add_argument("--support-docs", action="store_true",
+                        help="корпус — FAQ и README продукта: база поддержки (день 33)")
+    parser.add_argument("--only", default="", help="взять только эти каталоги корпуса (через запятую)")
     parser.add_argument("--exclude", default="", help="каталоги-исключения через запятую (заменяют пресет)")
     parser.add_argument("--exclude-names", default="", help="имена файлов-исключений через запятую")
     parser.add_argument("--allow", default="", help="скрытые каталоги, которые всё же нужны, через запятую")

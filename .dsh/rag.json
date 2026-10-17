@@ -20,9 +20,18 @@
     "title": "код проекта ai-challenge",
     "index": "doc-index",
     "out": "project-code-index/out",
-    "what": "исходники doc-index и dsh-term, скиллы и правила харнесса",
+    "what": "исходники doc-index и dsh-term: python, node, конфиги",
     "strategy": "fixed",
     "margin": 0.04,
     "minDense": 0.5
+  },
+  "support": {
+    "title": "FAQ продукта dsh-term",
+    "index": "doc-index",
+    "out": "support-index/out",
+    "what": "FAQ продукта dsh-term: запуск и ключи, локальная модель, ошибки и лимиты, MCP и базы, команды и сессии",
+    "strategy": "structural",
+    "margin": 0.04,
+    "minDense": 0.45
   }
 }
