@@ -32,6 +32,9 @@ project-code-index/out/
 # артефакты ревью PR (day32): diff, промпт и ответ агента по каждому PR — рабочий мусор
 /out/
 
+# индекс FAQ поддержки (day33): база для сессии /support
+support-index/out/
+
 # веса моделей (day23): ONNX-реранкер 543 МБ, качается скриптом, не в git
 doc-index/models/
 

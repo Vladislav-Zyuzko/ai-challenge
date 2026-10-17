@@ -39,6 +39,21 @@ import {
   resolveReviewTarget,
   reviewPaths,
 } from './lib/review.mjs'
+// Режим техподдержки (день 33): слепок обращения, промпт режима и чтение JSON —
+// в модуле, чтобы проверяться тестом без сессии и модели.
+import {
+  SUPPORT_BASE,
+  SUPPORT_DEV_QUEUE,
+  SUPPORT_MCP_PRESET,
+  SUPPORT_STATUS_LABELS,
+  supportInstructionText,
+  supportPromptPreview,
+  supportTicket,
+  supportTickets,
+  supportUserLine,
+  supportUserOf,
+  supportUsers,
+} from './lib/support.mjs'
 
 // ---------- ANSI ----------
 // Режим цвета определяется ДО первого использования палитр: `--color <auto|always|never>`
@@ -1173,6 +1188,8 @@ function parseArgs(argv) {
     mcpCheck: undefined,     // --mcp-check [preset]: только соединение + список инструментов, без сессии
     offline: undefined,      // --mcp-check --offline: показать оверлей и выйти (без сети)
     rag: undefined,          // --rag <имя>: подключить базу знаний из .dsh/rag.json (повторяемый)
+    support: undefined,      // --support [<тикет>]: сразу режим поддержки (пусто — меню обращений)
+    supportCheck: undefined, // --support-check <тикет>: что уйдёт в системный промпт (без сессии)
     ragMargin: undefined,    // --rag-margin <0..1>: переопределить маржу от лучшего результата
     ragMinDense: undefined,  // --rag-min-dense <0..1>: переопределить пол применимости базы
     ragMinKeep: undefined,   // --rag-min-keep <n>: сколько фрагментов оставить даже ниже порога
@@ -1217,6 +1234,13 @@ function parseArgs(argv) {
       case '--rag-min-keep': opts.ragMinKeep = Number(next()); break
       case '--rag-no-filter': opts.ragNoFilter = true; break
       case '--mcp': opts.mcp = [...(opts.mcp ?? []), next()]; break
+      case '--support': {
+        // Необязательный аргумент: `--support T-1042` — сразу в тикет, без него — меню.
+        const v = argv[i + 1]
+        opts.support = v && !v.startsWith('-') ? next() : ''
+        break
+      }
+      case '--support-check': opts.supportCheck = next(); break
       case '--mcp-toolsets': opts.mcpToolsets = next(); break
       case '--mcp-readwrite': opts.mcpReadwrite = true; break
       case '--mcp-check': {
@@ -1427,6 +1451,7 @@ const COMMANDS = [
   { name: 'mcp', usage: '/mcp [show|tools|refresh]', desc: 'MCP-серверы: соединение, список инструментов и их цена в промпте' },
   { name: 'rag', usage: '/rag [list]', desc: 'базы знаний сессии (--rag): что подключено и какие есть в реестре' },
   { name: 'rag-brief', usage: '/rag-brief <вопрос>', desc: 'справка по базе по шаблону: ответ + источники + цитаты (мимо агента)' },
+  { name: 'support', usage: '/support [<тикет>|off]', desc: 'режим техподдержки: FAQ + данные обращения + задача в разработку (INFRA)' },
   { name: 'model', usage: '/model [имя|show]', desc: 'модель сессии: облачные DeepSeek и локальная LLM через Ollama' },
   { name: 'resume', usage: '/resume [id]', desc: 'продолжить сессию: по id или выбором из списка' },
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
@@ -2408,6 +2433,24 @@ const MCP_PRESETS = {
     script: 'C:\\Users\\user\\FlutterProjects\\sl-figma-plugin\\mcp-server.js',
     what: 'выделение, цвета, шрифты, CSS, стили и переменные файла, экспорт PNG/SVG',
   },
+  // Свой MCP-сервер поддержки (день 33, каталог `support-mcp`): тикеты и
+  // пользователи из локального JSON вместо CRM. Это ровно тот вариант задания,
+  // где «CRM» — файл: сервер читает его и отдаёт теми же инструментами, какими
+  // отдавал бы удалённая система, поэтому замена на настоящую CRM не меняет
+  // ни промпт, ни скилл.
+  support: {
+    serverName: 'support',
+    title: 'Support MCP (локальный, stdio)',
+    transport: 'stdio',
+    command: 'python',
+    // Пакет запускается модулем (`-m`), поэтому в аргументах нет пути к скрипту:
+    // путь к каталогу пакета уходит в PYTHONPATH (см. resolveMcpServers).
+    // Раскладка у каждого своя — переопределяется окружением.
+    module: 'support_mcp.server',
+    packageEnv: 'DSH_TERM_SUPPORT_MCP_DIR',
+    packageDir: 'support-mcp',
+    what: 'тикеты поддержки: список, карточка с перепиской, пользователь, поиск по тексту',
+  },
 }
 const MCP_DEFAULT_PRESET = 'github'
 const MCP_FULL_TOOLSETS = 'all'
@@ -2446,6 +2489,7 @@ function mcpNormalizeUrl(raw) {
 function resolveMcpServers(opts) {
   const servers = []
   const unknown = []
+  const cwd = opts.workspace ?? process.cwd()
   for (const raw of opts.mcp ?? []) {
     const name = String(raw).trim().toLowerCase()
     if (!name) continue
@@ -2454,6 +2498,21 @@ function resolveMcpServers(opts) {
     // Локальный stdio-сервер: адреса нет, есть команда. Путь к скрипту можно
     // переопределить окружением (у каждого своя раскладка репозитория).
     if (preset.transport === 'stdio') {
+      // Два вида локальных серверов: скрипт (figma-мост: `node mcp-server.js`) и
+      // python-пакет (`python -m support_mcp.server`). Во втором каталог пакета
+      // едет в PYTHONPATH — иначе модуль не найдётся, и ошибка будет невнятной.
+      if (preset.module) {
+        const dir = resolve(cwd, preset.packageEnv
+          ? (String(process.env[preset.packageEnv] ?? '').trim() || preset.packageDir)
+          : preset.packageDir)
+        servers.push({
+          ...preset,
+          dir,
+          args: ['-m', preset.module],
+          env: { ...(preset.env ?? {}), PYTHONPATH: dir, PYTHONIOENCODING: 'utf-8' },
+        })
+        continue
+      }
       const fromEnv = preset.scriptEnv ? String(process.env[preset.scriptEnv] ?? '').trim() : ''
       servers.push({ ...preset, script: fromEnv || preset.script, args: preset.args ?? [] })
       continue
@@ -2486,6 +2545,13 @@ function mcpTarget(server) {
 /** Проверка, что файл stdio-сервера на месте: без него зонд упадёт невнятно. */
 function mcpStdioMissing(server) {
   if (server.transport !== 'stdio') return null
+  // Сервер-пакет (`python -m …`): проверяем каталог, из которого он импортируется.
+  if (server.module) {
+    if (!server.dir || !existsSync(server.dir)) {
+      return `не найден каталог пакета ${server.dir || '(не задан)'} — укажи его в ${server.packageEnv ?? 'конфиге'}`
+    }
+    return null
+  }
   const script = server.script ?? ''
   if (script && !existsSync(script)) {
     return `не найден ${script} — укажи путь к mcp-server.js в ${server.scriptEnv ?? 'конфиге'}`
@@ -2549,9 +2615,15 @@ function mcpPatchYaml(servers) {
       const stdioArgs = [...(s.args ?? []), ...(s.script ? [s.script] : [])]
       lines.push('        args:')
       for (const arg of stdioArgs) lines.push(`          - '${String(arg).replace(/'/g, "''")}'`)
-      for (const [key, value] of Object.entries(s.env ?? {})) {
-        if (!lines.includes('        env:')) lines.push('        env:')
-        lines.push(`          ${key}: '${String(value).replace(/'/g, "''")}'`)
+      // `env:` — свой для КАЖДОГО сервера: py-серверы несут в нём PYTHONPATH. Раньше
+      // блок писался один раз на весь файл, и у второго stdio-сервера переменные
+      // уезжали в `args` — YAML валился на «bad indentation» (день 33: RAG + поддержка).
+      const envEntries = Object.entries(s.env ?? {})
+      if (envEntries.length) {
+        lines.push('        env:')
+        for (const [key, value] of envEntries) {
+          lines.push(`          ${key}: '${String(value).replace(/'/g, "''")}'`)
+        }
       }
       continue
     }
@@ -3912,6 +3984,9 @@ async function main() {
     log.line('  --rag-margin <0..1> переопределить маржу от лучшего результата (флаг сессии главнее реестра)')
     log.line('  --rag-min-dense <0..1>  переопределить пол применимости базы')
     log.line('  --rag-min-keep <n>  сколько фрагментов оставить даже ниже порога (default 2)')
+    log.line('  --support [<тикет>] режим техподдержки: обращение из support-mcp/data + FAQ + задача в INFRA')
+    log.line('                      без аргумента — меню открытых обращений (то же: /support)')
+    log.line('  --support-check <тикет>  показать слепок обращения и промпт режима (без сессии и модели)')
     log.line('  --color <режим>     цвет и markdown-рендер: auto | always | never (default auto)')
     log.line('                      always — красить даже без TTY и при NO_COLOR (env DSH_TERM_COLOR)')
     log.line('  --llm-check         диагностика локальной модели: маршрут в settings.yaml и модели Ollama')
@@ -3938,6 +4013,8 @@ async function main() {
     log.line('  /rag [list]  базы знаний сессии (--rag): что подключено и что есть в .dsh/rag.json')
     log.line('  /rag-brief <вопрос>  справка по базе по шаблону: ОТВЕТ + ИСТОЧНИКИ + ЦИТАТЫ')
     log.line('                идёт мимо агента, формат и проверка цитат гарантированы кодом')
+    log.line('  /support [<тикет>|off]  режим техподдержки: данные обращения + FAQ + задача в INFRA')
+    log.line('                без аргумента — меню открытых обращений; off — выключить режим')
     log.line('  /model [имя|show]  модель сессии: облачные DeepSeek и локальная LLM (Ollama)')
     log.line('  /publish-day [--no-review]  git+gh: коммит → push → PR day→week → ревью агентом (по .dsh/SKILLS)')
     log.line('  /review-pr [<номер|ссылка|ветка>] [--force] [--dry-run]')
@@ -4007,6 +4084,35 @@ async function main() {
     if (node) log.line(`node-id: ${node}`)
     else log.err('node-id не найден: нужна ссылка Figma с параметром node-id=…')
     process.exitCode = node ? 0 : 1
+    return
+  }
+
+  // ---- --support-check: что уйдёт в системный промпт режима поддержки ----------
+  // Диагностика без сессии и модели: слепок обращения и правила видны текстом —
+  // иначе проверить режим можно было бы только живым прогоном (день 33).
+  if (opts.supportCheck !== undefined) {
+    const registry = readRagRegistry(opts.workspace)
+    const baseEntry = registry.bases?.[SUPPORT_BASE] ?? null
+    const baseDir = baseEntry ? resolve(opts.workspace, String(baseEntry.index ?? '')) : ''
+    const hasFaq = !!baseEntry && !!baseDir && existsSync(baseDir)
+    const hasTracker = !!String(process.env[MCP_PRESETS.sltracker.tokenEnv] ?? '').trim()
+    const preview = supportPromptPreview(opts.supportCheck, {
+      cwd: opts.workspace, hasFaq, hasTracker,
+    })
+    if (preview.error) {
+      log.err(`support-check: ${preview.error}`)
+      log.dim(`данные: ${join(opts.workspace, SUPPORT_DATA_DIR)} (переопределение: DSH_TERM_SUPPORT_DATA)`)
+      process.exitCode = 1
+      return
+    }
+    log.line(`${C.bold}support-check${C.off} ${preview.ticket.id} — «${preview.ticket.subject}»`)
+    log.dim(`  ${supportUserLine(preview.user, preview.ticket.user)}`)
+    log.dim(`  FAQ: ${hasFaq ? `база «${SUPPORT_BASE}»` : `не подключён${baseEntry ? ` (нет каталога ${baseDir})` : ' (нет записи в реестре)'}`}`
+      + ` · трекер: ${hasTracker ? `${SUPPORT_DEV_QUEUE} через sltracker` : `нет ${MCP_PRESETS.sltracker.tokenEnv} — задача текстом`}`)
+    if (preview.usersError) log.dim(`  ${preview.usersError}`)
+    log.line('  системный промпт режима:')
+    for (const line of preview.text.split('\n')) log.dim(`    ${line}`)
+    process.exitCode = 0
     return
   }
 
@@ -4159,6 +4265,8 @@ async function main() {
     profileNotice: null,       // объявление смены профиля — уходит префиксом к след. промпту
     profileLearning: false,    // фоновый разбор текущего сообщения на персонализацию
     mcp: null,                 // MCP-серверы (day16): серверы, зонды, цена в промпте
+    support: null,             // режим поддержки (day33): обращение, FAQ, трекер
+    supportInstruction: null,  // инструкция режима поддержки — в тот же system prompt
   }
   // В one-shot state не сохраняем: прогоны не должны затирать «последнюю сессию»
   // для интерактивного режима (у каждого -p запуска и так своя свежая сессия).
@@ -4260,6 +4368,9 @@ async function main() {
     const parts = []
     if (profile !== null) parts.push(userProfilePromptText(profile))
     if (state.ragInstruction) parts.push(state.ragInstruction)
+    // Режим поддержки (день 33): слепок обращения и правила — тот же оверлей,
+    // что профиль и база знаний, потому что personaPrefix один.
+    if (state.supportInstruction) parts.push(state.supportInstruction)
     if (parts.length) {
       try {
         mkdirSync(opts.dshHome, { recursive: true })
@@ -4296,6 +4407,35 @@ async function main() {
     process.exit(1)
   }
   const mcpPatchPath = join(opts.dshHome, MCP_PATCH_NAME)
+
+  /**
+   * Записать оверлей MCP-серверов и подключить его к рантайму.
+   *
+   * Отдельной функцией, потому что тот же оверлей переписывается при смене
+   * режима (день 33, `/support`): набор серверов меняется уже в живой сессии, а
+   * system prompt и точки монтирования фиксируются при спавне.
+   */
+  function applyMcpServers(servers, { announce = false } = {}) {
+    if (!servers.length) return false
+    try {
+      mkdirSync(opts.dshHome, { recursive: true })
+      writeFileSync(mcpPatchPath, mcpPatchYaml(servers), 'utf8')
+      // Проверяем именно первый сервер — так же, как на старте: `insert` не
+      // идемпотентен, и повторная вставка валит дерево плагинов.
+      if (profileHasMcpRow(opts.dshHome, opts.profile, servers[0].serverName)) {
+        if (announce) log.dim('mcp: строка уже есть в пользовательском слое профиля — оверлей не подключаю (insert не идемпотентен)')
+        return true
+      }
+      if (!(opts.patches ?? []).includes(mcpPatchPath)) {
+        opts.patches = [...(opts.patches ?? []), mcpPatchPath]
+      }
+      return true
+    } catch (e) {
+      log.err(`mcp patch failed: ${e.message}`)
+      return false
+    }
+  }
+
   if (mcpServers.length) {
     mcpAttachTokens(mcpServers)
     for (const s of mcpServers) {
@@ -4310,19 +4450,7 @@ async function main() {
       mcpServers.length = 0
       mcpServers.push(...usable)
     }
-    if (mcpServers.length) {
-      try {
-        mkdirSync(opts.dshHome, { recursive: true })
-        writeFileSync(mcpPatchPath, mcpPatchYaml(mcpServers), 'utf8')
-        if (profileHasMcpRow(opts.dshHome, opts.profile, mcpServers[0].serverName)) {
-          log.dim('mcp: строка уже есть в пользовательском слое профиля — оверлей не подключаю (insert не идемпотентен)')
-        } else {
-          opts.patches = [...(opts.patches ?? []), mcpPatchPath]
-        }
-      } catch (e) {
-        log.err(`mcp patch failed: ${e.message}`)
-      }
-    }
+    if (mcpServers.length) applyMcpServers(mcpServers, { announce: true })
   }
   opts.mcpEnv = mcpEnv
   state.mcp = mcpServers.length
@@ -4349,6 +4477,171 @@ async function main() {
       + (opts.localModels.includes(opts.model)
         ? '' : ` · ВНИМАНИЕ: модели нет в Ollama — ollama pull ${opts.model}`))
     if (llmSettingsPath) log.dim(`  маршрут: ${llmSettingsPath}`)
+  }
+
+  // ---- поддержка пользователей (день 33) --------------------------------------
+  /**
+   * Войти в режим поддержки по обращению.
+   *
+   * Режим — это три источника данных сразу: слепок обращения из локального JSON
+   * (кодом, не моделью), база FAQ (`rag_search`) и трекер задач (задача в
+   * разработку). Часть из них может отсутствовать — тогда режим работает
+   * деградированно, но об этом сказано и в консоли, и в промпте.
+   *
+   * @returns {Promise<boolean>} удалось ли применить режим (нужен перезапуск рантайма).
+   */
+  async function enterSupportMode(ticketId) {
+    const got = supportTicket(ticketId, opts.workspace)
+    if (got.error) {
+      log.err(`support: ${got.error}`)
+      return false
+    }
+    const ticket = got.ticket
+    const users = supportUsers(opts.workspace)
+    if (users.error) log.dim(`support: ${users.error} — продолжаю без карточки пользователя`)
+    const user = supportUserOf(ticket, users.users)
+    const notes = []
+
+    // 1) FAQ продукта. RAG-сервер один на все базы, поэтому он пересобирается
+    // целиком: «дописать» базу вторым процессом нельзя — оба звали бы один индекс.
+    let hasFaq = (state.rag?.names ?? []).includes(SUPPORT_BASE)
+    if (!hasFaq) {
+      const registry = readRagRegistry(opts.workspace)
+      const entry = registry.bases?.[SUPPORT_BASE] ?? null
+      const dir = entry ? resolve(opts.workspace, String(entry.index ?? '')) : ''
+      if (registry.error) notes.push(`FAQ не подключён: ${registry.error}`)
+      else if (registry.missing) notes.push(`FAQ не подключён: нет реестра ${registry.path}`)
+      else if (!entry) notes.push(`FAQ не подключён: в ${registry.path} нет базы «${SUPPORT_BASE}»`)
+      else if (!existsSync(dir)) notes.push(`FAQ не подключён: нет каталога ${dir}`)
+      else {
+        const names = [...(state.rag?.names ?? []), SUPPORT_BASE]
+        const server = ragServerFor(names, registry.bases, { cwd: opts.workspace, opts })
+        // Старый сервер базы заменяется, а не добавляется: имя у него то же (`rag`).
+        const kept = (state.mcp?.servers ?? []).filter((s) => s.serverName !== RAG_SERVER_NAME)
+        const probes = state.mcp?.probes ?? new Map()
+        probes.delete(RAG_SERVER_NAME) // зонд прежнего набора баз больше не актуален
+        state.rag = { names, servers: [server], registry: registry.path, filter: server.filter }
+        state.ragInstruction = ragInstructionText(names, registry.bases)
+        state.mcp = { servers: [...kept, server], probes, tokens: 0, patchPath: mcpPatchPath }
+        hasFaq = true
+      }
+    }
+
+    // 2) MCP поддержки (локальный JSON) и трекера. Трекер подключаем только при
+    // наличии токена: без него мост отдавал бы 401 на каждый вызов, а причина
+    // терялась бы среди ошибок инструментов.
+    const have = new Set((state.mcp?.servers ?? []).map((s) => s.serverName))
+    const wanted = [SUPPORT_MCP_PRESET]
+    const trackerToken = String(process.env[MCP_PRESETS.sltracker.tokenEnv] ?? '').trim()
+    if (trackerToken) wanted.push(MCP_PRESETS.sltracker.serverName)
+    const added = []
+    for (const name of wanted) {
+      if (have.has(name)) continue
+      const resolved = resolveMcpServers({ ...opts, mcp: [name] })
+      const server = resolved.servers[0]
+      if (!server) { notes.push(`MCP «${name}» не собран`); continue }
+      mcpAttachTokens([server])
+      if (server.tokenError) { notes.push(`MCP «${name}» не подключён: ${server.tokenError}`); continue }
+      if (server.tokenEnv && server.token) mcpEnv[server.tokenEnv] = server.token
+      added.push(server)
+    }
+    const hasTracker = new Set([...have, ...added.map((s) => s.serverName)])
+      .has(MCP_PRESETS.sltracker.serverName)
+    if (added.length) {
+      const servers = [...(state.mcp?.servers ?? []), ...added]
+      state.mcp = {
+        servers, probes: state.mcp?.probes ?? new Map(),
+        tokens: 0, patchPath: mcpPatchPath,
+      }
+    }
+
+    // 3) Промпт: данные обращения + правила ответа + правило задачи.
+    state.support = {
+      id: ticket.id,
+      subject: ticket.subject,
+      status: ticket.status,
+      user: user?.name ?? ticket.user,
+      faq: hasFaq,
+      tracker: hasTracker,
+    }
+    state.supportInstruction = supportInstructionText({ ticket, user, hasFaq, hasTracker })
+    applyUserProfile(state.userProfile, { dirty: false })
+    if (state.mcp?.servers?.length) applyMcpServers(state.mcp.servers)
+
+    // Зонды новых stdio-серверов — ДО перезапуска: поднимать второй экземпляр
+    // поверх живого рантайма нельзя, а после рестарта они уже заняты харнессом.
+    for (const s of state.mcp?.servers ?? []) {
+      if (state.mcp.probes.has(s.serverName)) continue
+      const probe = await mcpProbe(s)
+      state.mcp.probes.set(s.serverName, probe)
+      if (!probe.ok) log.err(`mcp ${s.serverName}: ${mcpProbeLine(s, probe)}`)
+    }
+
+    const ok = await restartRuntime(`режим поддержки: ${ticket.id}`)
+    log.line('')
+    log.ok(`режим поддержки: ${ticket.id} — «${ticket.subject}»`
+      + ` (${SUPPORT_STATUS_LABELS[ticket.status] ?? ticket.status})`)
+    log.dim(`  ${supportUserLine(user, ticket.user)}`)
+    log.dim(`  переписка: ${(ticket.messages ?? []).length} сообщений · слепок ушёл в системный промпт`)
+    log.dim(`  FAQ: ${hasFaq ? `база «${SUPPORT_BASE}» · rag_search` : 'не подключён — ответы без источников'}`)
+    log.dim(`  трекер: ${hasTracker ? `sltracker · задача в очередь ${SUPPORT_DEV_QUEUE}` : 'не подключён — задача уйдёт текстом'}`)
+    for (const note of notes) log.dim(`  ${note}`)
+    if (ok) {
+      log.dim('  опишите проблему пользователя в чате: сначала ответ, затем задача в разработку')
+      log.dim(`  другое обращение: /support <номер> · выключить: /support off`)
+    }
+    return ok
+  }
+
+  /** Выключить режим поддержки: промпт возвращается к обычному (данные и MCP остаются). */
+  async function leaveSupportMode() {
+    if (!state.support) {
+      log.dim('режим поддержки не включён')
+      return false
+    }
+    const id = state.support.id
+    state.support = null
+    state.supportInstruction = null
+    applyUserProfile(state.userProfile, { dirty: false })
+    const ok = await restartRuntime('режим поддержки выключен')
+    if (ok) log.dim(`режим поддержки выключен (было обращение ${id}); база FAQ и MCP остались в сессии`)
+    return ok
+  }
+
+  /**
+   * Выбрать обращение для режима поддержки: меню в TTY, список номеров в пайпе.
+   * `null` — отмена или нет данных (причина уже напечатана).
+   */
+  async function pickSupportTicket() {
+    const got = supportTickets(opts.workspace)
+    if (got.error) {
+      log.err(`support: ${got.error}`)
+      log.dim('ожидается каталог support-mcp/data (tickets.json, users.json) или DSH_TERM_SUPPORT_DATA')
+      return null
+    }
+    const open = got.tickets.filter((t) => t.status !== 'closed')
+    if (!open.length) {
+      log.dim('открытых обращений нет')
+      return null
+    }
+    const users = supportUsers(opts.workspace).users
+    const owner = (t) => supportUserOf(t, users)?.name ?? t.user
+    const items = open.map((t) => ({
+      id: t.id,
+      label: `${t.id} — ${t.subject}`,
+      note: `${owner(t)} · ${SUPPORT_STATUS_LABELS[t.status] ?? t.status} · ${(t.messages ?? []).length} сообщений`,
+      current: state.support?.id === t.id,
+    }))
+    if (!colorOk() || !process.stdin.isTTY) {
+      // Пайп и one-shot: меню показать нечем — печатаем номера и подсказку.
+      log.line('открытые обращения:')
+      for (const t of open) {
+        log.line(`  ${t.id} — ${t.subject} · ${owner(t)} · ${(t.messages ?? []).length} сообщений`)
+      }
+      log.dim('выбрать: /support <номер> · пример: /support T-1042')
+      return null
+    }
+    return await pickListTTY({ prompt: 'support> ', items })
   }
 
   // Локальные stdio-серверы зондируем ДО спавна рантайма. Порядок принципиален:
@@ -5407,6 +5700,37 @@ async function main() {
         log.dim('  сравнить режимы: --rag-no-filter (без порогов) или --rag-margin <0..1>')
         break
       }
+      case 'support': {
+        // Режим техподдержки (день 33): обращение → данные в промпт, FAQ в базу,
+        // разбор → задача в разработку. Без аргумента — меню открытых обращений;
+        // `off` — выключить режим (база и MCP остаются, данные тикета уходят).
+        const arg = parts.slice(1).join(' ').trim()
+        const low = arg.toLowerCase()
+        if (low === 'off' || low === 'stop' || low === 'выход') {
+          await leaveSupportMode()
+          break
+        }
+        if (low === 'show' || low === 'status') {
+          if (!state.support) {
+            log.dim('режим поддержки не включён · включить: /support <номер> или /support (меню)')
+            break
+          }
+          const s = state.support
+          log.line(`режим поддержки: ${s.id} — «${s.subject}» (${SUPPORT_STATUS_LABELS[s.status] ?? s.status})`)
+          log.dim(`  пользователь: ${s.user}`)
+          log.dim(`  FAQ: ${s.faq ? 'подключён' : 'нет'} · трекер: ${s.tracker ? `подключён (${SUPPORT_DEV_QUEUE})` : 'нет'}`)
+          break
+        }
+        let ticketId = arg
+        if (!ticketId) {
+          ticketId = await pickSupportTicket()
+          if (!ticketId) break
+        }
+        if (!(await enterSupportMode(ticketId))) {
+          log.err('support: режим не применён — рантайм не перезапустился (см. ошибку выше)')
+        }
+        break
+      }
       case 'rag-brief': {
         // Справка идёт МИМО агента: тот же строгий путь, что в проверке дня 24
         // (`doc_index brief`), поэтому форма ответа и проверка источников с цитатами
@@ -5795,6 +6119,23 @@ async function main() {
   }
 
   const oneShotText = opts.prompt ?? ''
+
+  // ---- --support: сессия сразу в режиме поддержки (день 33) --------------------
+  // Флаг нужен для прогонов и для входа «сразу в обращение»: дальнейший порядок
+  // тот же, что у `/support <номер>` — данные в промпт, FAQ в базу, трекер в MCP.
+  if (opts.support !== undefined) {
+    let ticketId = String(opts.support).trim()
+    if (!ticketId) ticketId = await pickSupportTicket()
+    if (!ticketId) {
+      log.dim('режим поддержки не включён — сессия продолжается как обычно')
+    } else if (!(await enterSupportMode(ticketId))) {
+      // Режим не применился — значит рантайм не перезапустился: отправлять промпт
+      // некуда, и молчаливое ожидание ответа выглядело бы как зависание.
+      log.err('режим поддержки не включён: рантайм не поднялся — см. ошибку выше')
+      try { await rpc.close() } catch {}
+      process.exit(1)
+    }
+  }
 
   if (opts.prompt !== undefined) {
     // One-shot (-p / --print): один ответ с флагами

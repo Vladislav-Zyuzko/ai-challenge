@@ -1,0 +1,46 @@
+[
+  {
+    "id": "u-101",
+    "name": "Ирина Соколова",
+    "email": "irina.sokolova@example.ru",
+    "plan": "team",
+    "since": "2026-03-14",
+    "platform": "Windows 11",
+    "dsh_term_version": "0.9.4",
+    "seats": 4,
+    "notes": "команда из четырёх разработчиков, у всех локальная модель через общий сервис"
+  },
+  {
+    "id": "u-102",
+    "name": "Павел Дорохов",
+    "email": "p.dorohov@example.ru",
+    "plan": "solo",
+    "since": "2026-08-02",
+    "platform": "Windows 10",
+    "dsh_term_version": "0.9.4",
+    "seats": 1,
+    "notes": "работает на ноутбуке без дискретной видеокарты"
+  },
+  {
+    "id": "u-103",
+    "name": "Мария Лебедева",
+    "email": "m.lebedeva@example.ru",
+    "plan": "team",
+    "since": "2025-12-21",
+    "platform": "macOS 14",
+    "dsh_term_version": "0.9.2",
+    "seats": 12,
+    "notes": "внедряет dsh-term в процесс ревью; версия отстаёт на два релиза"
+  },
+  {
+    "id": "u-104",
+    "name": "Артём Ковалёв",
+    "email": "a.kovalev@example.ru",
+    "plan": "solo",
+    "since": "2026-09-30",
+    "platform": "Windows 11",
+    "dsh_term_version": "0.9.4",
+    "seats": 1,
+    "notes": "первый месяц использования, часто меняет модели и базы знаний"
+  }
+]

@@ -165,6 +165,11 @@ def collect(cfg: Config) -> tuple[list[Note], list[str]]:
         rel_posix = rel.as_posix()
         parts = rel.parts
         allowed = any(rel_posix.startswith(prefix) for prefix in cfg.allow_dirs)
+        # Корпус «только эти каталоги»: для базы поддержки нужен FAQ продукта и его
+        # README, а не весь репозиторий.
+        if cfg.only_dirs and not any(rel_posix.startswith(prefix) for prefix in cfg.only_dirs):
+            skipped.append(rel_posix)
+            continue
         if any(part in cfg.exclude_dirs for part in parts) or rel.name in cfg.exclude_names:
             skipped.append(rel_posix)
             continue
