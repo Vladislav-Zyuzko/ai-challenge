@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -150,6 +151,56 @@ class SupportStore:
         payload = [self._tickets[ticket_id] for ticket_id in self._order]
         _write_json_atomic(self.data_dir / "tickets.json", payload)
         return {"id": ticket_id, "messages": len(ticket["messages"])}
+
+    def create_ticket(self, subject: str, text: str, user_id: str = "",
+                      component: str = "intake", tags: list[str] | None = None) -> dict:
+        """Завести новое обращение из первого сообщения пользователя.
+
+        Номер обращения пользователь не вводит и не знает — его присваивает поддержка.
+        Именно поэтому номер возвращается вызывающему: он нужен для ссылок, а не для входа.
+        """
+        if self.readonly:
+            raise SupportError("запись отключена: сервер запущен в режиме только чтения")
+        title = str(subject).strip()
+        if not title:
+            raise SupportError("пустая тема обращения: нужен короткий заголовок")
+        body = str(text).strip()
+        if not body:
+            raise SupportError("пустое сообщение: опишите проблему")
+        owner = str(user_id).strip()
+        if owner and owner not in self._users:
+            known = ", ".join(f"{u.get('id')} ({u.get('name')})" for u in self._users.values())
+            raise SupportError(f"пользователь не найден: {owner}. Известные: {known}")
+        ticket_id = self._next_id()
+        ticket = {
+            "id": ticket_id,
+            "user": owner or "",  # пусто — гость: карточки пользователя нет
+            "subject": title[:200],
+            "component": (str(component).strip() or "intake")[:40],
+            "status": "open",
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "tags": [str(t).strip() for t in (tags or []) if str(t).strip()],
+            "messages": [{
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "from": "user",
+                "text": body,
+            }],
+            "resolution": "",
+        }
+        self._tickets[ticket_id] = ticket
+        self._order.append(ticket_id)
+        payload = [self._tickets[key] for key in self._order]
+        _write_json_atomic(self.data_dir / "tickets.json", payload)
+        return self.ticket(ticket_id)
+
+    def _next_id(self) -> str:
+        """Следующий номер обращения: `T-<max+1>` по уже известным."""
+        numbers = []
+        for ticket_id in self._order:
+            match = re.fullmatch(r"T-(\d+)", str(ticket_id))
+            if match:
+                numbers.append(int(match.group(1)))
+        return f"T-{max(numbers, default=1000) + 1}"
 
     # --- внутреннее -----------------------------------------------------------
     def _require(self, ticket_id: str) -> dict:

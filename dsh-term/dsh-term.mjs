@@ -48,6 +48,8 @@ import {
   SUPPORT_STATUS_LABELS,
   supportInstructionText,
   supportDataDir,
+  supportIntakeInstructionText,
+  supportIntakePreview,
   supportPromptPreview,
   supportTicket,
   supportTickets,
@@ -1189,8 +1191,9 @@ function parseArgs(argv) {
     mcpCheck: undefined,     // --mcp-check [preset]: только соединение + список инструментов, без сессии
     offline: undefined,      // --mcp-check --offline: показать оверлей и выйти (без сети)
     rag: undefined,          // --rag <имя>: подключить базу знаний из .dsh/rag.json (повторяемый)
-    support: undefined,      // --support [<тикет>]: сразу режим поддержки (пусто — меню обращений)
-    supportCheck: undefined, // --support-check <тикет>: что уйдёт в системный промпт (без сессии)
+    support: undefined,      // --support [<тикет>]: режим поддержки (пусто — новое обращение)
+    supportCheck: undefined, // --support-check <тикет|new>: промпт режима (без сессии)
+    supportUser: undefined,  // --support-user <id|почта|имя>: кто обращается (env DSH_TERM_SUPPORT_USER)
     ragMargin: undefined,    // --rag-margin <0..1>: переопределить маржу от лучшего результата
     ragMinDense: undefined,  // --rag-min-dense <0..1>: переопределить пол применимости базы
     ragMinKeep: undefined,   // --rag-min-keep <n>: сколько фрагментов оставить даже ниже порога
@@ -1236,12 +1239,14 @@ function parseArgs(argv) {
       case '--rag-no-filter': opts.ragNoFilter = true; break
       case '--mcp': opts.mcp = [...(opts.mcp ?? []), next()]; break
       case '--support': {
-        // Необязательный аргумент: `--support T-1042` — сразу в тикет, без него — меню.
+        // Необязательный аргумент и три входа: без аргумента (или `new`) — первое
+        // обращение, `open` — меню уже заведённых, `T-1042` — конкретное.
         const v = argv[i + 1]
         opts.support = v && !v.startsWith('-') ? next() : ''
         break
       }
       case '--support-check': opts.supportCheck = next(); break
+      case '--user': case '--support-user': opts.supportUser = next(); break
       case '--mcp-toolsets': opts.mcpToolsets = next(); break
       case '--mcp-readwrite': opts.mcpReadwrite = true; break
       case '--mcp-check': {
@@ -1452,7 +1457,7 @@ const COMMANDS = [
   { name: 'mcp', usage: '/mcp [show|tools|refresh]', desc: 'MCP-серверы: соединение, список инструментов и их цена в промпте' },
   { name: 'rag', usage: '/rag [list]', desc: 'базы знаний сессии (--rag): что подключено и какие есть в реестре' },
   { name: 'rag-brief', usage: '/rag-brief <вопрос>', desc: 'справка по базе по шаблону: ответ + источники + цитаты (мимо агента)' },
-  { name: 'support', usage: '/support [<тикет>|off]', desc: 'режим техподдержки: FAQ + данные обращения + задача в разработку (INFRA)' },
+  { name: 'support', usage: '/support [<тикет>|open|off]', desc: 'режим техподдержки: без аргумента — новое обращение, FAQ + задача в INFRA' },
   { name: 'model', usage: '/model [имя|show]', desc: 'модель сессии: облачные DeepSeek и локальная LLM через Ollama' },
   { name: 'resume', usage: '/resume [id]', desc: 'продолжить сессию: по id или выбором из списка' },
   { name: 'new', usage: '/new', desc: 'начать новую сессию' },
@@ -2450,6 +2455,14 @@ const MCP_PRESETS = {
     module: 'support_mcp.server',
     packageEnv: 'DSH_TERM_SUPPORT_MCP_DIR',
     packageDir: 'support-mcp',
+    // Запись нужна только при заведении обращения (`/support` без номера): читать
+    // чужую переписку и заводить новую — разные права, поэтому флаг отдельный.
+    writeFlag: '--readwrite',
+    // Каталог данных: dsh-term читает его сам (supportDataDir) и обязан передать
+    // серверу тот же — иначе «своё хранилище» и MCP разъедутся (нашлось на прогоне:
+    // обращение уехало в фикстуры вместо временного каталога).
+    dataEnv: 'DSH_TERM_SUPPORT_DATA',
+    dataFlag: '--data',
     what: 'тикеты поддержки: список, карточка с перепиской, пользователь, поиск по тексту',
   },
 }
@@ -2515,11 +2528,19 @@ function resolveMcpServers(opts) {
         const dir = resolve(cwd, preset.packageEnv
           ? (String(process.env[preset.packageEnv] ?? '').trim() || preset.packageDir)
           : preset.packageDir)
+        const args = ['-m', preset.module]
+        // Сервер поддержки умеет заводить обращение, но только в режиме записи:
+        // включаем его ровно там, где пользователь оформляет новое обращение.
+        if (preset.writeFlag && opts.supportWrite) args.push(preset.writeFlag)
+        // Свой каталог данных едет в сервер флагом: dsh-term собирает слепок из него же,
+        // и разойтись этим путям нельзя (иначе обращение уедет в чужие данные).
+        const dataDir = preset.dataEnv ? String(process.env[preset.dataEnv] ?? '').trim() : ''
+        if (preset.dataFlag && dataDir) args.push(preset.dataFlag, resolve(cwd, dataDir))
         servers.push({
           ...preset,
           command: mcpPythonBin(preset.command),
           dir,
-          args: ['-m', preset.module],
+          args,
           env: { ...(preset.env ?? {}), PYTHONPATH: dir, PYTHONIOENCODING: 'utf-8' },
         })
         continue
@@ -4023,9 +4044,10 @@ async function main() {
     log.line('  --rag-margin <0..1> переопределить маржу от лучшего результата (флаг сессии главнее реестра)')
     log.line('  --rag-min-dense <0..1>  переопределить пол применимости базы')
     log.line('  --rag-min-keep <n>  сколько фрагментов оставить даже ниже порога (default 2)')
-    log.line('  --support [<тикет>] режим техподдержки: обращение из support-mcp/data + FAQ + задача в INFRA')
-    log.line('                      без аргумента — меню открытых обращений (то же: /support)')
-    log.line('  --support-check <тикет>  показать слепок обращения и промпт режима (без сессии и модели)')
+    log.line('  --support [<тикет>|open]  режим техподдержки: без аргумента — новое обращение')
+    log.line('                      (номер присвоит поддержка) · open — меню заведённых · T-1042 — разбор')
+    log.line('  --support-check <тикет|new>  слепок обращения и промпт режима (без сессии и модели)')
+    log.line('  --user <id|почта|имя>  кто обращается в поддержку (env DSH_TERM_SUPPORT_USER)')
     log.line('  --color <режим>     цвет и markdown-рендер: auto | always | never (default auto)')
     log.line('                      always — красить даже без TTY и при NO_COLOR (env DSH_TERM_COLOR)')
     log.line('  --llm-check         диагностика локальной модели: маршрут в settings.yaml и модели Ollama')
@@ -4052,8 +4074,8 @@ async function main() {
     log.line('  /rag [list]  базы знаний сессии (--rag): что подключено и что есть в .dsh/rag.json')
     log.line('  /rag-brief <вопрос>  справка по базе по шаблону: ОТВЕТ + ИСТОЧНИКИ + ЦИТАТЫ')
     log.line('                идёт мимо агента, формат и проверка цитат гарантированы кодом')
-    log.line('  /support [<тикет>|off]  режим техподдержки: данные обращения + FAQ + задача в INFRA')
-    log.line('                без аргумента — меню открытых обращений; off — выключить режим')
+    log.line('  /support [<тикет>|open|off]  режим техподдержки: без аргумента — новое обращение')
+    log.line('                (номер обращения присвоит поддержка) · open — меню заведённых · off — выключить')
     log.line('  /model [имя|show]  модель сессии: облачные DeepSeek и локальная LLM (Ollama)')
     log.line('  /publish-day [--no-review]  git+gh: коммит → push → PR day→week → ревью агентом (по .dsh/SKILLS)')
     log.line('  /review-pr [<номер|ссылка|ветка>] [--force] [--dry-run]')
@@ -4133,6 +4155,20 @@ async function main() {
     const base = supportBaseStatus(opts.workspace)
     const hasFaq = base.ok
     const hasTracker = !!String(process.env[MCP_PRESETS.sltracker.tokenEnv] ?? '').trim()
+    // `new` — промпт ПЕРВОГО обращения: тикета ещё нет, номер присвоит поддержка.
+    if (String(opts.supportCheck).toLowerCase() === 'new') {
+      const userKey = String(opts.supportUser ?? process.env.DSH_TERM_SUPPORT_USER ?? '').trim()
+      const intake = supportIntakePreview({ cwd: opts.workspace, userKey, hasFaq, hasTracker })
+      log.line(`${C.bold}support-check${C.off} new — первое обращение (номера пока нет)`)
+      log.dim(`  ${intake.user ? supportUserLine(intake.user, userKey) : `пользователь: ${userKey || 'гость'} — карточки нет`}`)
+      log.dim(`  FAQ: ${hasFaq ? `база «${SUPPORT_BASE}» · индекс ${base.outDir}` : `не подключён — ${base.error}`}`
+        + ` · MCP поддержки: запись включена · трекер: ${hasTracker ? `${SUPPORT_DEV_QUEUE} через sltracker` : `нет ${MCP_PRESETS.sltracker.tokenEnv} — задача текстом`}`)
+      if (intake.userError) log.dim(`  ${intake.userError}`)
+      log.line('  системный промпт режима:')
+      for (const line of intake.text.split('\n')) log.dim(`    ${line}`)
+      process.exitCode = 0
+      return
+    }
     const preview = supportPromptPreview(opts.supportCheck, {
       cwd: opts.workspace, hasFaq, hasTracker,
     })
@@ -4531,27 +4567,16 @@ async function main() {
 
   // ---- поддержка пользователей (день 33) --------------------------------------
   /**
-   * Войти в режим поддержки по обращению.
+   * Подключить к сессии всё, что нужно режиму поддержки: базу FAQ, MCP поддержки и
+   * трекер. Общая часть двух входов — «разбор существующего обращения» и «первое
+   * обращение»; различаются они только промптом и правами MCP.
    *
-   * Режим — это три источника данных сразу: слепок обращения из локального JSON
-   * (кодом, не моделью), база FAQ (`rag_search`) и трекер задач (задача в
-   * разработку). Часть из них может отсутствовать — тогда режим работает
-   * деградированно, но об этом сказано и в консоли, и в промпте.
-   *
-   * @returns {Promise<boolean>} удалось ли применить режим (нужен перезапуск рантайма).
+   * @param {{write?: boolean}} opts.write — запускать сервер поддержки с `--readwrite`
+   *   (нужно, чтобы завести обращение; чтение чужой переписки — без записи)
+   * @returns {Promise<{faq: boolean, tracker: boolean, notes: string[]}>}
    */
-  async function enterSupportMode(ticketId) {
-    const got = supportTicket(ticketId, opts.workspace)
-    if (got.error) {
-      log.err(`support: ${got.error}`)
-      return false
-    }
-    const ticket = got.ticket
-    const users = supportUsers(opts.workspace)
-    if (users.error) log.dim(`support: ${users.error} — продолжаю без карточки пользователя`)
-    const user = supportUserOf(ticket, users.users)
+  async function prepareSupportRuntime({ write = false } = {}) {
     const notes = []
-
     // 1) FAQ продукта. RAG-сервер один на все базы, поэтому он пересобирается
     // целиком: «дописать» базу вторым процессом нельзя — оба звали бы один индекс.
     let hasFaq = (state.rag?.names ?? []).includes(SUPPORT_BASE)
@@ -4583,8 +4608,17 @@ async function main() {
     if (trackerToken) wanted.push(MCP_PRESETS.sltracker.serverName)
     const added = []
     for (const name of wanted) {
-      if (have.has(name)) continue
-      const resolved = resolveMcpServers({ ...opts, mcp: [name] })
+      // Сервер поддержки уже подключён в режиме чтения, а нам нужна запись:
+      // пересобираем его с флагом, иначе `support_create_ticket` не зарегистрируется.
+      const existing = (state.mcp?.servers ?? []).find((s) => s.serverName === name)
+      if (existing) {
+        const needsWrite = write && name === SUPPORT_MCP_PRESET && !existing.args?.includes(MCP_PRESETS.support.writeFlag)
+        if (!needsWrite) continue
+        state.mcp.servers = state.mcp.servers.filter((s) => s.serverName !== name)
+        state.mcp.probes.delete(name)
+        have.delete(name)
+      }
+      const resolved = resolveMcpServers({ ...opts, mcp: [name], supportWrite: write })
       const server = resolved.servers[0]
       if (!server) { notes.push(`MCP «${name}» не собран`); continue }
       mcpAttachTokens([server])
@@ -4611,11 +4645,51 @@ async function main() {
     }
     const trackerDropped = mcpApplied.skipped.includes(MCP_PRESETS.sltracker.serverName)
     const faqDropped = hasFaq && mcpApplied.skipped.includes(RAG_SERVER_NAME)
-    if (faqDropped) notes.push(`FAQ не подключён: оверлей базы не применён`)
-    const faqReady = hasFaq && !faqDropped
-    const trackerReady = hasTracker && !trackerDropped
+    if (faqDropped) notes.push('FAQ не подключён: оверлей базы не применён')
+    const supportDropped = mcpApplied.skipped.includes(SUPPORT_MCP_PRESET)
+    if (supportDropped) notes.push(`MCP «${SUPPORT_MCP_PRESET}» не подключён: оверлей не применён`)
 
-    // 4) Промпт: данные обращения + правила ответа + правило задачи.
+    // Зонды новых stdio-серверов — ДО перезапуска: поднимать второй экземпляр
+    // поверх живого рантайма нельзя, а после рестарта они уже заняты харнессом.
+    for (const s of state.mcp?.servers ?? []) {
+      if (state.mcp.probes.has(s.serverName)) continue
+      const probe = await mcpProbe(s)
+      state.mcp.probes.set(s.serverName, probe)
+      if (!probe.ok) log.err(`mcp ${s.serverName}: ${mcpProbeLine(s, probe)}`)
+    }
+
+    return {
+      faq: hasFaq && !faqDropped,
+      tracker: hasTracker && !trackerDropped,
+      store: !supportDropped,
+      notes,
+    }
+  }
+
+  /**
+   * Войти в режим поддержки по обращению.
+   *
+   * Режим — это три источника данных сразу: слепок обращения из локального JSON
+   * (кодом, не моделью), база FAQ (`rag_search`) и трекер задач (задача в
+   * разработку). Часть из них может отсутствовать — тогда режим работает
+   * деградированно, но об этом сказано и в консоли, и в промпте.
+   *
+   * @returns {Promise<boolean>} удалось ли применить режим (нужен перезапуск рантайма).
+   */
+  async function enterSupportMode(ticketId) {
+    const got = supportTicket(ticketId, opts.workspace)
+    if (got.error) {
+      log.err(`support: ${got.error}`)
+      return false
+    }
+    const ticket = got.ticket
+    const users = supportUsers(opts.workspace)
+    if (users.error) log.dim(`support: ${users.error} — продолжаю без карточки пользователя`)
+    const user = supportUserOf(ticket, users.users)
+    const run = await prepareSupportRuntime({ write: false })
+    const { notes, faq: faqReady, tracker: trackerReady } = run
+
+    // Промпт: данные обращения + правила ответа + правило задачи.
     state.support = {
       id: ticket.id,
       subject: ticket.subject,
@@ -4628,15 +4702,6 @@ async function main() {
       ticket, user, hasFaq: faqReady, hasTracker: trackerReady,
     })
     applyUserProfile(state.userProfile, { dirty: false })
-
-    // Зонды новых stdio-серверов — ДО перезапуска: поднимать второй экземпляр
-    // поверх живого рантайма нельзя, а после рестарта они уже заняты харнессом.
-    for (const s of state.mcp?.servers ?? []) {
-      if (state.mcp.probes.has(s.serverName)) continue
-      const probe = await mcpProbe(s)
-      state.mcp.probes.set(s.serverName, probe)
-      if (!probe.ok) log.err(`mcp ${s.serverName}: ${mcpProbeLine(s, probe)}`)
-    }
 
     const ok = await restartRuntime(`режим поддержки: ${ticket.id}`)
     log.line('')
@@ -4666,6 +4731,57 @@ async function main() {
     applyUserProfile(state.userProfile, { dirty: false })
     const ok = await restartRuntime('режим поддержки выключен')
     if (ok) log.dim(`режим поддержки выключен (было обращение ${id}); база FAQ и MCP остались в сессии`)
+    return ok
+  }
+
+  /**
+   * Режим поддержки для ПЕРВОГО обращения: тикета ещё нет, пользователь просто
+   * пишет в чат. Номер обращения присваивает поддержка — агент заводит его сам
+   * инструментом `support_create_ticket` и называет в ответе; вводить номер
+   * пользователю не нужно и не за чем.
+   *
+   * @returns {Promise<boolean>} удалось ли применить режим
+   */
+  async function startSupportIntake() {
+    const users = supportUsers(opts.workspace)
+    const userKey = String(opts.supportUser ?? process.env.DSH_TERM_SUPPORT_USER ?? '').trim()
+    const intake = supportIntakePreview({
+      cwd: opts.workspace, userKey, hasFaq: true, hasTracker: true, hasStore: true,
+    })
+    if (intake.userError) log.dim(`support: ${intake.userError}`)
+    const run = await prepareSupportRuntime({ write: true })
+    const { notes, faq: faqReady, tracker: trackerReady, store: storeReady } = run
+
+    state.support = {
+      id: null,
+      intake: true,
+      subject: 'первое обращение',
+      status: 'open',
+      user: intake.user?.name ?? (userKey || 'гость'),
+      faq: faqReady,
+      tracker: trackerReady,
+    }
+    state.supportInstruction = supportIntakeInstructionText({
+      user: intake.user,
+      userKey: intake.user ? '' : userKey,
+      hasFaq: faqReady,
+      hasTracker: trackerReady,
+      hasStore: storeReady,
+    })
+    applyUserProfile(state.userProfile, { dirty: false })
+
+    const ok = await restartRuntime('режим поддержки: новое обращение')
+    log.line('')
+    log.ok('режим поддержки: новое обращение (номера пока нет — заведём по ходу)')
+    log.dim(`  ${intake.user ? supportUserLine(intake.user, userKey) : `пользователь: ${userKey || 'гость'} — карточки нет`}`)
+    log.dim(`  FAQ: ${faqReady ? `база «${SUPPORT_BASE}» · rag_search` : 'не подключён — ответы без источников'}`)
+    log.dim(`  MCP поддержки: ${storeReady ? `подключён с записью — обращение заведётся само` : 'не подключён — обращение не заведу'}`)
+    log.dim(`  трекер: ${trackerReady ? `sltracker · задача в очередь ${SUPPORT_DEV_QUEUE}` : 'не подключён — задача уйдёт текстом'}`)
+    for (const note of notes) log.dim(`  ${note}`)
+    if (ok) {
+      log.dim('  опишите проблему одним сообщением: ответ + обращение + задача в разработку')
+      log.dim('  разобрать уже заведённое: /support open · выключить: /support off')
+    }
     return ok
   }
 
@@ -5762,9 +5878,11 @@ async function main() {
         break
       }
       case 'support': {
-        // Режим техподдержки (день 33): обращение → данные в промпт, FAQ в базу,
-        // разбор → задача в разработку. Без аргумента — меню открытых обращений;
-        // `off` — выключить режим (база и MCP остаются, данные тикета уходят).
+        // Режим техподдержки (день 33). Два входа, как в жизни:
+        //   /support        — ПЕРВОЕ обращение: пользователь пишет проблему, номер
+        //                     обращения присваивается по ходу (его не вводят);
+        //   /support T-1042 — разбор уже заведённого обращения (сторона поддержки).
+        // `off` выключает режим, `open` показывает меню заведённых обращений.
         const arg = parts.slice(1).join(' ').trim()
         const low = arg.toLowerCase()
         if (low === 'off' || low === 'stop' || low === 'выход') {
@@ -5773,22 +5891,33 @@ async function main() {
         }
         if (low === 'show' || low === 'status') {
           if (!state.support) {
-            log.dim('режим поддержки не включён · включить: /support <номер> или /support (меню)')
+            log.dim('режим поддержки не включён · включить: /support (новое обращение)')
             break
           }
           const s = state.support
-          log.line(`режим поддержки: ${s.id} — «${s.subject}» (${SUPPORT_STATUS_LABELS[s.status] ?? s.status})`)
+          log.line(s.intake
+            ? 'режим поддержки: новое обращение (номер присвоится при оформлении)'
+            : `режим поддержки: ${s.id} — «${s.subject}» (${SUPPORT_STATUS_LABELS[s.status] ?? s.status})`)
           log.dim(`  пользователь: ${s.user}`)
           log.dim(`  FAQ: ${s.faq ? 'подключён' : 'нет'} · трекер: ${s.tracker ? `подключён (${SUPPORT_DEV_QUEUE})` : 'нет'}`)
           break
         }
-        let ticketId = arg
-        if (!ticketId) {
-          ticketId = await pickSupportTicket()
-          if (!ticketId) break
+        if (low === 'open' || low === 'list' || low === 'menu') {
+          const picked = await pickSupportTicket()
+          if (!picked) break
+          if (!(await enterSupportMode(picked))) {
+            log.err('support: режим не применён — см. ошибку выше')
+          }
+          break
         }
-        if (!(await enterSupportMode(ticketId))) {
-          log.err('support: режим не применён — рантайм не перезапустился (см. ошибку выше)')
+        if (!arg || low === 'new' || low === 'новый') {
+          if (!(await startSupportIntake())) {
+            log.err('support: режим не применён — см. ошибку выше')
+          }
+          break
+        }
+        if (!(await enterSupportMode(arg))) {
+          log.err('support: режим не применён — см. ошибку выше')
         }
         break
       }
@@ -6182,17 +6311,27 @@ async function main() {
   const oneShotText = opts.prompt ?? ''
 
   // ---- --support: сессия сразу в режиме поддержки (день 33) --------------------
-  // Флаг нужен для прогонов и для входа «сразу в обращение»: дальнейший порядок
-  // тот же, что у `/support <номер>` — данные в промпт, FAQ в базу, трекер в MCP.
+  // Три входа, как у команды: без аргумента — ПЕРВОЕ обращение (пользователь пишет
+  // проблему, номер присваивает поддержка), `open` — меню заведённых, `T-1042` — разбор
+  // конкретного. Дальнейший порядок одинаковый: данные в промпт, FAQ в базу, трекер в MCP.
   if (opts.support !== undefined) {
-    let ticketId = String(opts.support).trim()
-    if (!ticketId) ticketId = await pickSupportTicket()
-    if (!ticketId) {
-      log.dim('режим поддержки не включён — сессия продолжается как обычно')
-    } else if (!(await enterSupportMode(ticketId))) {
-      // Режим не применился — значит рантайм не перезапустился: отправлять промпт
-      // некуда, и молчаливое ожидание ответа выглядело бы как зависание.
-      log.err('режим поддержки не включён: рантайм не поднялся — см. ошибку выше')
+    const arg = String(opts.support).trim()
+    const low = arg.toLowerCase()
+    let started = false
+    if (!arg || low === 'new') {
+      started = await startSupportIntake()
+    } else if (low === 'open' || low === 'list') {
+      const ticketId = await pickSupportTicket()
+      if (!ticketId) {
+        log.dim('режим поддержки не включён — сессия продолжается как обычно')
+      } else started = await enterSupportMode(ticketId)
+    } else {
+      started = await enterSupportMode(arg)
+    }
+    if (!started && arg && low !== 'open' && low !== 'list') {
+      // Режим не применился — значит новой цели отправлять промпт некуда: без явного
+      // выхода ожидание ответа выглядело бы как зависание.
+      log.err('режим поддержки не включён — см. ошибку выше')
       try { await rpc.close() } catch {}
       process.exit(1)
     }

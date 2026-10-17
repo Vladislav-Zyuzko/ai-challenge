@@ -208,3 +208,125 @@ export function supportPromptPreview(ticketId, { cwd = process.cwd(), hasFaq = t
     text: supportInstructionText({ ticket: got.ticket, user, hasFaq, hasTracker }),
   }
 }
+
+/** Короткая тема обращения из первого сообщения: первая фраза, ужатая до 60 символов. */
+export function supportIntakeSubject(text) {
+  const clean = String(text ?? '').replace(/\s+/g, ' ').trim()
+  if (!clean) return 'Обращение без описания'
+  const first = /^[^.!?…]*[.!?…]?/.exec(clean)?.[0]?.trim() || clean
+  const short = first.length > 60 ? `${first.slice(0, 57).trimEnd()}…` : first
+  return short.charAt(0).toUpperCase() + short.slice(1)
+}
+
+/**
+ * Промпт **первого** обращения: тикета ещё нет, пользователь только что написал.
+ *
+ * Это и есть нормальный вход в поддержку: номер обращения пользователь не знает и
+ * вводить его не должен — номер присваивает поддержка (инструмент `support_create_ticket`),
+ * а нужен он для ссылок в задаче разработки и в следующих сообщениях.
+ */
+export function supportIntakeInstructionText({ user, userKey, hasFaq, hasTracker, hasStore }) {
+  const indent = (text) => text.split('\n').map((l) => (l ? `  ${l}` : '')).join('\n')
+  const faqRule = hasFaq
+    ? 'Вопросы про поведение dsh-term проверяй по базе FAQ: `rag_search` (база `support`). '
+      + 'Ссылайся на заметку и строки, цитируй дословно 1–2 фрагмента.'
+    : 'База FAQ в этой сессии не подключена — отвечай по своим знаниям и честно скажи об этом.'
+  const owner = user
+    ? `${supportUserLine(user, userKey)} · id для инструмента: ${user.id}`
+    : `пользователь: ${userKey || 'гость'} — карточки нет. Версию dsh-term, ОС и прочее уточняй `
+      + 'в ответе, не выдумывай.'
+  const ownerLine = owner.charAt(0).toUpperCase() + owner.slice(1)
+  // Образец описания задачи: у первого обращения ещё нет переписки, поэтому «Симптом»
+  // заполняется дословной фразой пользователя, а не выдуманным пересказом.
+  const template = [
+    '## Откуда',
+    '- обращение поддержки: <номер, который вернул support_create_ticket>',
+    `- ${supportUserLine(user, userKey || 'гость')}`,
+    '',
+    '## Симптом',
+    '(дословная фраза пользователя из чата)',
+    '',
+    '## Диагноз',
+    '(причина: код, конфигурация, документация или окружение пользователя)',
+    '',
+    '## Что сделать',
+    '- [ ] (правка в коде / сообщение об ошибке / заметка в FAQ)',
+    '',
+    '## Как проверить',
+    '(шаги воспроизведения и ожидаемый результат)',
+  ].join('\n')
+  const registryBlock = hasStore
+    ? [
+      '1) Сначала заведи само обращение:',
+      '   mcp__support__support_create_ticket(subject: "<тема до 60 символов>",',
+      '     message: "<сообщение пользователя дословно>", user_id: "<id или пусто>")',
+      '   Номер обращения (T-…) — только из ответа инструмента. Не выдумывай его.',
+    ].join('\n')
+    : [
+      '1) MCP поддержки в сессии нет — обращение не заводи. Скажи об этом и дай текст',
+      '   обращения блоком «Новое обращение:» (тема + сообщение пользователя).',
+    ].join('\n')
+  const taskBlock = hasTracker
+    ? [
+      '2) Затем задачу в разработку одним вызовом:',
+      `   mcp__sltracker__create_task(queue: "${SUPPORT_DEV_QUEUE}",`,
+      `     title: "[${SUPPORT_DEV_TAG}] <что починить, коротко>",`,
+      '     description: <markdown по шаблону ниже>)',
+      `   Заголовок ОБЯЗАТЕЛЬНО начинается с "${SUPPORT_DEV_TAG}" — тегов у трекера нет,`,
+      '   префикс в заголовке и есть тег.',
+      'Шаблон описания (подставь факты, ничего не выдумывай):',
+      indent(template),
+      'В конце ответа — две строки: «Обращение: T-<номер>» и',
+      '«Задача в разработку: INFRA-<номер> — <заголовок>». Если дефекта нет:',
+      '«Задача в разработку: не требуется — <причина>».',
+    ].join('\n')
+    : [
+      '2) Трекер не подключён (нет токена): задачу дай текстом последним блоком',
+      `   «Задача в разработку (${SUPPORT_DEV_QUEUE}):» с заголовком «[${SUPPORT_DEV_TAG}] …».`,
+      indent(template),
+      'В конце ответа — строка «Обращение: T-<номер>», если обращение заведено.',
+    ].join('\n')
+  return [
+    'РЕЖИМ ТЕХПОДДЕРЖКИ dsh-term — ПЕРВОЕ ОБРАЩЕНИЕ. Ты — инженер поддержки продукта dsh-term',
+    '(терминальный CLI для DeepSeek Harness). Обращения ещё нет: пользователь только что написал',
+    'в чат, его сообщение придёт следующим.',
+    '',
+    `ДАННЫЕ: обращения нет. ${ownerLine}`,
+    'Всё, что известно о проблеме, — сообщение пользователя. Не придумывай версии, ОС, номера и цитаты.',
+    '',
+    'КАК ОТВЕЧАТЬ:',
+    '1. Сразу по делу: что происходит, почему, что сделать — шагами. Без «здравствуйте, спасибо за обращение».',
+    `2. ${faqRule}`,
+    '3. Факты о пользователе бери из блока выше или из `mcp__support__support_get_user`; чего нет — не сочиняй.',
+    '4. Если ответа нет ни в FAQ, ни в данных — скажи это прямо, первой строкой ответа:',
+    '   «в базе и в обращении этого нет», назови, какие данные нужны (лог, шаги, версия).',
+    '5. Вопросы не про dsh-term — вежливо верни к теме поддержки.',
+    '6. Не обещай сроки и не придумывай номера задач, которых не создал.',
+    '',
+    'ПОСЛЕ ОТВЕТА — ОФОРМИТЬ ОБРАЩЕНИЕ И ЗАДАЧУ:',
+    registryBlock,
+    taskBlock,
+  ].join('\n')
+}
+
+/** Превью промпта первого обращения — для `--support-check new` и тестов. */
+export function supportIntakePreview({ cwd = process.cwd(), userKey = '', hasFaq = true, hasTracker = true, hasStore = true } = {}) {
+  const users = supportUsers(cwd)
+  let user = null
+  let userError = users.error
+  if (userKey) {
+    user = users.users.find((u) => String(u.id).toLowerCase() === String(userKey).toLowerCase()
+      || String(u.email ?? '').toLowerCase() === String(userKey).toLowerCase()
+      || String(u.name ?? '').toLowerCase() === String(userKey).toLowerCase()) ?? null
+    if (!user && !userError) {
+      const known = users.users.map((u) => `${u.id} (${u.name})`).join(', ')
+      userError = `пользователь не найден: ${userKey}${known ? ` · известные: ${known}` : ''}`
+    }
+  }
+  return {
+    user,
+    userError,
+    subject: 'тема будет из первого сообщения пользователя',
+    text: supportIntakeInstructionText({ user, userKey, hasFaq, hasTracker, hasStore }),
+  }
+}

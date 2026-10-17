@@ -122,6 +122,72 @@ class StoreTest(unittest.TestCase):
             self.assertIn("без поля id", str(ctx.exception))
             self.assertIn("users.json", str(ctx.exception))
 
+
+class CreateTicketTest(unittest.TestCase):
+    """Первое обращение: номер присваивает поддержка, пользователь его не вводит."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = Path(self.tmp.name) / "data"
+        shutil.copytree(DATA, self.data)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_create_assigns_next_number(self):
+        store = make_store(readonly=False, data_dir=self.data)
+        ticket = store.create_ticket("Меню команд задваивается", "Кажется, команды показываются дважды")
+        self.assertEqual(ticket["id"], "T-1078")
+        self.assertEqual(ticket["status"], "open")
+        self.assertEqual(ticket["component"], "intake")
+        self.assertEqual(ticket["messages"][0]["from"], "user")
+        self.assertIn("задваивается", ticket["subject"])
+
+    def test_created_ticket_is_readable_and_listed(self):
+        store = make_store(readonly=False, data_dir=self.data)
+        store.create_ticket("Тема", "Текст обращения", user_id="u-104")
+        self.assertEqual(store.ticket("T-1078")["user"]["name"], "Артём Ковалёв")
+        ids = [t["id"] for t in store.tickets()]
+        self.assertIn("T-1078", ids)
+        self.assertEqual(ids[-1], "T-1078")
+        self.assertEqual(len(store.tickets("open")), 6)
+
+    def test_numbers_increment(self):
+        store = make_store(readonly=False, data_dir=self.data)
+        self.assertEqual(store.create_ticket("Раз", "первое")["id"], "T-1078")
+        self.assertEqual(store.create_ticket("Два", "второе")["id"], "T-1079")
+
+    def test_guest_is_allowed(self):
+        store = make_store(readonly=False, data_dir=self.data)
+        ticket = store.create_ticket("Гость", "текст без карточки")
+        self.assertEqual(ticket["user"], {"id": ""})
+
+    def test_unknown_user_is_refused_with_hints(self):
+        store = make_store(readonly=False, data_dir=self.data)
+        with self.assertRaises(SupportError) as ctx:
+            store.create_ticket("Тема", "текст", user_id="u-999")
+        self.assertIn("пользователь не найден", str(ctx.exception))
+        self.assertIn("u-104", str(ctx.exception))
+
+    def test_empty_subject_or_text_is_refused(self):
+        store = make_store(readonly=False, data_dir=self.data)
+        with self.assertRaises(SupportError):
+            store.create_ticket("  ", "текст")
+        with self.assertRaises(SupportError):
+            store.create_ticket("тема", "   ")
+
+    def test_readonly_refuses_creation(self):
+        with self.assertRaises(SupportError) as ctx:
+            make_store(readonly=True, data_dir=self.data).create_ticket("Тема", "текст")
+        self.assertIn("только чтения", str(ctx.exception))
+
+    def test_creation_is_persisted_atomically(self):
+        store = make_store(readonly=False, data_dir=self.data)
+        store.create_ticket("Тема", "текст")
+        saved = json.loads((self.data / "tickets.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved[-1]["id"], "T-1078")
+        self.assertEqual([p.name for p in self.data.iterdir() if p.name.endswith(".tmp")], [])
+
     def test_bad_data_dir_is_reported(self):
         with self.assertRaises(SupportError) as ctx:
             SupportStore(data_dir=Path(tempfile.gettempdir()) / "нет-такого-каталога").load()
@@ -159,6 +225,11 @@ class ToolRegistryTest(unittest.TestCase):
     def test_write_tool_appears_in_readwrite(self):
         names = self.names(build_server(make_store(readonly=False)))
         self.assertIn("support_add_comment", names)
+        self.assertIn("support_create_ticket", names)
+
+    def test_create_ticket_hidden_in_readonly(self):
+        names = self.names(build_server(make_store(readonly=True)))
+        self.assertNotIn("support_create_ticket", names)
 
     def test_tools_return_text_on_errors(self):
         server = build_server(make_store())

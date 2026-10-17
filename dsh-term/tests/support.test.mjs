@@ -16,6 +16,9 @@ import {
   SUPPORT_DEV_QUEUE,
   SUPPORT_DEV_TAG,
   supportDigest,
+  supportIntakeInstructionText,
+  supportIntakePreview,
+  supportIntakeSubject,
   supportInstructionText,
   supportPromptPreview,
   supportTicket,
@@ -116,9 +119,9 @@ check('--support-check: неизвестный номер → код 1', unknown
 check('--support-check: неизвестный номер → подсказка', /обращение не найдено: T-0000/.test(unknown.out))
 
 const help = run(['--help'])
-check('--support в справке флагов', /--support \[<тикет>\]/.test(help.out))
-check('--support-check в справке флагов', /--support-check <тикет>/.test(help.out))
-check('/support в списке команд', /\/support \[<тикет>\|off\]/.test(help.out))
+check('--support в справке флагов', /--support \[<тикет>|open\]/.test(help.out))
+check('--support-check в справке флагов', /--support-check <тикет\|new>/.test(help.out))
+check('/support в списке команд', /\/support \[<тикет>\|open\|off\]/.test(help.out))
 
 // ---- 5. Своё хранилище и битые данные --------------------------------------
 const tmp = mkdtempSync(join(tmpdir(), 'dsh-support-'))
@@ -196,6 +199,74 @@ check('preview: обращение найдено', preview.ticket?.id === 'T-10
 check('preview: пользователь приложен', preview.user?.name === 'Павел Дорохов')
 const previewMissing = supportPromptPreview('T-7777', { cwd: repo })
 check('preview: ошибка вместо падения', !!previewMissing.error && !previewMissing.text)
+
+// ---- 9. Первое обращение: номера нет, его присваивает поддержка ------------
+const intake = supportIntakeInstructionText({
+  user: irina, userKey: '', hasFaq: true, hasTracker: true, hasStore: true,
+})
+check('первое обращение: сказано, что обращения нет', /ПЕРВОЕ ОБРАЩЕНИЕ/.test(intake)
+  && /ДАННЫЕ: обращения нет/.test(intake))
+check('первое обращение: карточка пользователя в промпте', /Ирина Соколова/.test(intake))
+check('первое обращение: id для инструмента указан', /id для инструмента: u-101/.test(intake))
+check('первое обращение: обращение заводится инструментом',
+  /mcp__support__support_create_ticket\(subject:/.test(intake))
+check('первое обращение: номер только из ответа инструмента', /Номер обращения \(T-…\) — только из ответа инструмента/.test(intake))
+check('первое обращение: задача в INFRA после ответа', new RegExp(`create_task\\(queue: "${SUPPORT_DEV_QUEUE}"`).test(intake))
+check('первое обращение: строки-итоги в конце', /«Обращение: T-<номер>»/.test(intake)
+  && /Задача в разработку: INFRA-<номер>/.test(intake))
+check('первое обращение: правило про отсутствие данных', /в базе и в обращении этого нет/.test(intake))
+
+const guest = supportIntakeInstructionText({ user: null, userKey: '', hasFaq: true, hasTracker: true, hasStore: true })
+check('гость: сказано, что карточки нет', /гость — карточки нет/.test(guest))
+check('гость: без обещания данных о пользователе', /Версию dsh-term, ОС и прочее уточняй/.test(guest))
+
+const noStore = supportIntakeInstructionText({ user: null, userKey: '', hasFaq: true, hasTracker: false, hasStore: false })
+check('без MCP поддержки: обращение не заводится', /MCP поддержки в сессии нет — обращение не заводи/.test(noStore))
+check('без трекера: задача текстом', /задачу дай текстом/.test(noStore))
+
+check('тема обращения из первого сообщения',
+  supportIntakeSubject('привет! Кажется у меня задвоилось отображение команд. Что делать?') === 'Привет!')
+check('длинная тема обрезается', supportIntakeSubject('a'.repeat(80)).length <= 60)
+check('пустое сообщение — тема по умолчанию', supportIntakeSubject('   ') === 'Обращение без описания')
+
+const intakePreview = supportIntakePreview({ cwd: repo, userKey: 'u-103', hasFaq: true, hasTracker: true })
+check('preview первого обращения: карточка по ключу', intakePreview.user?.name === 'Мария Лебедева')
+const intakeByEmail = supportIntakePreview({ cwd: repo, userKey: 'p.dorohov@example.ru' })
+check('preview первого обращения: поиск по почте', intakeByEmail.user?.id === 'u-102')
+const intakeUnknown = supportIntakePreview({ cwd: repo, userKey: 'u-777' })
+check('preview первого обращения: неизвестный пользователь объяснён',
+  /пользователь не найден: u-777/.test(intakeUnknown.userError ?? ''))
+
+// ---- 10. CLI: --support-check new (без модели) -----------------------------
+const intakeCli = run(['--support-check', 'new', '--support-user', 'u-104'])
+check('--support-check new: код 0', intakeCli.code === 0, `code=${intakeCli.code}`)
+check('--support-check new: шапка без номера', /support-check new — первое обращение \(номера пока нет\)/.test(intakeCli.out))
+check('--support-check new: пользователь из --support-user', /Артём Ковалёв/.test(intakeCli.out))
+check('--support-check new: сказано про запись MCP', /MCP поддержки: запись включена/.test(intakeCli.out))
+check('--support-check new: промпт напечатан', /ПОСЛЕ ОТВЕТА — ОФОРМИТЬ ОБРАЩЕНИЕ И ЗАДАЧУ/.test(intakeCli.out))
+
+const intakeGuest = run(['--support-check', 'new'])
+check('--support-check new без --user: гость', /пользователь: гость — карточки нет/.test(intakeGuest.out))
+
+const intakeBadUser = run(['--support-check', 'new', '--support-user', 'u-777'])
+check('--support-check new: неизвестный пользователь не ломает вывод',
+  intakeBadUser.code === 0 && /пользователь не найден: u-777/.test(intakeBadUser.out),
+  `code=${intakeBadUser.code}`)
+
+const intakeEnvUser = run(['--support-check', 'new'], { DSH_TERM_SUPPORT_USER: 'u-101' })
+check('DSH_TERM_SUPPORT_USER работает как --user', /Ирина Соколова/.test(intakeEnvUser.out))
+
+const helpText = /\/support \[<тикет>\|open\|off\]/.test(help.out)
+  && /--support \[<тикет>\|open\]/.test(help.out)
+  && /--user <id\|почта\|имя>/.test(help.out)
+check('справка описывает оба входа и --user', helpText)
+
+// ---- 11. MCP-сервер поддержки умеет заводить обращение ---------------------
+const rwOverlay = run(['--mcp-check', 'support', '--offline'])
+check('пресет поддержки: флага записи в оверлее нет по умолчанию', !/--readwrite/.test(rwOverlay.out))
+const dataOverlay = run(['--mcp-check', 'support', '--offline'], { DSH_TERM_SUPPORT_DATA: join(repo, 'tmp-data') })
+check('оверлей: свой каталог данных уходит в сервер',
+  /- '--data'/.test(dataOverlay.out) && /tmp-data/.test(dataOverlay.out))
 
 let failed = 0
 for (const c of checks) {

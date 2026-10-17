@@ -143,6 +143,18 @@ def build_server(store: SupportStore):
                 return f"Комментарий не записан: {exc}"
             return f"Комментарий записан в {got['id']}; сообщений стало {got['messages']}"
 
+        @server.tool(description="Завести новое обращение из сообщения пользователя "
+                                 "(номер присваивает поддержка)")
+        def support_create_ticket(subject: str, message: str, user_id: str = "",
+                                  component: str = "intake") -> str:
+            """Первое обращение: тема, текст пользователя, кто он (пусто — гость)."""
+            try:
+                ticket = store.create_ticket(subject, message, user_id=user_id,
+                                             component=component)
+            except SupportError as exc:
+                return f"Обращение не создано: {exc}"
+            return format_ticket(ticket)
+
     return server
 
 
