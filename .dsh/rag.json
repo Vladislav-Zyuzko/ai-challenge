@@ -15,5 +15,14 @@
     "strategy": "structural",
     "margin": 0.04,
     "minDense": 0.5
+  },
+  "project-code": {
+    "title": "код проекта ai-challenge",
+    "index": "doc-index",
+    "out": "project-code-index/out",
+    "what": "исходники doc-index и dsh-term, скиллы и правила харнесса",
+    "strategy": "fixed",
+    "margin": 0.04,
+    "minDense": 0.5
   }
 }

@@ -165,7 +165,7 @@ def collect(cfg: Config) -> tuple[list[Note], list[str]]:
         rel_posix = rel.as_posix()
         parts = rel.parts
         allowed = any(rel_posix.startswith(prefix) for prefix in cfg.allow_dirs)
-        if any(part in cfg.exclude_dirs for part in parts):
+        if any(part in cfg.exclude_dirs for part in parts) or rel.name in cfg.exclude_names:
             skipped.append(rel_posix)
             continue
         # Скрытые каталоги — почти всегда служебные (`.git`, `.venv`, `.pytest_cache`),

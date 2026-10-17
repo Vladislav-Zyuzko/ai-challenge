@@ -20,7 +20,7 @@ from . import store
 from .chunk import build_chunks, chunk_stats
 from .collect import collect
 from .config import DEFAULT_OUT, DEFAULT_VAULT, Config
-from .project import context_block, docs_config
+from .project import code_config, context_block, docs_config
 from .embed import OllamaEmbedder
 from .evaluate import evaluate, load_questions, source_skew, write_report as write_eval_report
 from .indexer import build_index
@@ -45,18 +45,23 @@ def _items(value: str) -> list[str]:
 def _config(args: argparse.Namespace) -> Config:
     """Настройки прогона: пресет корпуса + явные флаги поверх него.
 
-    `--project-docs` переключает корпус на документацию репозитория (день 31): другой
-    набор исключений, разрешённые скрытые каталоги и свой каталог индекса. Флаги
-    `--exclude`, `--allow`, `--suffix` позволяют уточнить пресет, не правя код.
+    `--project-docs` переключает корпус на документацию репозитория (день 31),
+    `--project-code` — на его исходники (день 32, база для ревьювера): у каждого
+    пресета свой набор расширений, исключений и свой каталог индекса. Флаги
+    `--exclude`, `--allow`, `--suffix`, `--exclude-names` уточняют пресет без правки кода.
     """
     vault = Path(args.vault).expanduser()
     explicit_out = Path(args.out).expanduser() if args.out else None
     base = Config()
     if getattr(args, "project_docs", False):
         base = docs_config(vault, explicit_out)
+    elif getattr(args, "project_code", False):
+        base = code_config(vault, explicit_out)
     exclude = tuple(_items(args.exclude)) if args.exclude else base.exclude_dirs
     allow = base.allow_dirs + tuple(_items(args.allow)) if args.allow else base.allow_dirs
     suffixes = tuple(_items(args.suffix)) if args.suffix else base.suffixes
+    names = (base.exclude_names + tuple(_items(args.exclude_names))
+             if args.exclude_names else base.exclude_names)
     return replace(
         base,
         vault=vault,
@@ -70,6 +75,7 @@ def _config(args: argparse.Namespace) -> Config:
         exclude_dirs=exclude,
         allow_dirs=allow,
         suffixes=suffixes,
+        exclude_names=names,
     )
 
 
@@ -79,7 +85,10 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--out", default="", help="каталог артефактов индекса")
     parser.add_argument("--project-docs", action="store_true",
                         help="корпус — документация проекта: README, docs, отчёты (день 31)")
+    parser.add_argument("--project-code", action="store_true",
+                        help="корпус — исходники проекта: база для ревьювера (день 32)")
     parser.add_argument("--exclude", default="", help="каталоги-исключения через запятую (заменяют пресет)")
+    parser.add_argument("--exclude-names", default="", help="имена файлов-исключений через запятую")
     parser.add_argument("--allow", default="", help="скрытые каталоги, которые всё же нужны, через запятую")
     parser.add_argument("--suffix", default="", help="расширения файлов корпуса через запятую (по умолчанию .md)")
     parser.add_argument("--model", default=Config().model, help="модель эмбеддингов в Ollama")

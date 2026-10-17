@@ -20,6 +20,7 @@ from doc_index.project import (  # noqa: E402
     PROJECT_EXCLUDES,
     RepoError,
     _git,
+    code_config,
     context_block,
     docs_config,
     git_branch,
@@ -130,6 +131,47 @@ class CollectProjectTest(unittest.TestCase):
     def test_suffixes_can_widen_the_corpus(self):
         notes, _ = self.collect(suffixes=(".md", ".py"))
         self.assertIn("src/main.py", {note.source for note in notes})
+
+
+class CodeConfigTest(unittest.TestCase):
+    """Пресет корпуса кода (день 32): исходники и конфиги, но не lock-файлы."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "app.py").write_text("print('код')\n", encoding="utf-8")
+        (self.root / "tool.mjs").write_text("export const x = 1\n", encoding="utf-8")
+        (self.root / "package.json").write_text('{"name": "проба"}\n', encoding="utf-8")
+        (self.root / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+        (self.root / "README.md").write_text("# Документация\n", encoding="utf-8")
+        (self.root / "node_modules" / "dep").mkdir(parents=True)
+        (self.root / "node_modules" / "dep" / "index.js").write_text("module.exports = 1\n", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_preset_paths_and_suffixes(self):
+        cfg = code_config(self.root)
+        self.assertEqual(cfg.out, self.root / "project-code-index" / "out")
+        self.assertIn(".py", cfg.suffixes)
+        self.assertIn(".mjs", cfg.suffixes)
+        # `.json` нужен, чтобы lock-файлы вообще доходили до фильтра по имени.
+        self.assertIn(".json", cfg.suffixes)
+
+    def test_code_corpus_without_lockfiles_and_docs(self):
+        notes, skipped = collect(code_config(self.root))
+        sources = {note.source for note in notes}
+        self.assertIn("app.py", sources)
+        self.assertIn("tool.mjs", sources)
+        self.assertIn("package.json", sources)
+        self.assertNotIn("README.md", sources)          # документация живёт в другой базе
+        self.assertNotIn("package-lock.json", sources)  # отсекается по имени
+        self.assertIn("package-lock.json", skipped)
+        self.assertNotIn("node_modules/dep/index.js", sources)
+
+    def test_docs_preset_has_no_dead_name_filter(self):
+        """В корпусе документации lock-имён не бывает: фильтр там только путал бы."""
+        self.assertEqual(docs_config(self.root).exclude_names, ())
 
 
 class GitContextTest(unittest.TestCase):
