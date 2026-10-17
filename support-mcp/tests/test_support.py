@@ -87,6 +87,41 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(ticket["messages"][-1]["from"], "support")
             self.assertIn("убрать старую переменную", ticket["messages"][-1]["text"])
 
+    def test_written_message_has_timestamp(self):
+        """Без `at` слепок обращения печатал бы «[] поддержка: текст» (PR #31)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            shutil.copytree(DATA, data)
+            store = make_store(readonly=False, data_dir=data)
+            store.add_comment("T-1042", "проверка времени")
+            saved = json.loads((data / "tickets.json").read_text(encoding="utf-8"))
+            ticket = next(t for t in saved if t["id"] == "T-1042")
+            at = ticket["messages"][-1].get("at", "")
+            self.assertTrue(at, "у сообщения нет поля at")
+            self.assertRegex(at, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+
+    def test_write_is_atomic(self):
+        """Временный файл не остаётся, а исходный JSON валиден после записи."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            shutil.copytree(DATA, data)
+            store = make_store(readonly=False, data_dir=data)
+            store.add_comment("T-1051", "атомарность")
+            self.assertEqual([p.name for p in data.iterdir() if p.name.endswith(".tmp")], [])
+            json.loads((data / "tickets.json").read_text(encoding="utf-8"))
+
+    def test_record_without_id_is_explained(self):
+        """Запись без `id` — SupportError, а не KeyError мимо обработчика."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            data.mkdir()
+            (data / "users.json").write_text('[{"name": "без id"}]', encoding="utf-8")
+            (data / "tickets.json").write_text("[]", encoding="utf-8")
+            with self.assertRaises(SupportError) as ctx:
+                make_store(data_dir=data)
+            self.assertIn("без поля id", str(ctx.exception))
+            self.assertIn("users.json", str(ctx.exception))
+
     def test_bad_data_dir_is_reported(self):
         with self.assertRaises(SupportError) as ctx:
             SupportStore(data_dir=Path(tempfile.gettempdir()) / "нет-такого-каталога").load()

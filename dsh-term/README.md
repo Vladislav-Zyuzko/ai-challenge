@@ -738,7 +738,7 @@ dsh-term --support T-1042 -p "вопрос"        # один ответ, без
 чтение по умолчанию, запись в тикет только с `--readwrite`.
 
 ```powershell
-node dsh-term/tests/support.test.mjs    # 70 проверок: слепок, промпт, оверлеи, ошибки данных
+node dsh-term/tests/support.test.mjs    # 74 проверки: слепок, промпт, оверлеи, ошибки данных
 cd support-mcp
 python tests\test_support.py            # 15 проверок сервера поддержки
 ```

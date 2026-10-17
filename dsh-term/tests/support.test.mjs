@@ -136,6 +136,29 @@ check('битый JSON → путь и причина', /не читается/.
 const noDir = run(['--support-check', 'T-1042'], { DSH_TERM_SUPPORT_DATA: join(tmp, 'нет-каталога') })
 check('нет каталога → код 1 и путь', noDir.code === 1 && /нет файла данных/.test(noDir.out))
 
+// Ошибочные пути не должны падать трейсбеком: `fatal:` — это непойманное исключение
+// (на PR #31 так проявлялся неимпортированный SUPPORT_DATA_DIR), а подсказка
+// «данные: …» должна печататься ДО любой ошибки, чтобы её было видно.
+for (const [name, res] of [['неизвестный номер', unknown], ['битый JSON', broken],
+  ['нет каталога', noDir]]) {
+  check(`${name}: без трейсбека`, !/fatal:|internal error:|ReferenceError/.test(res.out),
+    res.out.split('\n').slice(-2).join(' '))
+}
+check('ошибка печатает путь к данным', /данные: .*data/.test(broken.out)
+  && /DSH_TERM_SUPPORT_DATA/.test(noDir.out))
+
+// База FAQ без собранного индекса: режим должен сказать об этом, а не обещать цитаты.
+const noIndex = mkdtempSync(join(tmpdir(), 'dsh-support-reg-'))
+const regPath = join(noIndex, 'rag.json')
+writeFileSync(regPath, JSON.stringify({
+  support: { title: 'FAQ', index: join(repo, 'doc-index'), out: join(noIndex, 'нет-индекса') },
+}, null, 2), 'utf8')
+const noIdx = run(['--support-check', 'T-1042'], { DSH_TERM_RAG_FILE: regPath })
+check('нет индекса → FAQ не подключён', noIdx.code === 0 && /FAQ: не подключён/.test(noIdx.out),
+  `code=${noIdx.code}`)
+check('нет индекса → сказано, что индекс не собран', /индекс базы «support» не собран/.test(noIdx.out))
+check('нет индекса → промпт без требования цитат', /База FAQ в этой сессии не подключена/.test(noIdx.out))
+
 // ---- 6. MCP-сервер поддержки в оверлее моста -------------------------------
 const overlay = run(['--mcp-check', 'support', '--offline'])
 check('оверлей: exit 0', overlay.code === 0, `code=${overlay.code}`)

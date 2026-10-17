@@ -89,6 +89,29 @@ class CollectTest(unittest.TestCase):
         note = parse_note(self.path, self.root)
         self.assertIn("02_Модель", note.links)
 
+    def test_only_dirs_по_сегментам_пути(self) -> None:
+        """`support` и `support-mcp` — разные каталоги: префикс строки их путал.
+
+        На PR #31 ревьювер нашёл, что в корпус FAQ попал README соседнего проекта
+        `support-mcp/` — ровно из-за сравнения префикса строки.
+        """
+        (self.root / "support").mkdir()
+        (self.root / "support-mcp").mkdir()
+        (self.root / "support" / "faq.md").write_text("# FAQ продукта", encoding="utf-8")
+        (self.root / "support-mcp" / "README.md").write_text("# чужой проект", encoding="utf-8")
+        cfg = Config(vault=self.root, out=self.root / "out", only_dirs=("support",))
+        notes, skipped = collect(cfg)
+        self.assertEqual([n.source for n in notes], ["support/faq.md"])
+        self.assertIn("support-mcp/README.md", skipped)
+
+    def test_only_dirs_берёт_каталог_целиком(self) -> None:
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "inner").mkdir()
+        (self.root / "docs" / "inner" / "note.md").write_text("# вложенная", encoding="utf-8")
+        cfg = Config(vault=self.root, out=self.root / "out", only_dirs=("docs",))
+        notes, _ = collect(cfg)
+        self.assertEqual([n.source for n in notes], ["docs/inner/note.md"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

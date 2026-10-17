@@ -104,7 +104,11 @@ export function supportDigest(ticket, user) {
   lines.push(`переписка (${messages.length}):`)
   for (const m of messages) {
     const who = SUPPORT_FROM_LABELS[m.from] ?? m.from
-    lines.push(`  [${supportWhen(m.at)}] ${who}: ${String(m.text ?? '').replace(/\s+/g, ' ').trim()}`)
+    const when = supportWhen(m.at)
+    const text = String(m.text ?? '').replace(/\s+/g, ' ').trim()
+    // Время может отсутствовать (комментарий, записанный вручную): пустые скобки
+    // в промпте выглядят как сломанные данные.
+    lines.push(when ? `  [${when}] ${who}: ${text}` : `  ${who}: ${text}`)
   }
   if (ticket.resolution) lines.push(`прежнее решение: ${ticket.resolution}`)
   return lines.join('\n')

@@ -47,6 +47,7 @@ import {
   SUPPORT_MCP_PRESET,
   SUPPORT_STATUS_LABELS,
   supportInstructionText,
+  supportDataDir,
   supportPromptPreview,
   supportTicket,
   supportTickets,
@@ -2482,6 +2483,15 @@ function mcpNormalizeUrl(raw) {
 }
 
 /**
+ * Интерпретатор для python-MCP-серверов (RAG и поддержка) — один на всех:
+ * если на машине python для серверов переопределён, оба обязаны стартовать им же,
+ * иначе «второй сервер не поднимается» придётся искать заново.
+ */
+function mcpPythonBin(fallback = 'python') {
+  return String(process.env.DSH_TERM_RAG_PYTHON ?? '').trim() || fallback
+}
+
+/**
  * Разобрать флаги MCP в список серверов.
  * @param {{mcp?: string[], mcpToolsets?: string, mcpReadwrite?: boolean}} opts
  * @returns {{servers: Array<object>, unknown: string[]}}
@@ -2507,6 +2517,7 @@ function resolveMcpServers(opts) {
           : preset.packageDir)
         servers.push({
           ...preset,
+          command: mcpPythonBin(preset.command),
           dir,
           args: ['-m', preset.module],
           env: { ...(preset.env ?? {}), PYTHONPATH: dir, PYTHONIOENCODING: 'utf-8' },
@@ -2925,7 +2936,7 @@ function ragServerFor(names, bases, { cwd = process.cwd(), opts = {} } = {}) {
     serverName: RAG_SERVER_NAME,
     title: 'RAG: локальные базы знаний (stdio)',
     transport: 'stdio',
-    command: process.env.DSH_TERM_RAG_PYTHON || 'python',
+    command: mcpPythonBin(),
     args,
     env: { PYTHONPATH: root, PYTHONIOENCODING: 'utf-8' },
     filter,
@@ -2934,7 +2945,7 @@ function ragServerFor(names, bases, { cwd = process.cwd(), opts = {} } = {}) {
     ragCli: {
       root,
       outDir: outDirs[0],
-      python: process.env.DSH_TERM_RAG_PYTHON || 'python',
+      python: mcpPythonBin(),
       base: names[0],
       strategy: String(first.strategy || RAG_DEFAULT_STRATEGY),
       k: 5,
@@ -3080,6 +3091,34 @@ function profileHasMcpRow(dshHome, profile, serverName) {
   const p = join(dshHome, 'profiles', profile, 'cordis.patch.yml')
   const md = readTextIfExists(p)
   return md !== null && (md.includes(`mcp-${serverName}`) || md.includes('dsh-mcp-client'))
+}
+
+/**
+ * Готова ли база FAQ поддержки (день 33): запись в реестре + собранный индекс.
+ *
+ * Проверять нужно `out`, а не `index`: `index` — каталог пакета `doc-index`, он есть
+ * всегда, а сам индекс базы лежит отдельно (`support-index/out`) и в git не попадает.
+ * Проверка по `index` объявляла бы «FAQ подключён» на чистом клоне, где индекса нет:
+ * промпт требовал бы цитат, а `rag_search` отвечал бы ошибкой.
+ */
+function supportBaseStatus(workspace = process.cwd()) {
+  const registry = readRagRegistry(workspace)
+  if (registry.error) return { ok: false, error: registry.error, registry }
+  if (registry.missing) return { ok: false, error: `нет реестра баз ${registry.path}`, registry }
+  const entry = registry.bases?.[SUPPORT_BASE] ?? null
+  if (!entry) return { ok: false, error: `в ${registry.path} нет базы «${SUPPORT_BASE}»`, registry }
+  const indexDir = resolve(workspace, String(entry.index ?? ''))
+  const outDir = entry.out ? resolve(workspace, String(entry.out)) : indexDir
+  if (!existsSync(indexDir)) return { ok: false, error: `не найден каталог пакета ${indexDir}`, registry, entry }
+  if (!existsSync(outDir)) {
+    return {
+      ok: false,
+      error: `индекс базы «${SUPPORT_BASE}» не собран: ${outDir}`
+        + ' (python -m doc_index index --support-docs --vault .)',
+      registry, entry, indexDir, outDir,
+    }
+  }
+  return { ok: true, error: null, registry, entry, indexDir, outDir }
 }
 
 /**
@@ -4091,23 +4130,23 @@ async function main() {
   // Диагностика без сессии и модели: слепок обращения и правила видны текстом —
   // иначе проверить режим можно было бы только живым прогоном (день 33).
   if (opts.supportCheck !== undefined) {
-    const registry = readRagRegistry(opts.workspace)
-    const baseEntry = registry.bases?.[SUPPORT_BASE] ?? null
-    const baseDir = baseEntry ? resolve(opts.workspace, String(baseEntry.index ?? '')) : ''
-    const hasFaq = !!baseEntry && !!baseDir && existsSync(baseDir)
+    const base = supportBaseStatus(opts.workspace)
+    const hasFaq = base.ok
     const hasTracker = !!String(process.env[MCP_PRESETS.sltracker.tokenEnv] ?? '').trim()
     const preview = supportPromptPreview(opts.supportCheck, {
       cwd: opts.workspace, hasFaq, hasTracker,
     })
     if (preview.error) {
       log.err(`support-check: ${preview.error}`)
-      log.dim(`данные: ${join(opts.workspace, SUPPORT_DATA_DIR)} (переопределение: DSH_TERM_SUPPORT_DATA)`)
+      log.dim(`данные: ${supportDataDir(opts.workspace)} (переопределение: DSH_TERM_SUPPORT_DATA)`)
       process.exitCode = 1
       return
     }
     log.line(`${C.bold}support-check${C.off} ${preview.ticket.id} — «${preview.ticket.subject}»`)
     log.dim(`  ${supportUserLine(preview.user, preview.ticket.user)}`)
-    log.dim(`  FAQ: ${hasFaq ? `база «${SUPPORT_BASE}»` : `не подключён${baseEntry ? ` (нет каталога ${baseDir})` : ' (нет записи в реестре)'}`}`
+    log.dim(`  FAQ: ${hasFaq
+      ? `база «${SUPPORT_BASE}» · индекс ${base.outDir}`
+      : `не подключён — ${base.error}`}`
       + ` · трекер: ${hasTracker ? `${SUPPORT_DEV_QUEUE} через sltracker` : `нет ${MCP_PRESETS.sltracker.tokenEnv} — задача текстом`}`)
     if (preview.usersError) log.dim(`  ${preview.usersError}`)
     log.line('  системный промпт режима:')
@@ -4411,29 +4450,35 @@ async function main() {
   /**
    * Записать оверлей MCP-серверов и подключить его к рантайму.
    *
-   * Отдельной функцией, потому что тот же оверлей переписывается при смене
-   * режима (день 33, `/support`): набор серверов меняется уже в живой сессии, а
-   * system prompt и точки монтирования фиксируются при спавне.
+   * `insert` не идемпотентен: повторная вставка того же loader-id валит дерево
+   * плагинов («duplicate loader entry id»), поэтому сервер, чья строка уже есть в
+   * пользовательском слое профиля, в оверлей не попадает. Пропуск возвращается
+   * вызывающему: молчаливая деградация («промпт обещает инструменты, которых нет»)
+   * дороже одной строки в логе.
+   *
+   * @returns {{applied: string[], skipped: string[]}} имена серверов по итогу
    */
-  function applyMcpServers(servers, { announce = false } = {}) {
-    if (!servers.length) return false
+  function applyMcpServers(servers) {
+    const result = { applied: [], skipped: [] }
+    if (!servers.length) return result
+    const usable = []
+    for (const s of servers) {
+      if (profileHasMcpRow(opts.dshHome, opts.profile, s.serverName)) result.skipped.push(s.serverName)
+      else usable.push(s)
+    }
+    if (!usable.length) return result
     try {
       mkdirSync(opts.dshHome, { recursive: true })
-      writeFileSync(mcpPatchPath, mcpPatchYaml(servers), 'utf8')
-      // Проверяем именно первый сервер — так же, как на старте: `insert` не
-      // идемпотентен, и повторная вставка валит дерево плагинов.
-      if (profileHasMcpRow(opts.dshHome, opts.profile, servers[0].serverName)) {
-        if (announce) log.dim('mcp: строка уже есть в пользовательском слое профиля — оверлей не подключаю (insert не идемпотентен)')
-        return true
-      }
-      if (!(opts.patches ?? []).includes(mcpPatchPath)) {
-        opts.patches = [...(opts.patches ?? []), mcpPatchPath]
-      }
-      return true
+      writeFileSync(mcpPatchPath, mcpPatchYaml(usable), 'utf8')
     } catch (e) {
       log.err(`mcp patch failed: ${e.message}`)
-      return false
+      return result
     }
+    if (!(opts.patches ?? []).includes(mcpPatchPath)) {
+      opts.patches = [...(opts.patches ?? []), mcpPatchPath]
+    }
+    result.applied = usable.map((s) => s.serverName)
+    return result
   }
 
   if (mcpServers.length) {
@@ -4450,7 +4495,12 @@ async function main() {
       mcpServers.length = 0
       mcpServers.push(...usable)
     }
-    if (mcpServers.length) applyMcpServers(mcpServers, { announce: true })
+    if (mcpServers.length) {
+      const applied = applyMcpServers(mcpServers)
+      if (applied.skipped.length) {
+        log.dim(`mcp: строки уже есть в пользовательском слое профиля — оверлей не подключаю: ${applied.skipped.join(', ')}`)
+      }
+    }
   }
   opts.mcpEnv = mcpEnv
   state.mcp = mcpServers.length
@@ -4506,22 +4556,19 @@ async function main() {
     // целиком: «дописать» базу вторым процессом нельзя — оба звали бы один индекс.
     let hasFaq = (state.rag?.names ?? []).includes(SUPPORT_BASE)
     if (!hasFaq) {
-      const registry = readRagRegistry(opts.workspace)
-      const entry = registry.bases?.[SUPPORT_BASE] ?? null
-      const dir = entry ? resolve(opts.workspace, String(entry.index ?? '')) : ''
-      if (registry.error) notes.push(`FAQ не подключён: ${registry.error}`)
-      else if (registry.missing) notes.push(`FAQ не подключён: нет реестра ${registry.path}`)
-      else if (!entry) notes.push(`FAQ не подключён: в ${registry.path} нет базы «${SUPPORT_BASE}»`)
-      else if (!existsSync(dir)) notes.push(`FAQ не подключён: нет каталога ${dir}`)
+      // Проверяем не только запись в реестре, но и собранный индекс: без него
+      // rag_search отвечал бы ошибкой, а промпт требовал бы цитат из базы.
+      const base = supportBaseStatus(opts.workspace)
+      if (!base.ok) notes.push(`FAQ не подключён: ${base.error}`)
       else {
         const names = [...(state.rag?.names ?? []), SUPPORT_BASE]
-        const server = ragServerFor(names, registry.bases, { cwd: opts.workspace, opts })
+        const server = ragServerFor(names, base.registry.bases, { cwd: opts.workspace, opts })
         // Старый сервер базы заменяется, а не добавляется: имя у него то же (`rag`).
         const kept = (state.mcp?.servers ?? []).filter((s) => s.serverName !== RAG_SERVER_NAME)
         const probes = state.mcp?.probes ?? new Map()
         probes.delete(RAG_SERVER_NAME) // зонд прежнего набора баз больше не актуален
-        state.rag = { names, servers: [server], registry: registry.path, filter: server.filter }
-        state.ragInstruction = ragInstructionText(names, registry.bases)
+        state.rag = { names, servers: [server], registry: base.registry.path, filter: server.filter }
+        state.ragInstruction = ragInstructionText(names, base.registry.bases)
         state.mcp = { servers: [...kept, server], probes, tokens: 0, patchPath: mcpPatchPath }
         hasFaq = true
       }
@@ -4555,18 +4602,32 @@ async function main() {
       }
     }
 
-    // 3) Промпт: данные обращения + правила ответа + правило задачи.
+    // 3) Оверлей MCP. Пропущенные серверы важны: если строка сервера уже есть в
+    // пользовательском слое профиля, `insert` не повторяется, инструментов у модели
+    // не будет — и промпт не должен обещать `mcp__support__*`.
+    const mcpApplied = state.mcp?.servers?.length ? applyMcpServers(state.mcp.servers) : { skipped: [] }
+    for (const name of mcpApplied.skipped) {
+      notes.push(`MCP «${name}» не подключён: строка уже есть в пользовательском слое профиля`)
+    }
+    const trackerDropped = mcpApplied.skipped.includes(MCP_PRESETS.sltracker.serverName)
+    const faqDropped = hasFaq && mcpApplied.skipped.includes(RAG_SERVER_NAME)
+    if (faqDropped) notes.push(`FAQ не подключён: оверлей базы не применён`)
+    const faqReady = hasFaq && !faqDropped
+    const trackerReady = hasTracker && !trackerDropped
+
+    // 4) Промпт: данные обращения + правила ответа + правило задачи.
     state.support = {
       id: ticket.id,
       subject: ticket.subject,
       status: ticket.status,
       user: user?.name ?? ticket.user,
-      faq: hasFaq,
-      tracker: hasTracker,
+      faq: faqReady,
+      tracker: trackerReady,
     }
-    state.supportInstruction = supportInstructionText({ ticket, user, hasFaq, hasTracker })
+    state.supportInstruction = supportInstructionText({
+      ticket, user, hasFaq: faqReady, hasTracker: trackerReady,
+    })
     applyUserProfile(state.userProfile, { dirty: false })
-    if (state.mcp?.servers?.length) applyMcpServers(state.mcp.servers)
 
     // Зонды новых stdio-серверов — ДО перезапуска: поднимать второй экземпляр
     // поверх живого рантайма нельзя, а после рестарта они уже заняты харнессом.
@@ -4583,8 +4644,8 @@ async function main() {
       + ` (${SUPPORT_STATUS_LABELS[ticket.status] ?? ticket.status})`)
     log.dim(`  ${supportUserLine(user, ticket.user)}`)
     log.dim(`  переписка: ${(ticket.messages ?? []).length} сообщений · слепок ушёл в системный промпт`)
-    log.dim(`  FAQ: ${hasFaq ? `база «${SUPPORT_BASE}» · rag_search` : 'не подключён — ответы без источников'}`)
-    log.dim(`  трекер: ${hasTracker ? `sltracker · задача в очередь ${SUPPORT_DEV_QUEUE}` : 'не подключён — задача уйдёт текстом'}`)
+    log.dim(`  FAQ: ${faqReady ? `база «${SUPPORT_BASE}» · rag_search` : 'не подключён — ответы без источников'}`)
+    log.dim(`  трекер: ${trackerReady ? `sltracker · задача в очередь ${SUPPORT_DEV_QUEUE}` : 'не подключён — задача уйдёт текстом'}`)
     for (const note of notes) log.dim(`  ${note}`)
     if (ok) {
       log.dim('  опишите проблему пользователя в чате: сначала ответ, затем задача в разработку')

@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_DATA = Path(__file__).resolve().parent.parent / "data"
@@ -33,6 +35,31 @@ def _load(path: Path) -> list[dict]:
     return data
 
 
+def _index_by_id(rows: list[dict], path: Path) -> dict[str, dict]:
+    """Словарь по `id` с понятной ошибкой на запись без идентификатора.
+
+    Без проверки `KeyError` уходил бы трейсбеком мимо `except SupportError`, а
+    модуль обещает диагностику, а не стектрейс (нашёл ревьювер на PR #31).
+    """
+    result: dict[str, dict] = {}
+    for position, row in enumerate(rows, start=1):
+        if not isinstance(row, dict) or not str(row.get("id", "")).strip():
+            raise SupportError(f"{path}: запись №{position} без поля id")
+        result[str(row["id"])] = row
+    return result
+
+
+def _write_json_atomic(path: Path, payload: object) -> None:
+    """Записать JSON атомарно: временный файл рядом + `os.replace`.
+
+    `write_text` поверх существующего файла при прерывании оставляет обрезанный
+    `tickets.json` — то есть потерю всех обращений без копии.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
 @dataclass
 class SupportStore:
     """Пользователи и тикеты поддержки. По умолчанию только чтение."""
@@ -44,9 +71,11 @@ class SupportStore:
     _order: list[str] = field(default_factory=list, repr=False)
 
     def load(self) -> "SupportStore":
-        self._users = {str(user["id"]): user for user in _load(self.data_dir / "users.json")}
-        tickets = _load(self.data_dir / "tickets.json")
-        self._tickets = {str(ticket["id"]): ticket for ticket in tickets}
+        users_path = self.data_dir / "users.json"
+        tickets_path = self.data_dir / "tickets.json"
+        self._users = _index_by_id(_load(users_path), users_path)
+        tickets = _load(tickets_path)
+        self._tickets = _index_by_id(tickets, tickets_path)
         self._order = [str(ticket["id"]) for ticket in tickets]
         return self
 
@@ -101,18 +130,25 @@ class SupportStore:
 
     # --- запись ---------------------------------------------------------------
     def add_comment(self, ticket_id: str, text: str) -> dict:
-        """Записать сообщение в тикет: только в режиме не-readonly."""
+        """Записать сообщение в тикет: только в режиме не-readonly.
+
+        `at` обязателен: слепок обращения в системном промпте печатает время реплики,
+        и без него новая строка выглядела бы как «[] поддержка: текст».
+        """
         if self.readonly:
             raise SupportError("запись отключена: сервер запущен в режиме только чтения")
         body = str(text).strip()
         if not body:
             raise SupportError("пустой комментарий")
         ticket = self._require(ticket_id)
-        ticket.setdefault("messages", []).append({"from": "support", "text": body})
+        ticket.setdefault("messages", []).append({
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "from": "support",
+            "text": body,
+        })
         self._tickets[ticket_id] = ticket
-        path = self.data_dir / "tickets.json"
         payload = [self._tickets[ticket_id] for ticket_id in self._order]
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_json_atomic(self.data_dir / "tickets.json", payload)
         return {"id": ticket_id, "messages": len(ticket["messages"])}
 
     # --- внутреннее -----------------------------------------------------------
